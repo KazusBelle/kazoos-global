@@ -85,6 +85,8 @@ for the seeded 10 symbols. The frontend polls the dashboard every 15 s.
 4. Subsequent deploys: push to `main` → GitHub Actions `Deploy` workflow
    rsyncs the repo and runs `docker compose up -d --build`.
 
+For day-2 operations and recovery commands, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Pine source of truth
 
 The files in `docs/pine/` are the canonical description of the signal
