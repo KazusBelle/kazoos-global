@@ -39,23 +39,11 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
-        run: |
-          rsync -az --delete \
-            --exclude '.git' \
-            --exclude 'node_modules' \
-            --exclude 'frontend/dist' \
-            --exclude '.env' \
-            --exclude '__pycache__' \
-            ./ "${VPS_USER}@${VPS_HOST}:${VPS_DEPLOY_PATH}/"
+        run: rsync -az --delete --exclude='.git' --exclude='node_modules' --exclude='frontend/dist' --exclude='.env' --exclude='__pycache__' ./ ${VPS_USER}@${VPS_HOST}:${VPS_DEPLOY_PATH}
 
       - name: Run docker compose up on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
-        run: |
-          ssh "${VPS_USER}@${VPS_HOST}" "cd ${VPS_DEPLOY_PATH} && \
-            docker compose pull || true; \
-            docker compose build; \
-            docker compose up -d --remove-orphans; \
-            docker image prune -f"
+        run: ssh ${VPS_USER}@${VPS_HOST} "cd ${VPS_DEPLOY_PATH} && (docker compose pull || true) && docker compose build && docker compose up -d --remove-orphans && docker image prune -f"
