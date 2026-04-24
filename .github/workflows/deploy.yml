@@ -34,12 +34,19 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
 
+      - name: Ensure deploy path exists on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+        run: ssh ${VPS_USER}@${VPS_HOST} "mkdir -p ${VPS_DEPLOY_PATH}"
+
       - name: Rsync repo to VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
-        run: rsync -az --delete --exclude='.git' --exclude='node_modules' --exclude='frontend/dist' --exclude='.env' --exclude='__pycache__' ./ ${VPS_USER}@${VPS_HOST}:${VPS_DEPLOY_PATH}
+        run: rsync -az --delete --exclude='.git' --exclude='node_modules' --exclude='frontend/dist' --exclude='.env' --exclude='__pycache__' ./ ${VPS_USER}@${VPS_HOST}:${VPS_DEPLOY_PATH}/
 
       - name: Run docker compose up on VPS
         env:
