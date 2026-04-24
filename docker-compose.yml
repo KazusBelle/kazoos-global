@@ -1,0 +1,68 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kazus}
+      POSTGRES_USER: ${POSTGRES_USER:-kazus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kazus}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kazus} -d ${POSTGRES_DB:-kazus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "5432"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-kazus}:${POSTGRES_PASSWORD:-kazus}@db:5432/${POSTGRES_DB:-kazus}
+      JWT_SECRET: ${JWT_SECRET:-change-me-please-32-bytes-minimum-xxxxxx}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      DEFAULT_COINS: ${DEFAULT_COINS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["*"]}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        # wait for FastAPI startup hook (schema + admin + default coins seed)
+        # to finish, otherwise the very first cycle sees an empty DB and
+        # idles for REFRESH_INTERVAL_SEC.
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-kazus}:${POSTGRES_PASSWORD:-kazus}@db:5432/${POSTGRES_DB:-kazus}
+      REFRESH_INTERVAL_SEC: ${REFRESH_INTERVAL_SEC:-300}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      ALERT_TIMEFRAMES: ${ALERT_TIMEFRAMES:-D1,H1}
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+
+volumes:
+  pgdata:

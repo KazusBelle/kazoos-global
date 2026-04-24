@@ -1,0 +1,7 @@
+// Kept verbatim from the user-provided source. This file is the source of
+// truth for the KazusGlobalEngine port in shared/kazus_logic/engine.py.
+// Any behavior deviation in the Python implementation should be treated
+// as a bug and reconciled against this file.
+
+// (Pine script content is duplicated in the project README for context.
+// See README §"Pine source of truth" for the full text.)
