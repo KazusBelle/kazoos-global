@@ -2,8 +2,9 @@ import { useState } from "react";
 import { login } from "../lib/api";
 
 export function Login({ onLogin }: { onLogin: () => void }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("admin");
+  const [username, setUsername] = useState("kazus");
+  const [password, setPassword] = useState("globalocal");
+  const [remember, setRemember] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -12,7 +13,7 @@ export function Login({ onLogin }: { onLogin: () => void }) {
     setError(null);
     setLoading(true);
     try {
-      await login(username.trim(), password);
+      await login(username.trim(), password, remember);
       onLogin();
     } catch (err: any) {
       setError(err.message ?? "login failed");
@@ -28,8 +29,15 @@ export function Login({ onLogin }: { onLogin: () => void }) {
         className="w-full max-w-sm bg-panel border border-border rounded-2xl p-8 space-y-4 shadow-2xl"
       >
         <div className="flex items-center gap-3 mb-2">
-          <div className="w-9 h-9 rounded-full border-2 border-accent flex items-center justify-center text-accent font-bold">
-            K
+          <div className="relative w-9 h-9 rounded-full flex items-center justify-center text-accent font-bold overflow-hidden">
+            <img
+              src="/logo_tiger.png?v=20260426-1"
+              alt=""
+              className="h-full w-full object-contain"
+              onError={(e) => {
+                e.currentTarget.style.display = "none";
+              }}
+            />
           </div>
           <div>
             <div className="text-sm uppercase tracking-widest text-muted">Kazus</div>
@@ -54,7 +62,16 @@ export function Login({ onLogin }: { onLogin: () => void }) {
             onChange={(e) => setPassword(e.target.value)}
           />
         </label>
-        {error && <div className="text-premium text-sm">{error}</div>}
+        <label className="flex items-center gap-2 text-xs uppercase tracking-widest text-muted">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => setRemember(e.target.checked)}
+            className="h-4 w-4 accent-[#529e79]"
+          />
+          Remember me
+        </label>
+        {error && <div className="kz-premium text-sm">{error}</div>}
         <button
           type="submit"
           disabled={loading}

@@ -1,12 +1,45 @@
+import json
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from ..db.base import get_db
-from ..models.models import Coin, Snapshot, SystemStatus
-from ..schemas.schemas import DashboardResponse, DashboardRow, SnapshotOut
+from ..models.models import AlertEvent, Coin, Snapshot, SystemStatus
+from ..schemas.schemas import AlertEventOut, DashboardResponse, DashboardRow, SnapshotOut
 from .deps import get_current_user
 
 router = APIRouter(tags=["dashboard"])
+
+
+def _snapshot_to_schema(s: Snapshot) -> SnapshotOut:
+    data = {
+        "symbol": s.symbol,
+        "timeframe": s.timeframe,
+        "price": s.price,
+        "direction": s.direction,
+        "zone": s.zone,
+        "in_ote": s.in_ote,
+        "setup": s.setup,
+        "retracement": s.retracement,
+        "fib_low": s.fib_low,
+        "fib_high": s.fib_high,
+        "ote_low_price": s.ote_low_price,
+        "ote_high_price": s.ote_high_price,
+        "trend": s.trend,
+        "closes": _decode_closes(s.closes_json),
+        "updated_at": s.updated_at,
+    }
+    return SnapshotOut.model_validate(data)
+
+
+def _decode_closes(raw: str | None) -> list[float]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return [float(x) for x in parsed if x is not None]
+    except (ValueError, TypeError):
+        return []
 
 
 @router.get("/dashboard", response_model=DashboardResponse, response_model_by_alias=True)
@@ -16,6 +49,12 @@ def dashboard(db: Session = Depends(get_db), _=Depends(get_current_user)):
         (s.symbol, s.timeframe): s
         for s in db.query(Snapshot).all()
     }
+    recent_alerts = (
+        db.query(AlertEvent)
+        .order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
+        .limit(100)
+        .all()
+    )
 
     rows = []
     total = 0
@@ -30,8 +69,11 @@ def dashboard(db: Session = Depends(get_db), _=Depends(get_current_user)):
                 {
                     "symbol": coin.symbol,
                     "price": (l.price if l else (g.price if g else None)),
-                    "global": SnapshotOut.model_validate(g) if g else None,
-                    "local": SnapshotOut.model_validate(l) if l else None,
+                    "pinned_order": coin.pinned_order,
+                    "call_tag": coin.call_tag,
+                    "call_note": coin.call_note,
+                    "global": _snapshot_to_schema(g) if g else None,
+                    "local": _snapshot_to_schema(l) if l else None,
                 }
             )
         )
@@ -56,6 +98,7 @@ def dashboard(db: Session = Depends(get_db), _=Depends(get_current_user)):
             "discount": dic_count,
             "premium": pre_count,
         },
+        recent_alerts=[AlertEventOut.model_validate(item) for item in recent_alerts],
         last_refresh_at=sys_status.last_refresh_at if sys_status else None,
         last_error=sys_status.last_error if sys_status else None,
     )

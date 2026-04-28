@@ -13,6 +13,712 @@ body {
   background-color: #070709;
 }
 
+/* ── Motion ─────────────────────────────────────────────────────────────────
+   Animations everywhere on the site share the same cubic-bezier curve so
+   transitions feel consistent. The curve is a soft "ease-out-quint" that
+   starts fast, lands gently — closer to native macOS / iOS than the default
+   browser ease. */
+:root {
+  --kz-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --kz-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --kz-ease-spring: cubic-bezier(0.34, 1.32, 0.5, 1);
+}
+
+:root[data-motion="on"] button {
+  transition:
+    background-color 220ms var(--kz-ease),
+    color 220ms var(--kz-ease),
+    border-color 220ms var(--kz-ease),
+    opacity 220ms var(--kz-ease),
+    transform 200ms var(--kz-ease);
+}
+
+:root[data-motion="on"] button:active {
+  transform: scale(0.97);
+}
+
+:root[data-motion="off"] *,
+:root[data-motion="off"] *::before,
+:root[data-motion="off"] *::after {
+  animation: none !important;
+  transition-duration: 0ms !important;
+}
+
+@keyframes kzFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes kzModalEnter {
+  from {
+    opacity: 0;
+    backdrop-filter: blur(0);
+  }
+  to {
+    opacity: 1;
+    backdrop-filter: blur(8px);
+  }
+}
+
+@keyframes kzModalPop {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.96);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes kzPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes kzRowFlash {
+  0% {
+    background-color: transparent;
+  }
+  35% {
+    background-color: rgba(255, 255, 255, 0.05);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+/* Crossfade with a slight horizontal hint when the chart symbol changes —
+   gives the prev/next navigation an "expensive" weight rather than a hard
+   swap. */
+@keyframes kzChartSwitch {
+  from {
+    opacity: 0;
+    transform: translateX(8px) scale(0.995);
+    filter: blur(3px);
+  }
+  60% {
+    filter: blur(0);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+/* Center coin "comes from depth": starts slightly blurred/smaller and snaps
+   into crisp focus. */
+@keyframes kzCoinSwap {
+  0% {
+    opacity: 0;
+    transform: translateY(18px) scale(0.58) translateZ(-54px);
+    letter-spacing: 0.28em;
+    filter: blur(7px);
+  }
+  72% {
+    opacity: 1;
+    transform: translateY(0) scale(1.14) translateZ(0);
+    filter: blur(0.35px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) translateZ(0);
+    letter-spacing: 0.14em;
+    filter: blur(0);
+  }
+}
+
+/* Side coins stay in a deeper layer: dimmer/smaller, then sharpen a bit
+   when they enter after navigation. */
+@keyframes kzCoinSideSwap {
+  0% {
+    opacity: 0;
+    transform: translateY(5px) scale(0.82) translateZ(-16px);
+    filter: blur(1.2px);
+  }
+  100% {
+    opacity: 0.62;
+    transform: translateY(0) scale(0.94) translateZ(-10px);
+    filter: blur(0.16px);
+  }
+}
+
+@keyframes kzArrowSwap {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.76) translateZ(-10px);
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) translateZ(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes kzFlowFromRight {
+  0% {
+    opacity: 0;
+    transform: translateX(22px) scale(0.94);
+    filter: blur(0.8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes kzFlowFromLeft {
+  0% {
+    opacity: 0;
+    transform: translateX(-22px) scale(0.94);
+    filter: blur(0.8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes kzRowOutNext {
+  0% {
+    opacity: 1;
+    transform: translateX(0);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-54px);
+    filter: blur(0.8px);
+  }
+}
+
+@keyframes kzRowInNext {
+  0% {
+    opacity: 0;
+    transform: translateX(54px);
+    filter: blur(0.8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes kzRowOutPrev {
+  0% {
+    opacity: 1;
+    transform: translateX(0);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(54px);
+    filter: blur(0.8px);
+  }
+}
+
+@keyframes kzRowInPrev {
+  0% {
+    opacity: 0;
+    transform: translateX(-54px);
+    filter: blur(0.8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+    filter: blur(0);
+  }
+}
+
+:root[data-motion="on"] .kz-fade-enter {
+  animation: kzFadeIn 240ms var(--kz-ease) both;
+}
+
+:root[data-motion="on"] .kz-modal-enter {
+  animation: kzModalEnter 280ms var(--kz-ease) both;
+}
+
+:root[data-motion="on"] .kz-modal-pop {
+  animation: kzModalPop 360ms var(--kz-ease-spring) both;
+}
+
+:root[data-motion="on"] .kz-pop-in {
+  animation: kzPopIn 260ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .kz-row-flash {
+  animation: kzRowFlash 720ms ease-in-out both;
+}
+
+:root[data-motion="on"] .kz-chart-frame {
+  animation: kzChartSwitch 320ms var(--kz-ease-out) both;
+}
+
+/* Directional coin animations — data-dir on the coinNav wrapper picks the variant.
+   Support both legacy .coinNav and active .coinNav5 modal rail. */
+:root[data-motion="on"] .coinNav[data-dir=""] .kz-coin-active,
+:root[data-motion="on"] .coinNav:not([data-dir]) .kz-coin-active,
+:root[data-motion="on"] .coinNav5[data-dir=""] .kz-coin-active,
+:root[data-motion="on"] .coinNav5:not([data-dir]) .kz-coin-active {
+  animation: kzCoinSwap 1800ms var(--kz-ease-spring) both;
+}
+:root[data-motion="on"] .coinNav[data-dir="next"] .kz-coin-active,
+:root[data-motion="on"] .coinNav5[data-dir="next"] .kz-coin-active {
+  animation: kzCoinFromRight 1640ms var(--kz-ease-spring) both;
+}
+:root[data-motion="on"] .coinNav[data-dir="prev"] .kz-coin-active,
+:root[data-motion="on"] .coinNav5[data-dir="prev"] .kz-coin-active {
+  animation: kzCoinFromLeft 1640ms var(--kz-ease-spring) both;
+}
+
+/* Side coins: slide from the far side when new, fade from center when promoted. */
+:root[data-motion="on"] .coinNav[data-dir="next"] .kz-coin-side:first-child,
+:root[data-motion="on"] .coinNav5[data-dir="next"] .kz-coin-side:first-child {
+  animation: kzSideFromLeft 1520ms var(--kz-ease-out) both;
+}
+:root[data-motion="on"] .coinNav[data-dir="next"] .kz-coin-side:last-child,
+:root[data-motion="on"] .coinNav5[data-dir="next"] .kz-coin-side:last-child {
+  animation: kzSideFromCenter 1520ms var(--kz-ease-out) both;
+}
+:root[data-motion="on"] .coinNav[data-dir="prev"] .kz-coin-side:first-child,
+:root[data-motion="on"] .coinNav5[data-dir="prev"] .kz-coin-side:first-child {
+  animation: kzSideFromCenter 1520ms var(--kz-ease-out) both;
+}
+:root[data-motion="on"] .coinNav[data-dir="prev"] .kz-coin-side:last-child,
+:root[data-motion="on"] .coinNav5[data-dir="prev"] .kz-coin-side:last-child {
+  animation: kzSideFromRight 1520ms var(--kz-ease-out) both;
+}
+:root[data-motion="on"] .coinNav[data-dir=""] .kz-coin-side,
+:root[data-motion="on"] .coinNav:not([data-dir]) .kz-coin-side,
+:root[data-motion="on"] .coinNav5[data-dir=""] .kz-coin-side,
+:root[data-motion="on"] .coinNav5:not([data-dir]) .kz-coin-side {
+  animation: kzCoinSideSwap 1640ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .kz-coin-arrow {
+  animation: kzArrowSwap 1520ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .navRow-out-next {
+  animation: kzRowOutNext 360ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .navRow-in-next {
+  animation: kzRowInNext 360ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .navRow-out-prev {
+  animation: kzRowOutPrev 360ms var(--kz-ease-out) both;
+}
+
+:root[data-motion="on"] .navRow-in-prev {
+  animation: kzRowInPrev 360ms var(--kz-ease-out) both;
+}
+
+.kz-chart-shell {
+  position: relative;
+  display: grid;
+}
+
+.kz-chart-pane {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+.kz-chart-pane-out {
+  pointer-events: none;
+}
+
+/* Header buttons — subtle hover/press */
+.kz-btn {
+  transition:
+    background-color 200ms var(--kz-ease),
+    border-color 200ms var(--kz-ease),
+    color 200ms var(--kz-ease),
+    transform 180ms var(--kz-ease);
+}
+
+:root[data-motion="on"] .kz-btn:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+  border-color: rgba(228, 230, 235, 0.32);
+  color: #f4f4f5;
+}
+
+:root[data-motion="on"] .kz-btn:active {
+  transform: scale(0.96);
+}
+
+.kz-tab {
+  transition:
+    background-color 220ms var(--kz-ease),
+    color 220ms var(--kz-ease),
+    transform 200ms var(--kz-ease);
+}
+
+:root[data-motion="on"] .kz-tab:hover {
+  color: #e4e4e7;
+}
+
+:root[data-motion="on"] .kz-tab-active {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.kz-nav {
+  transition:
+    color 200ms var(--kz-ease),
+    transform 200ms var(--kz-ease),
+    opacity 200ms var(--kz-ease);
+}
+
+.kz-coin-rail {
+  perspective: 920px;
+  transform-style: preserve-3d;
+}
+
+.kz-coin-active {
+  transform: scale(1) translateZ(0);
+  letter-spacing: 0.14em;
+  text-shadow: none;
+}
+
+.kz-coin-side {
+  opacity: 0.62;
+  filter: blur(0.08px);
+  transform: scale(0.94) translateZ(-10px);
+}
+
+/* coinNav is taken OUT of flow. position:absolute + left:50% + translateX(-50%)
+   places it at the EXACT pixel center of .kz-modal-header regardless of how
+   wide the left info panel or right button panel are. */
+.coinNav {
+  position: absolute;
+  left: 50%;
+  top: calc(50% - 21px);
+  transform: translate(-50%, -50%);
+  display: grid;
+  grid-template-columns: 90px 32px 120px 32px 90px;
+  align-items: center;
+  justify-items: center;
+  column-gap: 10px;
+  height: 60px;
+  line-height: 1;
+  perspective: 900px;
+  transform-style: preserve-3d;
+}
+
+.coinNav * {
+  line-height: 1;
+}
+
+.coinNav button,
+.coinNav span {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: center;
+}
+
+.currentCoin {
+  text-align: center;
+  color: #fff;
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Optical correction: cap-height ≈ 0.72em, so glyphs sit ~3px below
+     the geometric center of the em square. Shift up to hit optical center. */
+  transform: translateY(-2px);
+}
+
+.sideCoin {
+  opacity: 0.6;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.arrow {
+  opacity: 0.55;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 28px;
+  line-height: 1;
+  transition:
+    opacity 160ms var(--kz-ease),
+    color 160ms var(--kz-ease),
+    transform 160ms var(--kz-ease);
+}
+
+.arrow:not(:disabled):hover {
+  opacity: 1;
+  color: #ffffff;
+  transform: scale(1.22);
+}
+
+:root[data-motion="on"] .arrow:not(:disabled):active {
+  transform: scale(0.88);
+  transition-duration: 80ms;
+}
+
+:root[data-motion="on"] .kz-nav:not(:disabled):hover {
+  color: #f4f4f5;
+}
+
+:root[data-motion="on"] .kz-nav:not(:disabled):hover > span:first-child {
+  transform: translateX(-2px);
+}
+
+:root[data-motion="on"] .kz-nav:not(:disabled):hover > span:last-child {
+  transform: translateX(2px);
+}
+
+.kz-nav > span {
+  display: inline-block;
+  transition: transform 220ms var(--kz-ease);
+}
+
+.kz-table-scroll {
+  scrollbar-gutter: stable;
+  scroll-behavior: smooth;
+}
+
+.kz-table-scroll thead tr {
+  background: rgba(13, 14, 18, 0.95);
+}
+
+.kz-premium {
+  color: #752727 !important;
+}
+
+.kz-premium-hover:hover {
+  color: #752727 !important;
+}
+
+.kz-step {
+  transition:
+    color 200ms var(--kz-ease),
+    background-color 200ms var(--kz-ease);
+}
+
+:root[data-motion="on"] .kz-step:not(:disabled):hover {
+  color: #f4f4f5;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.kz-checkbox {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border: 1px solid #5a5f6b;
+  border-radius: 3px;
+  background: transparent;
+  position: relative;
+  cursor: pointer;
+  transition:
+    background-color 180ms var(--kz-ease),
+    border-color 180ms var(--kz-ease);
+}
+
+.kz-checkbox:checked {
+  background-color: #e3822d;
+  border-color: #e3822d;
+}
+
+.kz-checkbox:checked::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0px;
+  width: 4px;
+  height: 7px;
+  border: solid #1a1c22;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
+.kz-fvg-input::-webkit-outer-spin-button,
+.kz-fvg-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.kz-fvg-input {
+  -moz-appearance: textfield;
+}
+
+/* ── Directional coin-nav keyframes ─────────────────────────────────────────
+   kzCoinFromRight / Left: horizontal entrance for the center coin.
+   kzSideFrom*: entrance for side coins after navigation.              */
+
+@keyframes kzCoinFromRight {
+  0%   { opacity: 0; transform: translateX(44px) scale(0.82); filter: blur(6px); }
+  60%  { filter: blur(0); transform: translateX(-3px) scale(1.06); }
+  100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
+}
+
+@keyframes kzCoinFromLeft {
+  0%   { opacity: 0; transform: translateX(-44px) scale(0.82); filter: blur(6px); }
+  60%  { filter: blur(0); transform: translateX(3px) scale(1.06); }
+  100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
+}
+
+@keyframes kzSideFromLeft {
+  0%   { opacity: 0; transform: translateX(-40px) scale(0.88) translateZ(-16px); filter: blur(1.5px); }
+  100% { opacity: 0.62; transform: translateX(0) scale(0.94) translateZ(-10px); filter: blur(0.08px); }
+}
+
+@keyframes kzSideFromRight {
+  0%   { opacity: 0; transform: translateX(40px) scale(0.88) translateZ(-16px); filter: blur(1.5px); }
+  100% { opacity: 0.62; transform: translateX(0) scale(0.94) translateZ(-10px); filter: blur(0.08px); }
+}
+
+/* Side coin that was the center — fades from large+opaque to dim */
+@keyframes kzSideFromCenter {
+  0%   { opacity: 0.9; transform: translateX(0) scale(1) translateZ(0); filter: blur(0); }
+  100% { opacity: 0.62; transform: translateX(0) scale(0.94) translateZ(-10px); filter: blur(0.08px); }
+}
+
+/* ── Modal header ────────────────────────────────────────────────────────────
+   coinNav is position:absolute so left:50% + translateX(-50%) pins it to the
+   EXACT geometric center of the header regardless of left/right panel widths.
+   Grid / flex approaches depend on equal column sizes which can drift;
+   absolute centering has zero dependence on sibling content. */
+
+.kz-modal-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  height: 48px;
+  border-bottom: 1px solid #2a2a2e;
+  margin-bottom: 8px;
+}
+
+.coinNav5 {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate3d(-50%, -50%, 0);
+  display: grid;
+  grid-template-columns: 70px 90px 28px 130px 28px 90px 70px;
+  align-items: center;
+  justify-items: center;
+  place-items: center;
+  column-gap: 10px;
+  width: 626px;
+  height: 100%;
+  pointer-events: none;
+}
+
+.coinNav5 > * {
+  align-self: center;
+  justify-self: center;
+  min-width: 0;
+  max-width: 100%;
+  pointer-events: auto;
+}
+
+.coinNav5 button,
+.coinNav5 span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coinNav5 .sideCoin {
+  text-align: center;
+  line-height: 1;
+  white-space: nowrap;
+  transform: none;
+}
+
+.coinNav5 .sideCoin-near {
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.coinNav5 .sideCoin-far {
+  color: rgba(255, 255, 255, 0.32);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}
+
+.coinNav5 .currentCoin {
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transform: none;
+}
+
+.coinNav5 .arrow {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 26px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.9;
+  transform: none;
+}
+
+.kz-unified-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.kz-toolbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-motion="on"] *,
+  :root[data-motion="on"] *::before,
+  :root[data-motion="on"] *::after {
+    animation: none !important;
+    transition-duration: 0ms !important;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

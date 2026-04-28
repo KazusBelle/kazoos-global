@@ -9,12 +9,11 @@ import random
 
 from kazus_logic.engine import (
     Bar,
-    EQUILIBRIUM_HIGH,
-    EQUILIBRIUM_LOW,
     KazusGlobalEngine,
     KazusLocalEngine,
     OTE_HIGH,
     OTE_LOW,
+    PREMIUM_LIMIT,
     classify_zone,
     detect_setup,
 )
@@ -28,14 +27,18 @@ def test_classify_zone_boundaries():
     assert classify_zone(None) == "none"
     assert classify_zone(0.0) == "premium"
     assert classify_zone(0.2) == "premium"
-    assert classify_zone(0.5) == "equilibrium"
-    assert classify_zone(EQUILIBRIUM_LOW) == "equilibrium"
-    assert classify_zone(EQUILIBRIUM_HIGH) == "equilibrium"
-    # 0.5–0.61 → discount (per user requirement)
+    assert classify_zone(PREMIUM_LIMIT - 1e-6) == "premium"
+    # 0.5–0.618 → discount
+    assert classify_zone(0.5) == "discount"
     assert classify_zone(0.55) == "discount"
     assert classify_zone(0.6) == "discount"
-    assert classify_zone(0.7) == "discount"
-    assert classify_zone(1.0) == "discount"
+    # 0.618–0.79 → OTE zone
+    assert classify_zone(OTE_LOW) == "ote"
+    assert classify_zone(0.7) == "ote"
+    assert classify_zone(OTE_HIGH) == "ote"
+    # deeper retracement becomes abnormal
+    assert classify_zone(0.8) == "abnormal"
+    assert classify_zone(1.0) == "abnormal"
 
 
 def test_detect_setup():
@@ -95,9 +98,9 @@ def test_global_engine_detects_bullish_ms():
     s_high = eng.snapshot(snap.fib_high - 1e-6)
     assert s_high.zone == "premium"
 
-    # Price near fib_low → retracement ~1.0 → discount.
+    # Price near fib_low → retracement ~1.0 → abnormal.
     s_low = eng.snapshot(snap.fib_low + 1e-6)
-    assert s_low.zone == "discount"
+    assert s_low.zone == "abnormal"
 
 
 def test_local_engine_zigzag_produces_fib():

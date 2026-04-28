@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import auth, coins, dashboard
+from .api import auth, chart, coins, dashboard, tda
 from .core.config import get_settings
 from .db.init_db import create_schema, seed_initial_data
 
@@ -26,6 +26,8 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix=settings.api_prefix)
     app.include_router(coins.router, prefix=settings.api_prefix)
     app.include_router(dashboard.router, prefix=settings.api_prefix)
+    app.include_router(chart.router, prefix=settings.api_prefix)
+    app.include_router(tda.router, prefix=settings.api_prefix)
 
     @app.get("/healthz")
     def healthz():

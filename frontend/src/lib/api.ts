@@ -3,7 +3,7 @@ export type Snapshot = {
   timeframe: string;
   price: number | null;
   direction: string;
-  zone: "premium" | "discount" | "equilibrium" | "none" | string;
+  zone: "premium" | "discount" | "ote" | "none" | string;
   in_ote: boolean;
   setup: "yes" | "no" | string;
   retracement: number | null;
@@ -12,32 +12,59 @@ export type Snapshot = {
   ote_low_price: number | null;
   ote_high_price: number | null;
   trend: string;
+  closes: number[];
   updated_at: string;
 };
+
+export type CallTag = "vanga" | "voldemar" | "makiavelli" | "me" | null;
 
 export type DashboardRow = {
   symbol: string;
   price: number | null;
+  pinned_order: number | null;
+  call_tag: CallTag;
+  call_note: string | null;
   global: Snapshot | null;
   local: Snapshot | null;
+};
+
+export type Coin = {
+  id: number;
+  symbol: string;
+  is_active: boolean;
+  pinned_order: number | null;
+  call_tag: CallTag;
+  call_note: string | null;
 };
 
 export type DashboardResponse = {
   rows: DashboardRow[];
   totals: { total: number; ote: number; discount: number; premium: number };
+  recent_alerts: AlertEvent[];
   last_refresh_at: string | null;
   last_error: string | null;
+};
+
+export type AlertEvent = {
+  id: number;
+  timeframe: string;
+  message: string;
+  created_at: string;
 };
 
 const TOKEN_KEY = "kazus_token";
 
 export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return localStorage.getItem(TOKEN_KEY) ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
-export function setToken(token: string | null) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+export function setToken(token: string | null, remember = true) {
+  localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(TOKEN_KEY);
+  if (token) {
+    const storage = remember ? localStorage : sessionStorage;
+    storage.setItem(TOKEN_KEY, token);
+  }
 }
 
 async function request<T>(
@@ -69,30 +96,143 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-export async function login(username: string, password: string): Promise<string> {
+export async function login(username: string, password: string, remember = true): Promise<string> {
   const res = await request<{ access_token: string }>("/auth/login-json", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
-  setToken(res.access_token);
+  setToken(res.access_token, remember);
   return res.access_token;
 }
 
 export async function listCoins() {
-  return request<{ id: number; symbol: string; is_active: boolean }[]>("/coins");
+  return request<Coin[]>("/coins");
 }
 
 export async function addCoin(symbol: string) {
-  return request<{ id: number; symbol: string; is_active: boolean }>("/coins", {
+  return request<Coin>("/coins", {
     method: "POST",
     body: JSON.stringify({ symbol }),
   });
+}
+
+export async function suggestCoins(query: string, limit = 12) {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(limit),
+  });
+  return request<string[]>(`/coins/suggestions?${params.toString()}`);
 }
 
 export async function removeCoin(symbol: string) {
   return request<void>(`/coins/${encodeURIComponent(symbol)}`, { method: "DELETE" });
 }
 
+export async function togglePin(symbol: string) {
+  return request<Coin>(`/coins/${encodeURIComponent(symbol)}/pin`, { method: "POST" });
+}
+
+export async function movePin(symbol: string, direction: "up" | "down") {
+  return request<Coin[]>(`/coins/${encodeURIComponent(symbol)}/pin/move`, {
+    method: "POST",
+    body: JSON.stringify({ direction }),
+  });
+}
+
+export async function setCall(symbol: string, tag: CallTag, note: string | null) {
+  return request<Coin>(`/coins/${encodeURIComponent(symbol)}/call`, {
+    method: "POST",
+    body: JSON.stringify({ tag, note }),
+  });
+}
+
 export async function getDashboard() {
   return request<DashboardResponse>("/dashboard");
+}
+
+export type OHLCVBar = {
+  ts: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+export type SwingPoint = {
+  ts: number;
+  price: number;
+  label: "HH" | "HL" | "LL" | "LH" | string;
+};
+
+export type FvgBox = {
+  ts: number;
+  end_ts: number;
+  top: number;
+  bottom: number;
+  kind: "bullish" | "bearish" | string;
+};
+
+export type ChartData = {
+  symbol: string;
+  interval: string;
+  bars: OHLCVBar[];
+  swings: SwingPoint[];
+  fvgs: FvgBox[];
+  fib_high: number | null;
+  fib_low: number | null;
+  fib_direction: "bullish" | "bearish" | "none" | string;
+};
+
+export async function getChart(symbol: string, interval: string, limit?: number) {
+  // When limit is undefined the backend picks a per-interval default that
+  // matches the worker (d1=500, h1=900, 15m=600) so the chart's engine state
+  // is identical to what the screener table shows.
+  const params = new URLSearchParams({ interval });
+  if (limit != null) params.set("limit", String(limit));
+  return request<ChartData>(
+    `/chart/${encodeURIComponent(symbol)}?${params.toString()}`
+  );
+}
+
+export type TDAState = {
+  coins: string[];
+  data: Record<string, Record<string, string>>;
+  photos: Record<string, string>;
+};
+
+export async function getTdaState() {
+  return request<TDAState>("/tda/state");
+}
+
+export async function saveTdaState(state: TDAState) {
+  return request<TDAState>("/tda/state", {
+    method: "PUT",
+    body: JSON.stringify(state),
+  });
+}
+
+export async function patchTdaState(state: Partial<TDAState>) {
+  try {
+    return await request<TDAState>("/tda/state", {
+      method: "PATCH",
+      body: JSON.stringify(state),
+    });
+  } catch {
+    // PATCH failed — fall back to a full PUT merged with current server state.
+    const current = await getTdaState().catch(
+      () => ({ coins: [], data: {}, photos: {} }) as TDAState
+    );
+    const merged: TDAState = {
+      coins: state.coins ?? current.coins,
+      data: state.data ?? current.data,
+      photos: state.photos ?? current.photos,
+    };
+    try {
+      return await saveTdaState(merged);
+    } catch {
+      // PUT also failed — last resort: strip photos to reduce payload size and retry.
+      return saveTdaState({ coins: merged.coins, data: merged.data, photos: {} });
+    }
+  }
 }

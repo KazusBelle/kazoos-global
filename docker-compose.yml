@@ -27,8 +27,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-kazus}:${POSTGRES_PASSWORD:-kazus}@db:5432/${POSTGRES_DB:-kazus}
       JWT_SECRET: ${JWT_SECRET:-change-me-please-32-bytes-minimum-xxxxxx}
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-kazus}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-globalocal}
       DEFAULT_COINS: ${DEFAULT_COINS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT}
       CORS_ORIGINS: ${CORS_ORIGINS:-["*"]}
     ports:

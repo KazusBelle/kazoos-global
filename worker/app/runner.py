@@ -16,6 +16,7 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 from datetime import datetime, timezone
@@ -25,8 +26,9 @@ from sqlalchemy.orm import Session
 
 from kazus_logic.binance import BinanceFuturesClient
 from kazus_logic.compute import SymbolSnapshot, compute_symbol
-from kazus_db.models import AlertState, Coin, Snapshot, SystemStatus
+from kazus_db.models import AlertEvent, AlertState, Coin, Snapshot, SystemStatus
 
+from .alerts import format_alert_batch
 from .db import SessionLocal
 from .settings import get_settings
 from .telegram import send_telegram
@@ -50,6 +52,7 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
     alert_timeframes = {
         t.strip() for t in settings.alert_timeframes.split(",") if t.strip()
     }
+    entered_symbols_by_tf: dict[str, list[str]] = {tf: [] for tf in alert_timeframes}
 
     last_error: str | None = None
     for symbol in coins:
@@ -66,28 +69,42 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
 
         with SessionLocal() as db:
             _upsert_snapshots(db, snap)
-            alerts_to_send = _update_alert_states(db, snap, alert_timeframes)
+            entered_timeframes, setup_timeframes = _update_alert_states(db, snap, alert_timeframes)
             db.commit()
 
-        for tf, text in alerts_to_send:
-            await send_telegram(settings.telegram_bot_token, settings.telegram_chat_id, text)
-            with SessionLocal() as db:
-                row = (
-                    db.query(AlertState)
-                    .filter(AlertState.symbol == symbol, AlertState.timeframe == tf)
-                    .first()
-                )
-                if row is not None:
-                    row.last_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    db.commit()
+        for tf in entered_timeframes:
+            entered_symbols_by_tf.setdefault(tf, []).append(symbol)
+
+        # Setup alerts (FVG confirmed in OTE) — sent immediately per symbol.
+        for tf in setup_timeframes:
+            await _send_setup_alert(settings, snap.symbol, tf)
+
+    for tf in ("D1", "H1"):
+        symbols = entered_symbols_by_tf.get(tf, [])
+        if not symbols:
+            continue
+        message = format_alert_batch(symbols, tf)
+        with SessionLocal() as db:
+            db.add(AlertEvent(timeframe=tf, message=message))
+            db.flush()
+            _prune_alert_events(db)
+            db.commit()
+        await send_telegram(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            message,
+        )
+        with SessionLocal() as db:
+            _mark_alerts_sent(db, symbols, tf)
+            db.commit()
 
     _touch_status(last_error)
 
 
 def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
-    for tf, result, trend in (
-        ("D1", snap.global_result, snap.global_trend),
-        ("H1", snap.local_result, snap.local_trend),
+    for tf, result, trend, closes in (
+        ("D1", snap.global_result, snap.global_trend, snap.global_closes),
+        ("H1", snap.local_result, snap.local_trend, snap.local_closes),
     ):
         row = (
             db.query(Snapshot)
@@ -108,14 +125,20 @@ def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
         row.ote_low_price = result.ote_low_price
         row.ote_high_price = result.ote_high_price
         row.trend = trend
+        row.closes_json = json.dumps(closes) if closes else None
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _update_alert_states(
     db: Session, snap: SymbolSnapshot, timeframes: Iterable[str]
-) -> list[tuple[str, str]]:
-    """Return list of (timeframe, message) pairs that still need to be sent."""
-    out: list[tuple[str, str]] = []
+) -> tuple[list[str], list[str]]:
+    """
+    Returns (ote_entered_timeframes, setup_entered_timeframes).
+    OTE re-entry and setup transition each fire exactly one alert.
+    """
+    ote_entered: list[str] = []
+    setup_entered: list[str] = []
+
     for tf, result in (("D1", snap.global_result), ("H1", snap.local_result)):
         if tf not in timeframes:
             continue
@@ -126,46 +149,77 @@ def _update_alert_states(
             .first()
         )
         if row is None:
-            row = AlertState(symbol=snap.symbol, timeframe=tf, in_ote=False)
+            row = AlertState(symbol=snap.symbol, timeframe=tf, in_ote=False, in_setup=False)
             db.add(row)
             db.flush()
 
         prev_in_ote = bool(row.in_ote)
         now_in_ote = bool(result.in_ote)
+        prev_in_setup = bool(getattr(row, "in_setup", False))
+        now_in_setup = result.setup == "yes"
 
-        # Entering OTE → send exactly one alert.
         if now_in_ote and not prev_in_ote:
-            out.append(
-                (
-                    tf,
-                    _format_alert(snap.symbol, tf, snap.price, result),
-                )
-            )
+            ote_entered.append(tf)
+
+        # Setup fires when: newly in setup (was no, now yes).
+        # Reset when price leaves OTE.
+        if now_in_setup and not prev_in_setup:
+            setup_entered.append(tf)
+        if not now_in_ote:
+            now_in_setup = False  # reset setup state when OTE exits
 
         row.in_ote = now_in_ote
+        row.in_setup = now_in_setup
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    return out
+
+    return ote_entered, setup_entered
 
 
-def _format_alert(symbol: str, timeframe: str, price: float, result) -> str:
-    tf_label = "D1 (GLOBAL)" if timeframe == "D1" else "H1 (LOCAL)"
-    dir_label = result.direction.upper()
-    ret_pct = f"{result.retracement * 100:.2f}%" if result.retracement is not None else "n/a"
-    zone_label = _format_ote_range(result)
-    return (
-        f"<b>OTE entry</b> — {symbol}\n"
-        f"TF: {tf_label}\n"
-        f"Direction: {dir_label}\n"
-        f"Price: {price}\n"
-        f"Retracement: {ret_pct}\n"
-        f"{zone_label}"
+async def _send_setup_alert(settings, symbol: str, timeframe: str) -> None:
+    fvg_tf = "H1 FVG" if timeframe == "D1" else "M15 FVG"
+    message = (
+        f"🎯 SETUP: #{symbol} [{timeframe}]\n"
+        f"Price is in OTE and closed above nearest {fvg_tf}.\n"
+        f"Long entry confirmed."
     )
+    logger.info("setup alert: %s %s", symbol, timeframe)
+    with SessionLocal() as db:
+        db.add(AlertEvent(timeframe=timeframe, message=message))
+        db.flush()
+        _prune_alert_events(db)
+        row = (
+            db.query(AlertState)
+            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
+            .first()
+        )
+        if row is not None:
+            row.last_setup_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.commit()
+    await send_telegram(settings.telegram_bot_token, settings.telegram_chat_id, message)
 
 
-def _format_ote_range(result) -> str:
-    if result.ote_low_price is None or result.ote_high_price is None:
-        return ""
-    return f"OTE zone: {result.ote_low_price:.6g} – {result.ote_high_price:.6g}"
+def _mark_alerts_sent(db: Session, symbols: list[str], timeframe: str) -> None:
+    sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    for symbol in symbols:
+        row = (
+            db.query(AlertState)
+            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
+            .first()
+        )
+        if row is not None:
+            row.last_alert_at = sent_at
+
+
+def _prune_alert_events(db: Session, keep: int = 100) -> None:
+    keep_ids = (
+        db.query(AlertEvent.id)
+        .order_by(AlertEvent.created_at.desc(), AlertEvent.id.desc())
+        .limit(keep)
+        .subquery()
+    )
+    db.query(AlertEvent).filter(AlertEvent.id.not_in(keep_ids)).delete(
+        synchronize_session=False
+    )
 
 
 def _touch_status(last_error: str | None) -> None:

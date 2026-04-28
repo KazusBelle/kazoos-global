@@ -1,0 +1,18 @@
+services:
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install --prefer-offline && npm run dev"
+    volumes:
+      - ./frontend:/app
+      - frontend_nm:/app/node_modules
+    environment:
+      VITE_API_PROXY: http://backend:8000
+    ports:
+      - "${FRONTEND_PORT:-8080}:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  frontend_nm:
