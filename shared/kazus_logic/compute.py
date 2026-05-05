@@ -274,8 +274,8 @@ def _promote_zone_result(
     """
     Pick the highest-priority event for the snapshot UI label so the screener
     keeps showing a single setup string (STB > Inversion > Created). The
-    `setup_fvg_*` fields mirror the chosen event for any consumer that still
-    reads them; the worker uses the events list directly for alerts.
+    worker uses the events list directly for chart rendering and alert
+    deduping — only `setup` is mirrored on ZoneResult for the UI label.
     """
     if not events:
         return zone_result
@@ -290,8 +290,6 @@ def _promote_zone_result(
         fib_high=zone_result.fib_high,
         ote_low_price=zone_result.ote_low_price,
         ote_high_price=zone_result.ote_high_price,
-        setup_fvg_top=best.fvg_top,
-        setup_fvg_bottom=best.fvg_bottom,
     )
 
 
