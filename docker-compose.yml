@@ -62,6 +62,7 @@ services:
     depends_on:
       - backend
     ports:
+      - "${FRONTEND_HTTP_PORT:-80}:80"
       - "${FRONTEND_PORT:-8080}:80"
 
 volumes:
