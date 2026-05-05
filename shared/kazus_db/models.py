@@ -54,7 +54,8 @@ class Snapshot(Base):
     direction: Mapped[str] = mapped_column(String(16), default="none")
     zone: Mapped[str] = mapped_column(String(16), default="none")
     in_ote: Mapped[bool] = mapped_column(Boolean, default=False)
-    setup: Mapped[str] = mapped_column(String(4), default="no")
+    # "" (no setup) | "Inversion" | "Created"
+    setup: Mapped[str] = mapped_column(String(16), default="")
     retracement: Mapped[Optional[float]] = mapped_column(Float)
 
     fib_low: Mapped[Optional[float]] = mapped_column(Float)
@@ -81,7 +82,9 @@ class AlertState(Base):
     symbol: Mapped[str] = mapped_column(String(32))
     timeframe: Mapped[str] = mapped_column(String(8))
     in_ote: Mapped[bool] = mapped_column(Boolean, default=False)
-    in_setup: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # JSON array of setup event_ids already alerted within the current OTE
+    # window. Cleared when price exits OTE so re-entry restarts the stream.
+    sent_event_ids: Mapped[Optional[str]] = mapped_column(Text)
     last_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_setup_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

@@ -26,8 +26,14 @@ _ADDITIVE_MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_alert_events_timeframe ON alert_events (timeframe)",
     "CREATE INDEX IF NOT EXISTS ix_alert_events_created_at ON alert_events (created_at)",
-    "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS in_setup BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS last_setup_alert_at TIMESTAMP",
+    "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS sent_event_ids TEXT",
+    "ALTER TABLE alert_states DROP COLUMN IF EXISTS last_setup_kind",
+    "ALTER TABLE alert_states DROP COLUMN IF EXISTS in_setup",
+    # Snapshot.setup widened from yes/no flag to setup-kind label.
+    "ALTER TABLE snapshots ALTER COLUMN setup TYPE VARCHAR(16)",
+    "ALTER TABLE snapshots ALTER COLUMN setup SET DEFAULT ''",
+    "UPDATE snapshots SET setup = '' WHERE setup IN ('no', 'yes')",
     """
     CREATE TABLE IF NOT EXISTS user_tda_states (
         id SERIAL PRIMARY KEY,

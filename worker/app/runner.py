@@ -7,9 +7,9 @@ Responsibilities:
 - For each coin fetch D1 and H1 klines from Binance Futures and compute
   the KazusGlobal (D1) + KazusLocal (H1) snapshot.
 - Upsert the result into `snapshots`.
-- Update per-(symbol, timeframe) alert state; send a Telegram notification
-  only on OTE re-entry (outside → inside). Do NOT resend while the price
-  stays inside OTE. When price leaves OTE the state resets.
+- Drive a per-(symbol, timeframe) event-stream alert state: while price is
+  in OTE, fire one Telegram message per new SetupEvent (STB / Inversion /
+  Created), deduped by event_id. Reset the sent set when price leaves OTE.
 - Update `system_status.last_refresh_at` and `last_error`.
 """
 
@@ -20,18 +20,19 @@ import json
 import logging
 import signal
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, List, Tuple
 
 from sqlalchemy.orm import Session
 
 from kazus_logic.binance import BinanceFuturesClient
-from kazus_logic.compute import SymbolSnapshot, compute_symbol
+from kazus_logic.compute import SetupEvent, SymbolSnapshot, compute_symbol
+from kazus_logic.engine import Bar, ZoneResult
 from kazus_db.models import AlertEvent, AlertState, Coin, Snapshot, SystemStatus
 
-from .alerts import format_alert_batch
+from .chart_image import render_htf_png, render_setup_png
 from .db import SessionLocal
 from .settings import get_settings
-from .telegram import send_telegram
+from .telegram import send_telegram, send_telegram_media_group, send_telegram_photo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("kazus.worker")
@@ -52,7 +53,6 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
     alert_timeframes = {
         t.strip() for t in settings.alert_timeframes.split(",") if t.strip()
     }
-    entered_symbols_by_tf: dict[str, list[str]] = {tf: [] for tf in alert_timeframes}
 
     last_error: str | None = None
     for symbol in coins:
@@ -69,34 +69,14 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
 
         with SessionLocal() as db:
             _upsert_snapshots(db, snap)
-            entered_timeframes, setup_timeframes = _update_alert_states(db, snap, alert_timeframes)
+            new_events = _collect_new_events(db, snap, alert_timeframes)
             db.commit()
 
-        for tf in entered_timeframes:
-            entered_symbols_by_tf.setdefault(tf, []).append(symbol)
-
-        # Setup alerts (FVG confirmed in OTE) — sent immediately per symbol.
-        for tf in setup_timeframes:
-            await _send_setup_alert(settings, snap.symbol, tf)
-
-    for tf in ("D1", "H1"):
-        symbols = entered_symbols_by_tf.get(tf, [])
-        if not symbols:
-            continue
-        message = format_alert_batch(symbols, tf)
-        with SessionLocal() as db:
-            db.add(AlertEvent(timeframe=tf, message=message))
-            db.flush()
-            _prune_alert_events(db)
-            db.commit()
-        await send_telegram(
-            settings.telegram_bot_token,
-            settings.telegram_chat_id,
-            message,
-        )
-        with SessionLocal() as db:
-            _mark_alerts_sent(db, symbols, tf)
-            db.commit()
+        # Fire one Telegram message per new event. Persist the event_id only
+        # AFTER successful send (commit-after-send), so a transient Telegram
+        # failure causes a retry on the next cycle rather than a lost alert.
+        for tf, event in new_events:
+            await _send_setup_alert(settings, snap, tf, event)
 
     _touch_status(last_error)
 
@@ -118,7 +98,7 @@ def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
         row.direction = result.direction
         row.zone = result.zone
         row.in_ote = result.in_ote
-        row.setup = result.setup
+        row.setup = result.setup or ""
         row.retracement = result.retracement
         row.fib_low = result.fib_low
         row.fib_high = result.fib_high
@@ -129,17 +109,24 @@ def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _update_alert_states(
+def _collect_new_events(
     db: Session, snap: SymbolSnapshot, timeframes: Iterable[str]
-) -> tuple[list[str], list[str]]:
+) -> List[Tuple[str, SetupEvent]]:
     """
-    Returns (ote_entered_timeframes, setup_entered_timeframes).
-    OTE re-entry and setup transition each fire exactly one alert.
-    """
-    ote_entered: list[str] = []
-    setup_entered: list[str] = []
+    For each enabled timeframe, dedupe the snapshot's setup events against
+    AlertState.sent_event_ids. Returns events that should fire NOW; commit
+    of `sent_event_ids` happens after each successful Telegram send so that
+    failed sends retry on the next cycle.
 
-    for tf, result in (("D1", snap.global_result), ("H1", snap.local_result)):
+    On OTE exit, the per-(symbol, timeframe) sent set is cleared so a later
+    re-entry restarts the event stream.
+    """
+    pending: List[Tuple[str, SetupEvent]] = []
+
+    for tf, result, events in (
+        ("D1", snap.global_result, snap.global_setup_events),
+        ("H1", snap.local_result, snap.local_setup_events),
+    ):
         if tf not in timeframes:
             continue
 
@@ -149,65 +136,137 @@ def _update_alert_states(
             .first()
         )
         if row is None:
-            row = AlertState(symbol=snap.symbol, timeframe=tf, in_ote=False, in_setup=False)
+            row = AlertState(symbol=snap.symbol, timeframe=tf, in_ote=False)
             db.add(row)
             db.flush()
 
-        prev_in_ote = bool(row.in_ote)
         now_in_ote = bool(result.in_ote)
-        prev_in_setup = bool(getattr(row, "in_setup", False))
-        now_in_setup = result.setup == "yes"
 
-        if now_in_ote and not prev_in_ote:
-            ote_entered.append(tf)
-
-        # Setup fires when: newly in setup (was no, now yes).
-        # Reset when price leaves OTE.
-        if now_in_setup and not prev_in_setup:
-            setup_entered.append(tf)
         if not now_in_ote:
-            now_in_setup = False  # reset setup state when OTE exits
+            row.in_ote = False
+            row.sent_event_ids = "[]"
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            continue
 
-        row.in_ote = now_in_ote
-        row.in_setup = now_in_setup
+        sent_ids = _load_sent_ids(row.sent_event_ids)
+        new_for_tf: List[SetupEvent] = []
+        for event in events:
+            if event.event_id in sent_ids:
+                continue
+            new_for_tf.append(event)
+
+        row.in_ote = True
+        # Persist OTE entry/state immediately; sent_event_ids is updated
+        # per-event in _send_setup_alert after Telegram acknowledges.
+        if row.sent_event_ids is None:
+            row.sent_event_ids = "[]"
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    return ote_entered, setup_entered
+        for event in new_for_tf:
+            pending.append((tf, event))
+
+    return pending
 
 
-async def _send_setup_alert(settings, symbol: str, timeframe: str) -> None:
-    fvg_tf = "H1 FVG" if timeframe == "D1" else "M15 FVG"
-    message = (
-        f"🎯 SETUP: #{symbol} [{timeframe}]\n"
-        f"Price is in OTE and closed above nearest {fvg_tf}.\n"
-        f"Long entry confirmed."
+def _load_sent_ids(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(x) for x in data}
+
+
+async def _send_setup_alert(
+    settings, snap: SymbolSnapshot, timeframe: str, event: SetupEvent
+) -> None:
+    if timeframe == "D1":
+        result: ZoneResult = snap.global_result
+        bars: list[Bar] = list(snap.global_confirmation_bars)
+        htf_bars: list[Bar] = list(snap.global_htf_bars)
+        confirmation_tf = "H1"
+    else:
+        result = snap.local_result
+        bars = list(snap.local_confirmation_bars)
+        htf_bars = list(snap.local_htf_bars)
+        confirmation_tf = "M15"
+
+    symbol = snap.symbol
+    price_str = f"{snap.price:g}" if snap.price else "—"
+    retr_str = (
+        f"{result.retracement * 100:.1f}%" if result.retracement is not None else "—"
     )
-    logger.info("setup alert: %s %s", symbol, timeframe)
+    ote_str = (
+        f"{result.ote_low_price:g} – {result.ote_high_price:g}"
+        if result.ote_low_price is not None and result.ote_high_price is not None
+        else "—"
+    )
+    fvg_str = f"{event.fvg_bottom:g} – {event.fvg_top:g}"
+    message = (
+        f"🎯 <b>{event.kind}</b> setup: #{symbol} [{timeframe}]\n"
+        f"{event.direction} trend, retracement {retr_str}\n"
+        f"Price: {price_str}\n"
+        f"OTE:   {ote_str}\n"
+        f"FVG:   {fvg_str}\n"
+        f"Confirmation: {confirmation_tf} bars"
+    )
+    logger.info(
+        "setup alert: %s %s kind=%s id=%s",
+        symbol, timeframe, event.kind, event.event_id,
+    )
+
+    htf_photo = render_htf_png(
+        symbol, timeframe, htf_bars, result, event.kind, event.fvg_top, event.fvg_bottom
+    )
+    confirm_photo = render_setup_png(
+        symbol, timeframe, confirmation_tf, bars, result,
+        event.kind, event.fvg_top, event.fvg_bottom,
+    )
+
+    photos = [p for p in (htf_photo, confirm_photo) if p is not None]
+    sent = False
+    if len(photos) >= 2:
+        sent = await send_telegram_media_group(
+            settings.telegram_bot_token, settings.telegram_chat_id, photos, message
+        )
+    elif len(photos) == 1:
+        sent = await send_telegram_photo(
+            settings.telegram_bot_token, settings.telegram_chat_id, photos[0], message
+        )
+    if not sent:
+        sent = await send_telegram(
+            settings.telegram_bot_token, settings.telegram_chat_id, message
+        )
+
+    if not sent:
+        # Don't persist the event_id — let the next cycle retry.
+        return
+
+    # Telegram acknowledged: persist the event_id (plus any STB-suppressed
+    # ids) so subsequent cycles dedupe.
     with SessionLocal() as db:
+        row = (
+            db.query(AlertState)
+            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
+            .first()
+        )
+        if row is None:
+            row = AlertState(symbol=symbol, timeframe=timeframe, in_ote=True)
+            db.add(row)
+            db.flush()
+        sent_ids = _load_sent_ids(row.sent_event_ids)
+        sent_ids.add(event.event_id)
+        sent_ids.update(event.suppresses)
+        row.sent_event_ids = json.dumps(sorted(sent_ids))
+        row.last_setup_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.add(AlertEvent(timeframe=timeframe, message=message))
         db.flush()
         _prune_alert_events(db)
-        row = (
-            db.query(AlertState)
-            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
-            .first()
-        )
-        if row is not None:
-            row.last_setup_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
-    await send_telegram(settings.telegram_bot_token, settings.telegram_chat_id, message)
-
-
-def _mark_alerts_sent(db: Session, symbols: list[str], timeframe: str) -> None:
-    sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    for symbol in symbols:
-        row = (
-            db.query(AlertState)
-            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
-            .first()
-        )
-        if row is not None:
-            row.last_alert_at = sent_at
 
 
 def _prune_alert_events(db: Session, keep: int = 100) -> None:
