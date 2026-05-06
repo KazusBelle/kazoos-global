@@ -1,0 +1,7 @@
+ backend/app/api/chart.py              |   75 +-
+ backend/app/main.py                   |    3 +-
+ frontend/index.html                   |    2 +-
+ frontend/src/components/Dashboard.tsx | 1730 ++++++++++++++++++++++-----------
+ frontend/src/lib/api.ts               |   40 +
+ frontend/src/main.tsx                 |    6 +-
+ 6 files changed, 1299 insertions(+), 557 deletions(-)

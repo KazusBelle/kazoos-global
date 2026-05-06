@@ -1,0 +1,28 @@
+{
+  "name": "chart-window-current-stable",
+  "created_at": "2026-05-06",
+  "base_commit": "bd28930",
+  "snapshot_type": "frozen_restore_checkpoint",
+  "purpose": "Restore current chart window visual, layout, OTE/FVG, and structure behavior after risky changes.",
+  "notes": [
+    "This is not a live private page.",
+    "The git tag is only a base anchor because the working tree had uncommitted changes.",
+    "Use files/ as the source of truth for restore."
+  ],
+  "restore_command": "bash snapshots/chart-window/2026-05-06-current-stable/restore.sh",
+  "files": [
+    "backend/app/api/chart.py",
+    "backend/app/api/frontend_logs.py",
+    "backend/app/main.py",
+    "frontend/index.html",
+    "frontend/src/components/Dashboard.tsx",
+    "frontend/src/index.css",
+    "frontend/src/lib/api.ts",
+    "frontend/src/lib/frontendErrors.tsx",
+    "frontend/src/main.tsx",
+    "shared/kazus_logic/compute.py",
+    "shared/kazus_logic/engine.py",
+    "worker/app/chart_image.py"
+  ]
+}
+

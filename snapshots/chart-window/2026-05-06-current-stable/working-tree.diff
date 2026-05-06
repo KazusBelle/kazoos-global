@@ -1,0 +1,2433 @@
+diff --git a/backend/app/api/chart.py b/backend/app/api/chart.py
+index 769f230..5edc706 100644
+--- a/backend/app/api/chart.py
++++ b/backend/app/api/chart.py
+@@ -94,37 +94,90 @@ def _analyze(
+     else:
+         return [], [], None, None, "none"
+ 
+-    closed = bars[:-1] if len(bars) > 1 else bars
+-    for b in closed:
++    # The chart modal should visually match TradingView, which includes the
++    # currently forming candle and the live/potential structure it can imply.
++    # Screener + alerts still use closed-bar compute in shared/kazus_logic.
++    chart_bars = list(bars)
++    for b in chart_bars:
+         engine.feed(Bar(ts=b.ts, open=b.open, high=b.high, low=b.low, close=b.close))
+ 
+-    # Structure timeline. The engines already collapse HH*/LL* repeats inside
+-    # one leg, but we still de-dupe defensively (multiple writes can land on
+-    # the same bar+label when a trend change confirms a pending event).
++    # Structure timeline. The engines already collapse repeated swing writes
++    # inside one leg, but we still de-dupe defensively (multiple writes can
++    # land on the same bar+label when a trend change confirms a pending event).
+     swings: List[SwingPoint] = []
+     seen_keys: set = set()
+     for bar_index, price, label in engine.structure_events:
+-        if not (0 <= bar_index < len(closed)):
++        if not (0 <= bar_index < len(chart_bars)):
+             continue
+         key = (bar_index, label)
+         if key in seen_keys:
+             continue
+         seen_keys.add(key)
+         swings.append(
+-            SwingPoint(ts=closed[bar_index].ts, price=price, label=label)
++            SwingPoint(ts=chart_bars[bar_index].ts, price=price, label=label)
+         )
+ 
++    # Global/D1 chart parity with TradingView: when the active bullish fib has
++    # already extended above the last confirmed high pivot (or the active
++    # bearish fib has already extended below the last confirmed low pivot),
++    # Pine shows a provisional HH/LL on the live leg. The engine keeps the fib
++    # state, but does not surface that provisional label in `structure_events`,
++    # so the chart would otherwise look like the move was "missed".
++    if interval == "1d":
++        if engine.fib_state.direction == "bullish":
++            potential_idx = getattr(engine, "tracked_fib_high_index", None)
++            potential_price = getattr(engine, "tracked_fib_high", None)
++            last_high = getattr(engine, "last_swing_high", None)
++            if (
++                potential_idx is not None
++                and potential_price is not None
++                and last_high is not None
++                and potential_price > last_high
++                and 0 <= potential_idx < len(chart_bars)
++            ):
++                key = (potential_idx, "HH")
++                if key not in seen_keys:
++                    seen_keys.add(key)
++                    swings.append(
++                        SwingPoint(
++                            ts=chart_bars[potential_idx].ts,
++                            price=potential_price,
++                            label="HH",
++                        )
++                    )
++        elif engine.fib_state.direction == "bearish":
++            potential_idx = getattr(engine, "tracked_fib_low_index", None)
++            potential_price = getattr(engine, "tracked_fib_low", None)
++            last_low = getattr(engine, "last_swing_low", None)
++            if (
++                potential_idx is not None
++                and potential_price is not None
++                and last_low is not None
++                and potential_price < last_low
++                and 0 <= potential_idx < len(chart_bars)
++            ):
++                key = (potential_idx, "LL")
++                if key not in seen_keys:
++                    seen_keys.add(key)
++                    swings.append(
++                        SwingPoint(
++                            ts=chart_bars[potential_idx].ts,
++                            price=potential_price,
++                            label="LL",
++                        )
++                    )
++
+     # FVG boxes — extend each gap to the right edge of the closed-bar window.
+     # The frontend draws them as semi-transparent rectangles spanning that range.
+     fvgs: List[FvgBox] = []
+-    if closed:
+-        end_ts = closed[-1].ts
++    if chart_bars:
++        end_ts = chart_bars[-1].ts
+         for bar_index, top, bottom, kind in engine.fvg_events:
+-            if not (0 <= bar_index < len(closed)):
++            if not (0 <= bar_index < len(chart_bars)):
+                 continue
+             fvgs.append(
+                 FvgBox(
+-                    ts=closed[bar_index].ts,
++                    ts=chart_bars[bar_index].ts,
+                     end_ts=end_ts,
+                     top=top,
+                     bottom=bottom,
+diff --git a/backend/app/main.py b/backend/app/main.py
+index d9b933a..ff3e7bd 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -3,7 +3,7 @@ import logging
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+-from .api import auth, chart, coins, dashboard, tda
++from .api import auth, chart, coins, dashboard, frontend_logs, tda
+ from .core.config import get_settings
+ from .db.init_db import create_schema, seed_initial_data
+ 
+@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
+     app.include_router(coins.router, prefix=settings.api_prefix)
+     app.include_router(dashboard.router, prefix=settings.api_prefix)
+     app.include_router(chart.router, prefix=settings.api_prefix)
++    app.include_router(frontend_logs.router, prefix=settings.api_prefix)
+     app.include_router(tda.router, prefix=settings.api_prefix)
+ 
+     @app.get("/healthz")
+diff --git a/frontend/index.html b/frontend/index.html
+index a793e8b..434eccf 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -25,7 +25,7 @@
+     <link rel="manifest" href="/site.webmanifest" />
+     <link rel="preconnect" href="https://fonts.googleapis.com" />
+     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
++    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+   </head>
+   <body class="bg-bg text-zinc-100 font-sans">
+     <div id="root"></div>
+diff --git a/frontend/src/components/Dashboard.tsx b/frontend/src/components/Dashboard.tsx
+index a29221e..974506b 100644
+--- a/frontend/src/components/Dashboard.tsx
++++ b/frontend/src/components/Dashboard.tsx
+@@ -1,10 +1,13 @@
+ import { useEffect, useMemo, useRef, useState } from "react";
+ import {
+   addCoin,
++  deleteStructure,
+   getChart,
+   getDashboard,
+   movePin,
+   removeCoin,
++  reportFrontendError,
++  saveStructure,
+   setCall,
+   setToken,
+   togglePin,
+@@ -14,6 +17,8 @@ import {
+   type DashboardResponse,
+   type DashboardRow,
+   type Snapshot,
++  type StructureEvent,
++  type SwingPoint,
+ } from "../lib/api";
+ import { ScreenerTable } from "./ScreenerTable";
+ import { normalizeSymbol, SymbolSuggestInput } from "./SymbolSuggestInput";
+@@ -96,7 +101,7 @@ const CHART_THEMES = {
+     bullBorder: "#2e2e2e",
+     bearColor: "#505757",
+     bearBorder: "#2e2e2e",
+-    wickColor: "#505757",
++    wickColor: "#525757",
+     loadingBg: "#171717",
+   },
+   light: {
+@@ -114,27 +119,37 @@ const CHART_THEMES = {
+ } as const;
+ 
+ const SVG_NS = "http://www.w3.org/2000/svg";
+-const RIGHT_PADDING_BARS = 30; // empty bars on the right (initial fallback only — pixel-based logic overrides)
+-// OTE zone: a fixed-width vertical band right of candles, painted with chart bg
+-// to physically mask the candle area underneath. Layout from chart-edge of zone:
+-//   [INNER_LEFT_PAD] [FIB_LINE_W] [FIB_LABEL_GAP_W] [labels ~36] [INNER_RIGHT_PAD]
+-const FIB_LINE_W = 120;          // fib line segment length in px
+-const FIB_LABEL_GAP_W = 20;      // gap between line end and label start
+-const OTE_ZONE_INNER_LEFT_PAD = 8;
+-const OTE_ZONE_INNER_RIGHT_PAD = 16;
+-const OTE_LABEL_RESERVE_W = 36;  // reserved width for the longest label "0.618"
+-const OTE_ZONE_WIDTH =
+-  OTE_ZONE_INNER_LEFT_PAD + FIB_LINE_W + FIB_LABEL_GAP_W + OTE_LABEL_RESERVE_W + OTE_ZONE_INNER_RIGHT_PAD;
+-const OTE_TO_CANDLES_GAP_PX = 24; // visible gap between candles' last bar and OTE zone left edge
+-const FIB_ANCHOR_INSET_PX = 24; // keep 0.0/1.0 visible when their prices are off-screen
+-const SWING_OFFSCREEN = -9999;
++
++// Initial fit (logical bars only — no pixel paddings, no masks).
++//   visibleBars = clamp(max(50, currentIndex - swingStartIndex), 50, 180)
++//   paddingBars = clamp(round(visibleBars * 0.20), 12, 40)
++// After this single call, X range is fully under user control.
++const VISIBLE_BARS_MIN = 50;
++const VISIBLE_BARS_MAX = 180;
++const FALLBACK_VISIBLE_BARS = 120;
++const PADDING_RATIO = 0.20;
++const PADDING_BARS_MIN = 60;
++const PADDING_BARS_MAX = 60;
++
++// Y autoscale: candles fill ~70% of plot height; OTE band is included only
++// if its height does not exceed the candle range by more than 20%.
++const TARGET_CANDLE_HEIGHT_RATIO = 0.70;
++const OTE_HEIGHT_TOLERANCE = 1.2;
++
++// Fib visual: right-side mode in chart-space, same model as Pine/TradingView.
++// X is logical bars, Y is price. The chart projects both to screen coords.
++const FIB_LINE_LENGTH_BARS = 20;
++const FIB_RIGHT_OFFSET_BARS = 40;
++const FIB_LABEL_GAP = 10;          // visual gap between line end and label
++
++const SWING_TAG_W = 22;
++const SWING_TAG_H = 13;
+ const CANDLE_STROKE_COLOR = "#2e2e2e";
++const DARK_WICK_COLOR = "#525757";
+ const LIGHT_CANDLE_STROKE_COLOR = "#000000";
+ const CURRENT_PRICE_COLOR = "#056656";
+-const MIN_VISIBLE_BARS = 50;
+-// Limit is left undefined so the backend uses its per-interval default
+-// (d1=500, h1=900, 15m=600) — matches the worker's compute.py exactly so
+-// the chart's engine state is identical to the screener table.
++// Backend defaults the chart limit per interval (d1=500, h1=900, 15m=600) —
++// matches worker/compute.py so engine state is identical to the screener.
+ 
+ const chartDataCache = new Map<string, ChartData>();
+ const chartDataInFlight = new Map<string, Promise<ChartData>>();
+@@ -172,6 +187,11 @@ function prefetchChart(symbol: string, interval: string) {
+   });
+ }
+ 
++function invalidateChartCache(symbol: string, interval: string) {
++  chartDataCache.delete(chartCacheKey(symbol, interval));
++  chartDataInFlight.delete(chartCacheKey(symbol, interval));
++}
++
+ function decimalPlaces(value: number): number {
+   if (!Number.isFinite(value)) return 0;
+   const s = value.toString();
+@@ -200,106 +220,58 @@ function inferPricePrecision(
+   return Math.min(8, Math.max(2, p));
+ }
+ 
+-// Default visible-bar count when there is no active fib swing to frame.
+-// Chosen so candles are wide enough not to look "squashed" while still
+-// giving the user a few weeks/days of context.
+-const DEFAULT_FALLBACK_VISIBLE_BARS = 120;
+-const TARGET_CANDLE_HEIGHT_RATIO = 0.70;
+-
+ type ChartPriceRange = { minValue: number; maxValue: number };
+-
+-// When there's no fib, frame the most recent N bars instead of fitContent
+-// (which would show all 500–900 bars at hair-thin widths).
+-function defaultFallbackRange(
+-  chart: any,
+-  candleData: ReadonlyArray<{ time: any; high: number; low: number }>,
+-) {
+-  if (candleData.length === 0) {
+-    chart.timeScale().fitContent();
+-    return;
+-  }
+-  const target = Math.min(candleData.length, DEFAULT_FALLBACK_VISIBLE_BARS);
+-  const fromIdx = Math.max(0, candleData.length - target);
+-  try {
+-    chart.timeScale().setVisibleLogicalRange({
+-      from: fromIdx,
+-      to: candleData.length - 1 + RIGHT_PADDING_BARS,
+-    });
+-  } catch {
+-    chart.timeScale().fitContent();
+-  }
+-}
+-
+-// Pick an initial visible time range that puts the active fib swing on screen
+-// with breathing room on both sides. Run when the modal first opens (no saved
+-// range) so the OTE zone is immediately framed.
+-function defaultFitToFib(
+-  chart: any,
+-  candleData: ReadonlyArray<{ time: any; high: number; low: number }>,
+-  data: { fib_high: number | null; fib_low: number | null },
+-) {
+-  if (data.fib_high == null || data.fib_low == null || candleData.length === 0) {
+-    defaultFallbackRange(chart, candleData);
+-    return;
++type LogicalRange = { from: number; to: number };
++
++// Locate the swing start anchoring the active fib:
++//   bullish → last HL before the most recent HH
++//   bearish → last LH before the most recent LL
++// Returns the candle index, or -1 if not resolvable.
++function computeSwingStartIndex(
++  data: ChartData,
++  barIndexByTime: Map<number, number>,
++): number {
++  if (data.fib_direction !== "bullish" && data.fib_direction !== "bearish") return -1;
++  const swings = data.swings;
++  if (!swings || swings.length === 0) return -1;
++  const isBullish = data.fib_direction === "bullish";
++  const peakLabel = isBullish ? "HH" : "LL";
++  const baseLabel = isBullish ? "HL" : "LH";
++  let lastPeakIdx = -1;
++  for (let i = swings.length - 1; i >= 0; i--) {
++    if (swings[i].label === peakLabel) { lastPeakIdx = i; break; }
+   }
+-  // Find the first bar whose high reaches fib_high or low reaches fib_low —
+-  // that's where the swing begins. Walk from oldest to newest.
+-  const tol = (data.fib_high - data.fib_low) * 0.001 || 1e-6;
+-  let swingStart = -1;
+-  for (let k = 0; k < candleData.length; k++) {
+-    const b = candleData[k];
+-    if (
+-      Math.abs(b.high - data.fib_high) <= tol ||
+-      Math.abs(b.low - data.fib_low) <= tol
+-    ) {
+-      swingStart = k;
+-      break;
++  if (lastPeakIdx < 0) return -1;
++  for (let i = lastPeakIdx - 1; i >= 0; i--) {
++    if (swings[i].label === baseLabel) {
++      const tsSec = Math.floor(swings[i].ts / 1000);
++      const idx = barIndexByTime.get(tsSec);
++      return idx == null ? -1 : idx;
+     }
+   }
+-  if (swingStart < 0) {
+-    defaultFallbackRange(chart, candleData);
+-    return;
+-  }
+-  // Show 25% extra context to the left of the swing and the right edge.
+-  const span = candleData.length - 1 - swingStart;
+-  const padLeft = Math.max(8, Math.floor(span * 0.25));
+-  const fromIdx = Math.max(0, swingStart - padLeft);
+-  try {
+-    chart.timeScale().setVisibleLogicalRange({
+-      from: fromIdx,
+-      to: candleData.length - 1 + RIGHT_PADDING_BARS,
+-    });
+-  } catch {
+-    defaultFallbackRange(chart, candleData);
+-  }
++  return -1;
+ }
+ 
+-function padRangeToHeight(
+-  minValue: number,
+-  maxValue: number,
+-  fallbackPrice: number,
+-): ChartPriceRange | null {
+-  let low = minValue;
+-  let high = maxValue;
+-  if (!Number.isFinite(low) || !Number.isFinite(high)) return null;
+-  if (high < low) {
+-    const tmp = high;
+-    high = low;
+-    low = tmp;
+-  }
+-
+-  let range = high - low;
+-  if (!Number.isFinite(range) || range <= 0) {
+-    const basis = Math.max(Math.abs(fallbackPrice), Math.abs(high), 1);
+-    range = basis * 0.002;
+-    low -= range / 2;
+-    high += range / 2;
++// Initial fit — the SOLE source of truth for the X range. Pure function.
++function computeInitialFit(
++  currentIndex: number,
++  swingStartIndex: number,
++): LogicalRange {
++  if (currentIndex < 0) return { from: 0, to: 0 };
++  let span: number;
++  if (swingStartIndex < 0 || swingStartIndex >= currentIndex) {
++    span = FALLBACK_VISIBLE_BARS;
++  } else {
++    span = currentIndex - swingStartIndex;
+   }
+-
+-  const pad = range * ((1 - TARGET_CANDLE_HEIGHT_RATIO) / 2 / TARGET_CANDLE_HEIGHT_RATIO);
++  const visibleBars = Math.min(VISIBLE_BARS_MAX, Math.max(VISIBLE_BARS_MIN, span));
++  const paddingBars = Math.min(
++    PADDING_BARS_MAX,
++    Math.max(PADDING_BARS_MIN, Math.round(visibleBars * PADDING_RATIO)),
++  );
+   return {
+-    minValue: low - pad,
+-    maxValue: high + pad,
++    from: Math.max(0, currentIndex - visibleBars),
++    to: currentIndex + paddingBars,
+   };
+ }
+ 
+@@ -311,77 +283,68 @@ function getBullishOteZone(
+     data.fib_high == null ||
+     data.fib_low == null ||
+     data.fib_high <= data.fib_low
+-  ) {
+-    return null;
+-  }
+-
++  ) return null;
+   const fibRange = data.fib_high - data.fib_low;
+   const oteA = data.fib_high - fibRange * 0.618;
+   const oteB = data.fib_high - fibRange * 0.786;
+-  return {
+-    low: Math.min(oteA, oteB),
+-    high: Math.max(oteA, oteB),
+-  };
++  return { low: Math.min(oteA, oteB), high: Math.max(oteA, oteB) };
+ }
+ 
+-function isOteUsableForCandles(
+-  candleData: ReadonlyArray<{ high: number; low: number; close: number }>,
+-  data: { fib_high: number | null; fib_low: number | null; fib_direction?: string },
+-): boolean {
+-  const oteZone = getBullishOteZone(data);
+-  if (oteZone == null || candleData.length === 0) return false;
+-
+-  const recent = candleData.slice(-DEFAULT_FALLBACK_VISIBLE_BARS);
+-  let candleLow = Infinity;
+-  let candleHigh = -Infinity;
+-  for (const b of recent) {
+-    candleLow = Math.min(candleLow, b.low);
+-    candleHigh = Math.max(candleHigh, b.high);
++function padRangeToHeight(
++  minValue: number,
++  maxValue: number,
++  fallbackPrice: number,
++): ChartPriceRange | null {
++  let low = minValue;
++  let high = maxValue;
++  if (!Number.isFinite(low) || !Number.isFinite(high)) return null;
++  if (high < low) { const tmp = high; high = low; low = tmp; }
++  let range = high - low;
++  if (!Number.isFinite(range) || range <= 0) {
++    const basis = Math.max(Math.abs(fallbackPrice), Math.abs(high), 1);
++    range = basis * 0.002;
++    low -= range / 2;
++    high += range / 2;
+   }
+-  if (!Number.isFinite(candleLow) || !Number.isFinite(candleHigh)) return false;
+-
+-  const candleRange = Math.max(candleHigh - candleLow, Math.abs(recent[recent.length - 1].close) * 0.002, 1e-9);
+-  const tolerance = candleRange * 1.2;
+-  return oteZone.high >= candleLow - tolerance && oteZone.low <= candleHigh + tolerance;
++  const pad = range * ((1 - TARGET_CANDLE_HEIGHT_RATIO) / 2 / TARGET_CANDLE_HEIGHT_RATIO);
++  return { minValue: low - pad, maxValue: high + pad };
+ }
+ 
+-function makeAutoscaleInfoProvider(
+-  data: { fib_high: number | null; fib_low: number | null; fib_direction?: string },
+-) {
++// Y autoscale: include OTE band only if its vertical extent does not dwarf
++// the visible candle range. Otherwise the band is ignored entirely so the
++// candles stay proportional. No clamping, no edge stretching.
++function makeAutoscaleProvider(data: ChartData) {
+   return (baseImplementation: () => { priceRange: ChartPriceRange | null; margins?: any } | null) => {
+     const base = baseImplementation();
+     const baseRange = base?.priceRange;
+     if (baseRange == null) return base;
+-
+     const candleLow = baseRange.minValue;
+     const candleHigh = baseRange.maxValue;
+-    const candleRange = Math.max(candleHigh - candleLow, Math.abs(candleHigh) * 0.002, 1e-9);
++    const candleHeight = Math.max(candleHigh - candleLow, Math.abs(candleHigh) * 0.002, 1e-9);
+     let minValue = candleLow;
+     let maxValue = candleHigh;
+-
++    // 0.0 and 1.0 fib levels are always visible.
++    if (data.fib_high != null && data.fib_low != null && data.fib_high > data.fib_low) {
++      minValue = Math.min(minValue, data.fib_low);
++      maxValue = Math.max(maxValue, data.fib_high);
++    }
+     const oteZone = getBullishOteZone(data);
+     if (oteZone != null) {
+-      const tolerance = candleRange * 1.2;
+-      const nearCandles =
+-        oteZone.high >= candleLow - tolerance &&
+-        oteZone.low <= candleHigh + tolerance;
+-
+-      if (nearCandles) {
++      const oteHeight = oteZone.high - oteZone.low;
++      if (oteHeight <= candleHeight * OTE_HEIGHT_TOLERANCE) {
+         minValue = Math.min(minValue, oteZone.low);
+         maxValue = Math.max(maxValue, oteZone.high);
+       }
+     }
+-
+     const padded = padRangeToHeight(minValue, maxValue, (candleHigh + candleLow) / 2);
+     return padded == null
+       ? base
+-      : {
+-          priceRange: padded,
+-          margins: { above: 0, below: 0 },
+-        };
++      : { priceRange: padded, margins: { above: 0, below: 0 } };
+   };
+ }
+ 
++type SwingClickAnchor = { idx: number; clientX: number; clientY: number };
++
+ function CandleChart({
+   symbol,
+   interval,
+@@ -389,6 +352,12 @@ function CandleChart({
+   chartHeight,
+   fvgEnabled,
+   fvgLimit,
++  reloadKey,
++  editMode,
++  draft,
++  onSwingClick,
++  onCanvasClick,
++  onSwingDragEnd,
+ }: {
+   symbol: string;
+   interval: ChartInterval;
+@@ -396,19 +365,24 @@ function CandleChart({
+   chartHeight: number;
+   fvgEnabled: boolean;
+   fvgLimit: number;
++  reloadKey?: number;
++  editMode?: boolean;
++  draft?: StructureEvent[];
++  onSwingClick?: (a: SwingClickAnchor) => void;
++  onCanvasClick?: (ts: number, price: number) => void;
++  onSwingDragEnd?: (idx: number, ts: number, price: number) => void;
+ }) {
+   const containerRef = useRef<HTMLDivElement>(null);
+   const overlayRef = useRef<SVGSVGElement>(null);
+-  const fibLabelLayerRef = useRef<HTMLDivElement>(null);
++  const plotClipIdRef = useRef(`chart-plot-clip-${Math.random().toString(36).slice(2)}`);
+   const [status, setStatus] = useState<"loading" | "ok" | "error">("loading");
+   const [err, setErr] = useState<string | null>(null);
+   const t = CHART_THEMES[theme];
+ 
+-  // Live refs — written by props-sync effects, read by the rAF loop each frame
+-  // so toggling FVG visibility never forces a chart remount.
++  // Live refs — read by the rAF loop each frame so toggling FVG
++  // visibility never forces a chart remount.
+   const fvgEnabledRef = useRef(fvgEnabled);
+   const fvgLimitRef = useRef(fvgLimit);
+-
+   useEffect(() => { fvgEnabledRef.current = fvgEnabled; }, [fvgEnabled]);
+   useEffect(() => { fvgLimitRef.current = fvgLimit; }, [fvgLimit]);
+ 
+@@ -421,14 +395,51 @@ function CandleChart({
+   };
+   const fvgElementsRef = useRef<FvgEl[]>([]);
+ 
++  // Swing/zigzag refs survive across effects: the main effect builds the
++  // chart + initial swing layer; a secondary effect rebuilds the swing layer
++  // from the draft when edit mode toggles or the draft changes. The rAF
++  // loop reads the current swing array via the ref so positioning continues
++  // to work after a rebuild.
++  type SwingEl = {
++    ts: number;
++    price: number;
++    label: string;
++    isHigh: boolean;
++    tag: SVGRectElement;
++    tagText: SVGTextElement;
++    stem: SVGLineElement;
++    dot: SVGCircleElement;
++    hit: SVGRectElement | null;
++    group: SVGGElement;
++  };
++  const swingElementsRef = useRef<SwingEl[]>([]);
++  const zigzagPolylineRef = useRef<SVGPolylineElement | null>(null);
++  const previewLineRef = useRef<SVGLineElement | null>(null);
++  const rebuildSwingsRef = useRef<((source: SwingPoint[], edit: boolean) => void) | null>(null);
++  const serverSwingsRef = useRef<SwingPoint[]>([]);
++  // Live mirrors so listeners (set up once in init) always see latest props.
++  const editModeRef = useRef(!!editMode);
++  const draftRef = useRef<StructureEvent[] | undefined>(draft);
++  const onCanvasClickRef = useRef(onCanvasClick);
++  const onSwingDragEndRef = useRef(onSwingDragEnd);
++  const onSwingClickRef = useRef(onSwingClick);
++  useEffect(() => { editModeRef.current = !!editMode; }, [editMode]);
++  useEffect(() => { draftRef.current = draft; }, [draft]);
++  useEffect(() => { onCanvasClickRef.current = onCanvasClick; }, [onCanvasClick]);
++  useEffect(() => { onSwingDragEndRef.current = onSwingDragEnd; }, [onSwingDragEnd]);
++  useEffect(() => { onSwingClickRef.current = onSwingClick; }, [onSwingClick]);
++  // Cursor / drag state read by the rAF loop for live preview.
++  const cursorRef = useRef<{ x: number; y: number; inside: boolean }>({ x: 0, y: 0, inside: false });
++  const dragRef = useRef<{ idx: number; x: number; y: number; moved: boolean } | null>(null);
++  const reportedRafErrorRef = useRef(false);
++
+   useEffect(() => {
+     let destroyed = false;
+     let chart: any;
+     let candles: any;
+     let livePriceLine: any;
+     let rafId = 0;
+-    let initialSyncRafIds: number[] = [];
+-    let initialSyncTimerIds: number[] = [];
++    let cleanupListeners: (() => void) | null = null;
+ 
+     const init = async () => {
+       if (destroyed || !containerRef.current) return;
+@@ -440,20 +451,24 @@ function CandleChart({
+         const data = await getChartCached(symbol, interval);
+         if (destroyed || !containerRef.current) return;
+ 
+-        const candleData = data.bars.slice(0, -1).map((b) => ({
++        const candleData = data.bars.map((b) => ({
+           time: Math.floor(b.ts / 1000) as any,
+           open: b.open,
+           high: b.high,
+           low: b.low,
+           close: b.close,
+           borderColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
+-          wickColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
++          wickColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : DARK_WICK_COLOR,
+         }));
++        const barIndexByTime = new Map<number, number>();
++        candleData.forEach((bar, index) => {
++          barIndexByTime.set(Number(bar.time), index);
++        });
++
+         const fibActive =
+           data.fib_high != null && data.fib_low != null && data.fib_high > data.fib_low;
+-        const hasBullishFib = fibActive && data.fib_direction === "bullish";
+-        const hasInitialOte = isOteUsableForCandles(candleData, data);
+-        const autoscaleOverride = makeAutoscaleInfoProvider(data);
++        const isBullish = fibActive && data.fib_direction === "bullish";
++        const autoscaleOverride = makeAutoscaleProvider(data);
+         const pricePrecision = inferPricePrecision(data.bars);
+         const minMove = 10 ** (-pricePrecision);
+ 
+@@ -477,7 +492,7 @@ function CandleChart({
+             vertTouchDrag: true,
+           },
+           crosshair: {
+-            mode: CrosshairMode.Normal, // no "magnet" snap to candle points
++            mode: CrosshairMode.Normal,
+             vertLine: {
+               color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
+               labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
+@@ -504,42 +519,26 @@ function CandleChart({
+             timeVisible: true,
+             secondsVisible: false,
+             ticksVisible: true,
+-            rightOffset: 46,
++            rightOffset: 0,
+           },
+         });
+ 
+-        candles = chart.addSeries(
+-          CandlestickSeries,
+-          {
+-            ...(theme === "light"
+-              ? {
+-                  upColor: "#9598a1",
+-                  downColor: "#434651",
+-                }
+-              : {
+-                  upColor: t.bullColor,
+-                  downColor: t.bearColor,
+-                }),
+-            borderVisible: true,
+-            borderUpColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
+-            borderDownColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
+-            wickVisible: true,
+-            wickUpColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
+-            wickDownColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
+-            // Hide horizontal last-price line, keep native price-scale label.
+-            priceLineVisible: false,
+-            lastValueVisible: false,
+-            priceFormat: {
+-              type: "price",
+-              precision: pricePrecision,
+-              minMove,
+-            },
+-            autoscaleInfoProvider: autoscaleOverride,
+-          }
+-        );
++        candles = chart.addSeries(CandlestickSeries, {
++          ...(theme === "light"
++            ? { upColor: "#9598a1", downColor: "#434651" }
++            : { upColor: t.bullColor, downColor: t.bearColor }),
++          borderVisible: true,
++          borderUpColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
++          borderDownColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : CANDLE_STROKE_COLOR,
++          wickVisible: true,
++          wickUpColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : DARK_WICK_COLOR,
++          wickDownColor: theme === "light" ? LIGHT_CANDLE_STROKE_COLOR : DARK_WICK_COLOR,
++          priceLineVisible: false,
++          lastValueVisible: false,
++          priceFormat: { type: "price", precision: pricePrecision, minMove },
++          autoscaleInfoProvider: autoscaleOverride,
++        });
+ 
+-        // Custom autoscale pads the active visible price range to ~70% height.
+-        // With scaleMargins at 0/0, the math is not compounded by chart margins.
+         try {
+           candles.priceScale().applyOptions({
+             scaleMargins: { top: 0, bottom: 0 },
+@@ -559,145 +558,45 @@ function CandleChart({
+           });
+         }
+ 
+-        const rangeKey = `kazus_chart_range_${symbol}_${interval}`;
+-        const savedRange = localStorage.getItem(rangeKey);
+-        const haveFib = hasBullishFib && hasInitialOte && candleData.length > 0;
+-        if (savedRange) {
+-          try {
+-            chart.timeScale().setVisibleRange(JSON.parse(savedRange));
+-          } catch {
+-            if (haveFib) defaultFitToFib(chart, candleData, data);
+-            else defaultFallbackRange(chart, candleData);
+-          }
+-        } else if (haveFib) {
+-          defaultFitToFib(chart, candleData, data);
+-        } else {
+-          defaultFallbackRange(chart, candleData);
++        // ── INITIAL FIT — sole place that touches the X range. After this
++        // point, no subscribe→set, no resize→set, no timers, no enforce.
++        if (candleData.length > 0) {
++          const currentIndex = candleData.length - 1;
++          const swingStartIndex = computeSwingStartIndex(data, barIndexByTime);
++          const range = computeInitialFit(currentIndex, swingStartIndex);
++          try { chart.timeScale().setVisibleLogicalRange(range); } catch { /* ignore */ }
+         }
+ 
+-        // Pixel-based right padding. Empty bars are not enough at low zoom
+-        // (1 px/bar → 30 bars = 30 px, candles overlap the OTE zone). Compute
+-        // padding in PIXELS (OTE zone width + visible gap), translate to logical
+-        // bars, shift the visible range so the last candle sits left of the OTE
+-        // zone with breathing room. Re-runs on every range change behind a
+-        // recursion guard so user pan/zoom can't push candles into OTE.
+-        let isAdjustingPadding = false;
+-        const enforceRightPadding = () => {
+-          if (isAdjustingPadding) return;
+-          try {
+-            if (!containerRef.current) return;
+-            let psWidth = 60;
+-            try { psWidth = chart.priceScale("right").width() || 60; } catch { /* pre-render */ }
+-            const plotRight = containerRef.current.clientWidth - psWidth;
+-            if (!Number.isFinite(plotRight) || plotRight <= 0) return;
+-
+-            const lr = chart.timeScale().getVisibleLogicalRange?.();
+-            if (!lr) return;
+-            const from = Number(lr.from);
+-            const to = Number(lr.to);
+-            if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
+-
+-            const span = to - from;
+-            const barSpacing = plotRight / span;
+-            if (!Number.isFinite(barSpacing) || barSpacing <= 0) return;
+-
+-            const desiredPaddingPx = OTE_ZONE_WIDTH + OTE_TO_CANDLES_GAP_PX;
+-            const desiredPaddingBars = desiredPaddingPx / barSpacing;
+-            const minTo = (candleData.length - 1) + desiredPaddingBars;
+-
+-            if (to < minTo - 0.5) {
+-              isAdjustingPadding = true;
+-              try {
+-                chart.timeScale().setVisibleLogicalRange({
+-                  from: minTo - span,
+-                  to: minTo,
+-                });
+-              } finally {
+-                isAdjustingPadding = false;
+-              }
+-            }
+-          } catch { /* noop */ }
+-        };
+-        enforceRightPadding();
+-
+-        // X-axis guardrail: keep at least 50 REAL data candles visible inside
+-        // the plot area (excluding right empty offset zone).
+-        const enforceMinVisibleBars = () => {
+-          try {
+-            if (!containerRef.current) return;
+-            let psWidth = 60;
+-            try { psWidth = chart.priceScale("right").width() || 60; } catch { /* pre-render */ }
+-            const plotRight = containerRef.current.clientWidth - psWidth;
+-            if (!Number.isFinite(plotRight) || plotRight <= 0) return;
+-
+-            let visibleDataBars = 0;
+-            for (const b of candleData) {
+-              let x: number | null = null;
+-              try {
+-                const v = chart.timeScale().timeToCoordinate(b.time);
+-                x = v == null || !Number.isFinite(Number(v)) ? null : Number(v);
+-              } catch {
+-                x = null;
+-              }
+-              if (x != null && x >= 0 && x <= plotRight) visibleDataBars++;
+-            }
+-            if (visibleDataBars >= MIN_VISIBLE_BARS) return;
+-
+-            const lr = chart.timeScale().getVisibleLogicalRange?.();
+-            if (!lr) return;
+-            const from = Number(lr.from);
+-            const to = Number(lr.to);
+-            if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+-
+-            const deficit = MIN_VISIBLE_BARS - visibleDataBars;
+-            const pad = Math.max(2, deficit + 2);
+-            chart.timeScale().setVisibleLogicalRange({
+-              from: from - pad,
+-              to,
+-            });
+-          } catch {
+-            // noop
+-          }
+-        };
+-        enforceMinVisibleBars();
+-
+-        chart.timeScale().subscribeVisibleTimeRangeChange((range: any) => {
+-          if (range && !destroyed) {
+-            try { localStorage.setItem(rangeKey, JSON.stringify(range)); } catch { /* full */ }
+-          }
+-        });
+-        chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+-          if (!destroyed) {
+-            enforceMinVisibleBars();
+-            enforceRightPadding();
+-          }
+-        });
+-
+-        // ── Imperative SVG overlay ────────────────────────────────────────
++        // ── SVG OVERLAY ─────────────────────────────────────────────────
+         const svg = overlayRef.current;
+         if (!svg) return;
+         while (svg.firstChild) svg.removeChild(svg.firstChild);
+-        const fibLabelLayer = fibLabelLayerRef.current;
+-        if (fibLabelLayer) fibLabelLayer.innerHTML = "";
++        const plotClipId = plotClipIdRef.current;
++        const defs = document.createElementNS(SVG_NS, "defs");
++        const plotClip = document.createElementNS(SVG_NS, "clipPath");
++        plotClip.setAttribute("id", plotClipId);
++        plotClip.setAttribute("clipPathUnits", "userSpaceOnUse");
++        const plotClipRect = document.createElementNS(SVG_NS, "rect");
++        plotClip.appendChild(plotClipRect);
++        defs.appendChild(plotClip);
++        svg.appendChild(defs);
+ 
+         const isLocal = interval === "1h";
+-        const isBullish = hasBullishFib && data.fib_high != null && data.fib_low != null;
+         const halfColor = isLocal ? "#5c7bd5" : "#752727";
++        const plotClipUrl = `url(#${plotClipId})`;
+ 
+-        // ── FVG rectangles — ALL created now, visibility controlled per-frame
+-        // by the rAF loop reading fvgEnabledRef / fvgLimitRef. This lets the
+-        // user toggle FVGs without any chart remount.
++        // FVG layer (created here, visibility per-frame from refs).
+         const allFvgs = data.fvgs ?? [];
+         const newFvgElements: FvgEl[] = [];
+         for (const fvg of allFvgs) {
+-          const fill =
+-            fvg.kind === "bullish"
+-              ? "rgba(38, 166, 154, 0.18)"
+-              : "rgba(117, 39, 39, 0.24)";
++          const fill = fvg.kind === "bullish"
++            ? "rgba(38, 166, 154, 0.18)"
++            : "rgba(117, 39, 39, 0.24)";
+           const rect = document.createElementNS(SVG_NS, "rect");
+           rect.setAttribute("fill", fill);
+           rect.setAttribute("stroke", fill);
+           rect.setAttribute("stroke-width", "0.5");
++          rect.setAttribute("clip-path", plotClipUrl);
+           svg.appendChild(rect);
+           newFvgElements.push({
+             ts: fvg.ts,
+@@ -709,45 +608,33 @@ function CandleChart({
+         }
+         fvgElementsRef.current = newFvgElements;
+ 
+-        // ── Fib lines — solid, no dashes; labels as plain colored text (no
+-        // colored rect background) positioned in the price-scale gutter.
++        // Fib layer can extend into the right price-scale area. The native
++        // price-scale canvases are raised above it so OTE sits behind labels.
+         type FibEl = {
+           ratio: number;
+           color: string;
+           label: string;
+-          anchor: boolean;
+           group: SVGGElement;
+           line: SVGLineElement;
+           text: SVGTextElement;
+         };
+         const fibElements: FibEl[] = [];
+-        const fibBlockGroup = document.createElementNS(SVG_NS, "g");
+-        fibBlockGroup.setAttribute("data-layer", "ote-zone");
+-        // Solid mask rect: physically separates the OTE zone from the candle
+-        // plot. Painted with chart bg so candles drawn underneath are hidden.
+-        // Sized in the rAF loop to match plot height (excluding time axis).
+-        const oteZoneBg = document.createElementNS(SVG_NS, "rect");
+-        oteZoneBg.setAttribute("data-ote-bg", "true");
+-        oteZoneBg.setAttribute("x", "0");
+-        oteZoneBg.setAttribute("y", "0");
+-        oteZoneBg.setAttribute("width", String(OTE_ZONE_WIDTH));
+-        oteZoneBg.setAttribute("fill", t.bg);
+-        fibBlockGroup.appendChild(oteZoneBg);
+-        svg.appendChild(fibBlockGroup);
++        const fibLayer = document.createElementNS(SVG_NS, "g");
++        fibLayer.setAttribute("data-layer", "fib");
++        svg.appendChild(fibLayer);
+ 
+         if (isBullish) {
+           const fibConfig = [
+-            { ratio: 0.0,   color: "#787b86", label: "0.0",   anchor: true },
+-            { ratio: 0.5,   color: halfColor, label: "0.5",   anchor: false },
+-            { ratio: 0.618, color: "#056656", label: "0.618", anchor: false },
+-            { ratio: 0.705, color: "#056656", label: "0.705", anchor: false },
+-            { ratio: 0.786, color: "#056656", label: "0.786", anchor: false },
+-            { ratio: 1.0,   color: "#787b86", label: "1.0",   anchor: true },
++            { ratio: 0.0,   color: "#787b86", label: "0.0"   },
++            { ratio: 0.5,   color: halfColor, label: "0.5"   },
++            { ratio: 0.618, color: "#056656", label: "0.618" },
++            { ratio: 0.705, color: "#056656", label: "0.705" },
++            { ratio: 0.786, color: "#056656", label: "0.786" },
++            { ratio: 1.0,   color: "#787b86", label: "1.0"   },
+           ];
+           for (const f of fibConfig) {
+             const g = document.createElementNS(SVG_NS, "g");
+             g.setAttribute("data-fib-ratio", f.label);
+-            g.setAttribute("data-fib-anchor", f.anchor ? "true" : "false");
+             const line = document.createElementNS(SVG_NS, "line");
+             line.setAttribute("data-fib-line", f.label);
+             line.setAttribute("stroke", f.color);
+@@ -758,107 +645,211 @@ function CandleChart({
+             text.setAttribute("data-fib-text", f.label);
+             text.setAttribute("text-anchor", "start");
+             text.setAttribute("dominant-baseline", "middle");
+-            text.setAttribute("font-size", "12");
++            text.setAttribute("font-size", "7");
+             text.setAttribute("font-weight", "600");
+             text.setAttribute("fill", f.color);
+             text.setAttribute("font-family", "monospace");
+             text.setAttribute("paint-order", "stroke fill");
+-            text.setAttribute("stroke", "#0a0a0a");
++            text.setAttribute("stroke", t.bg);
+             text.setAttribute("stroke-width", "2.5");
+             text.setAttribute("stroke-linejoin", "round");
+-            text.setAttribute("opacity", "1");
+             text.textContent = f.label;
+-
+             g.appendChild(line);
+             g.appendChild(text);
+-            fibBlockGroup.appendChild(g);
+-            fibElements.push({ ...f, group: g, line, text });
++            fibLayer.appendChild(g);
++            fibElements.push({ ratio: f.ratio, color: f.color, label: f.label, group: g, line, text });
+           }
+         }
+ 
+-        let placeholder: HTMLDivElement | null = null;
++        // Bearish placeholder text (no zone, just a centered hint).
++        let placeholder: SVGTextElement | null = null;
+         if (!isBullish && data.fib_direction === "bearish") {
+-          placeholder = document.createElement("div");
+-          placeholder.textContent = "downtrend";
+-          placeholder.style.position = "absolute";
+-          placeholder.style.left = "0px";
+-          placeholder.style.top = "0px";
+-          placeholder.style.transform = "translate(-9999px,-9999px)";
+-          placeholder.style.width = "120px";
+-          placeholder.style.textAlign = "center";
+-          placeholder.style.fontFamily = "monospace";
+-          placeholder.style.fontSize = "12px";
+-          placeholder.style.fontWeight = "700";
+-          placeholder.style.lineHeight = "1";
+-          placeholder.style.whiteSpace = "nowrap";
+-          placeholder.style.color = "#71717a";
+-          placeholder.style.textTransform = "uppercase";
+-          placeholder.style.letterSpacing = "0.16em";
+-          placeholder.style.opacity = "0";
+-          fibLabelLayer?.appendChild(placeholder);
++          placeholder = document.createElementNS(SVG_NS, "text");
++          placeholder.setAttribute("text-anchor", "middle");
++          placeholder.setAttribute("dominant-baseline", "middle");
++          placeholder.setAttribute("font-size", "12");
++          placeholder.setAttribute("font-weight", "700");
++          placeholder.setAttribute("font-family", "monospace");
++          placeholder.setAttribute("fill", "#71717a");
++          placeholder.setAttribute("letter-spacing", "1.6");
++          placeholder.textContent = "DOWNTREND";
++          fibLayer.appendChild(placeholder);
+         }
+ 
+-        // Swing markers — HH/HL/LL/LH tags. All swing groups live in a single
+-        // container appended LAST to the SVG so they always sit on top of the
+-        // FVG rectangles and the fib lines (otherwise the dark fib/FVG fills
+-        // can blend with the dark tag fills and visually swallow the labels).
++        // Zigzag layer — sits BELOW swing tags so chips remain readable.
++        // Empty until edit mode is engaged; the rAF loop updates points.
++        const zigzagLayer = document.createElementNS(SVG_NS, "g");
++        zigzagLayer.setAttribute("data-layer", "zigzag");
++        zigzagLayer.setAttribute("clip-path", plotClipUrl);
++        const zigzagPolyline = document.createElementNS(SVG_NS, "polyline");
++        zigzagPolyline.setAttribute("fill", "none");
++        zigzagPolyline.setAttribute("stroke", theme === "dark" ? "#a1a1aa" : "#52525b");
++        zigzagPolyline.setAttribute("stroke-width", "1.4");
++        zigzagPolyline.setAttribute("stroke-linecap", "round");
++        zigzagPolyline.setAttribute("stroke-linejoin", "round");
++        zigzagPolyline.setAttribute("stroke-dasharray", "5 4");
++        zigzagPolyline.setAttribute("opacity", "0");
++        zigzagLayer.appendChild(zigzagPolyline);
++        // Preview leg from last point to cursor while in edit mode.
++        const previewLine = document.createElementNS(SVG_NS, "line");
++        previewLine.setAttribute("stroke", theme === "dark" ? "#a1a1aa" : "#52525b");
++        previewLine.setAttribute("stroke-width", "1.4");
++        previewLine.setAttribute("stroke-linecap", "round");
++        previewLine.setAttribute("stroke-dasharray", "5 4");
++        previewLine.setAttribute("opacity", "0");
++        zigzagLayer.appendChild(previewLine);
++        svg.appendChild(zigzagLayer);
++        zigzagPolylineRef.current = zigzagPolyline;
++        previewLineRef.current = previewLine;
++
++        // Swing layer — appended LAST so it always sits above FVG/fib/zigzag,
++        // but clipped to the live plot rect. That keeps swing tags anchored to
++        // their true candle/price coordinates instead of nudging them inward
++        // when they approach the price or time scales.
+         const swingLayer = document.createElementNS(SVG_NS, "g");
+         swingLayer.setAttribute("data-layer", "swings");
+-        type SwingEl = {
+-          ts: number;
+-          price: number;
+-          label: string;
+-          isHigh: boolean;
+-          tag: SVGRectElement;
+-          tagText: SVGTextElement;
+-          stem: SVGLineElement;
+-          dot: SVGCircleElement;
+-          group: SVGGElement;
+-        };
+-        const swingElements: SwingEl[] = [];
++        swingLayer.setAttribute("clip-path", plotClipUrl);
+         const swingStyles = {
+-          bullish: { fill: "#2a3d27", stroke: "#7fb678" },
+-          bearish: { fill: "#752727", stroke: "#d68b8b" },
++          bullish: { fill: "#2a3d27", stroke: "#395935" },
++          bearish: { fill: "#4a282a", stroke: "#703639" },
+         } as const;
+-        for (const sw of data.swings) {
+-          const isHigh = sw.label === "HH" || sw.label === "LH";
+-          const bullishTag = sw.label === "HH" || sw.label === "HL";
+-          const style = bullishTag ? swingStyles.bullish : swingStyles.bearish;
+-          const g = document.createElementNS(SVG_NS, "g");
+-          const stem = document.createElementNS(SVG_NS, "line");
+-          stem.setAttribute("stroke", style.stroke);
+-          stem.setAttribute("stroke-width", "1");
+-          stem.setAttribute("opacity", "0.7");
+-          // Small dot AT the swing price so the point is visible even when
+-          // the tag rect is offset away from the candle wick.
+-          const dot = document.createElementNS(SVG_NS, "circle");
+-          dot.setAttribute("r", "2.5");
+-          dot.setAttribute("fill", style.stroke);
+-          dot.setAttribute("stroke", "#0a0a0a");
+-          dot.setAttribute("stroke-width", "0.6");
+-          const tag = document.createElementNS(SVG_NS, "rect");
+-          tag.setAttribute("width", "22");
+-          tag.setAttribute("height", "13");
+-          tag.setAttribute("rx", "2");
+-          tag.setAttribute("fill", style.fill);
+-          tag.setAttribute("stroke", style.stroke);
+-          tag.setAttribute("stroke-width", "1");
+-          const tagText = document.createElementNS(SVG_NS, "text");
+-          tagText.setAttribute("text-anchor", "middle");
+-          tagText.setAttribute("font-size", "9");
+-          tagText.setAttribute("font-family", "monospace");
+-          tagText.setAttribute("font-weight", "600");
+-          tagText.setAttribute("fill", "#ffffff");
+-          tagText.textContent = sw.label;
+-          g.appendChild(stem);
+-          g.appendChild(dot);
+-          g.appendChild(tag);
+-          g.appendChild(tagText);
+-          swingLayer.appendChild(g);
+-          swingElements.push({ ts: sw.ts, price: sw.price, label: sw.label, isHigh, tag, tagText, stem, dot, group: g });
+-        }
++
++        // Builds (or rebuilds) the swing layer DOM from a swing list. In
++        // edit mode each swing also gets an invisible 28×28 hit-rect that
++        // captures pointer events and routes clicks back to the parent
++        // modal (which opens the popover). Outside edit mode no listeners
++        // are attached so pan/zoom of the chart is unaffected.
++        const buildSwings = (source: SwingPoint[], edit: boolean) => {
++          while (swingLayer.firstChild) swingLayer.removeChild(swingLayer.firstChild);
++          const next: SwingEl[] = [];
++          for (let idx = 0; idx < source.length; idx++) {
++            const sw = source[idx];
++            const isHigh = sw.label === "HH" || sw.label === "LH";
++            const bullishTag = sw.label === "HH" || sw.label === "HL";
++            const style = bullishTag ? swingStyles.bullish : swingStyles.bearish;
++            const g = document.createElementNS(SVG_NS, "g");
++            g.setAttribute("data-swing-idx", String(idx));
++            const stem = document.createElementNS(SVG_NS, "line");
++            stem.setAttribute("stroke", style.stroke);
++            stem.setAttribute("stroke-width", edit ? "1.4" : "1");
++            stem.setAttribute("opacity", edit ? "0.95" : "0.7");
++            const dot = document.createElementNS(SVG_NS, "circle");
++            dot.setAttribute("r", edit ? "3.5" : "2.5");
++            dot.setAttribute("fill", style.stroke);
++            dot.setAttribute("stroke", "#0a0a0a");
++            dot.setAttribute("stroke-width", "0.6");
++            const tag = document.createElementNS(SVG_NS, "rect");
++            tag.setAttribute("width", String(SWING_TAG_W));
++            tag.setAttribute("height", String(SWING_TAG_H));
++            tag.setAttribute("rx", "2");
++            tag.setAttribute("fill", style.fill);
++            tag.setAttribute("stroke", style.stroke);
++            tag.setAttribute("stroke-width", edit ? "1.4" : "1");
++            const tagText = document.createElementNS(SVG_NS, "text");
++            tagText.setAttribute("text-anchor", "middle");
++            tagText.setAttribute("alignment-baseline", "middle");
++            tagText.setAttribute("dominant-baseline", "middle");
++            tagText.setAttribute("font-size", "8");
++            tagText.setAttribute("font-family", "Inter, sans-serif");
++            tagText.setAttribute("font-weight", "200");
++            tagText.setAttribute("fill", "#dbdbdb");
++            tagText.setAttribute("stroke", "none");
++            tagText.setAttribute("stroke-width", "0");
++            tagText.textContent = sw.label;
++            g.appendChild(stem);
++            g.appendChild(dot);
++            g.appendChild(tag);
++            g.appendChild(tagText);
++            let hit: SVGRectElement | null = null;
++            if (edit) {
++              hit = document.createElementNS(SVG_NS, "rect");
++              hit.setAttribute("width", "32");
++              hit.setAttribute("height", "32");
++              hit.setAttribute("fill", "transparent");
++              hit.setAttribute("style", "cursor: grab; pointer-events: all;");
++              const swingIdx = idx;
++              hit.addEventListener("pointerdown", (e) => {
++                e.stopPropagation();
++                e.preventDefault();
++                const target = e.currentTarget as SVGRectElement;
++                try { target.setPointerCapture(e.pointerId); } catch { /* noop */ }
++                target.setAttribute("style", "cursor: grabbing; pointer-events: all;");
++                dragRef.current = { idx: swingIdx, x: e.clientX, y: e.clientY, moved: false };
++              });
++              hit.addEventListener("pointermove", (e) => {
++                const drag = dragRef.current;
++                if (!drag || drag.idx !== swingIdx) return;
++                if (Math.abs(e.clientX - drag.x) > 3 || Math.abs(e.clientY - drag.y) > 3) {
++                  drag.moved = true;
++                }
++                drag.x = e.clientX;
++                drag.y = e.clientY;
++              });
++              const finishDrag = (e: PointerEvent) => {
++                const drag = dragRef.current;
++                const target = e.currentTarget as SVGRectElement;
++                target.setAttribute("style", "cursor: grab; pointer-events: all;");
++                try { target.releasePointerCapture(e.pointerId); } catch { /* noop */ }
++                if (!drag || drag.idx !== swingIdx) {
++                  dragRef.current = null;
++                  return;
++                }
++                if (!drag.moved) {
++                  dragRef.current = null;
++                  const rect = target.getBoundingClientRect();
++                  onSwingClickRef.current?.({
++                    idx: swingIdx,
++                    clientX: rect.left + rect.width / 2,
++                    clientY: rect.top + rect.height / 2,
++                  });
++                  return;
++                }
++                const root = containerRef.current;
++                if (!root) { dragRef.current = null; return; }
++                const rootRect = root.getBoundingClientRect();
++                const localX = e.clientX - rootRect.left;
++                const localY = e.clientY - rootRect.top;
++                let newPrice: number | null = null;
++                let newTs: number | null = null;
++                try {
++                  const p = candles.coordinateToPrice(localY);
++                  if (p != null && Number.isFinite(Number(p))) newPrice = Number(p);
++                } catch { /* noop */ }
++                try {
++                  const t = chart.timeScale().coordinateToTime?.(localX);
++                  if (t != null) newTs = Number(t) * 1000;
++                } catch { /* noop */ }
++                if (newPrice == null || newTs == null) {
++                  dragRef.current = null;
++                  return;
++                }
++                dragRef.current = null;
++                onSwingDragEndRef.current?.(swingIdx, newTs, newPrice);
++              };
++              hit.addEventListener("pointerup", finishDrag);
++              hit.addEventListener("pointercancel", finishDrag);
++              hit.addEventListener("mouseenter", () => {
++                if (dragRef.current) return;
++                tag.setAttribute("stroke-width", "2.2");
++                dot.setAttribute("r", "4.5");
++              });
++              hit.addEventListener("mouseleave", () => {
++                tag.setAttribute("stroke-width", "1.4");
++                dot.setAttribute("r", "3.5");
++              });
++              g.appendChild(hit);
++            }
++            swingLayer.appendChild(g);
++            next.push({ ts: sw.ts, price: sw.price, label: sw.label, isHigh, tag, tagText, stem, dot, hit, group: g });
++          }
++          swingElementsRef.current = next;
++        };
+         svg.appendChild(swingLayer);
++        rebuildSwingsRef.current = buildSwings;
++        serverSwingsRef.current = data.swings;
++        buildSwings(data.swings, false);
+ 
++        // ── Coordinate helpers ──────────────────────────────────────────
+         const safePriceY = (price: number): number | null => {
+           try {
+             const v = candles.priceToCoordinate(price);
+@@ -866,12 +857,134 @@ function CandleChart({
+           } catch { return null; }
+         };
+         const safeTimeX = (tsMs: number): number | null => {
++          const time = Math.floor(tsMs / 1000);
+           try {
+-            const v = chart.timeScale().timeToCoordinate(Math.floor(tsMs / 1000));
+-            return v == null || !Number.isFinite(Number(v)) ? null : Number(v);
+-          } catch { return null; }
++            const v = chart.timeScale().timeToCoordinate(time);
++            if (v != null && Number.isFinite(Number(v))) return Number(v);
++          } catch { /* fall through */ }
++          const logicalIndex = barIndexByTime.get(time);
++          if (logicalIndex == null) return null;
++          try {
++            const v = chart.timeScale().logicalToCoordinate?.(logicalIndex);
++            if (v != null && Number.isFinite(Number(v))) return Number(v);
++          } catch { /* noop */ }
++          return null;
++        };
++        const safeLogicalX = (logicalIndex: number, plotRight: number): number | null => {
++          if (!Number.isFinite(logicalIndex)) return null;
++          try {
++            const v = chart.timeScale().logicalToCoordinate?.(logicalIndex);
++            if (v != null && Number.isFinite(Number(v))) return Number(v);
++          } catch { /* fall through */ }
++
++          // Fallback projection mirrors the chart's logical range transform.
++          try {
++            const lr = chart.timeScale().getVisibleLogicalRange?.();
++            const from = Number(lr?.from);
++            const to = Number(lr?.to);
++            if (Number.isFinite(from) && Number.isFinite(to) && to > from && plotRight > 0) {
++              return ((logicalIndex - from) / (to - from)) * plotRight;
++            }
++          } catch { /* noop */ }
++          return null;
++        };
++        const getRightSideFibRange = (): { x1: number; x2: number } | null => {
++          if (candleData.length <= 0) return null;
++          const currentIndex = candleData.length - 1;
++          const x2 = currentIndex + FIB_RIGHT_OFFSET_BARS;
++          return { x1: x2 - FIB_LINE_LENGTH_BARS, x2 };
++        };
++        const logicalIndexFromTs = (tsMs: number): number | null => {
++          const time = Math.floor(tsMs / 1000);
++          const idx = barIndexByTime.get(time);
++          return idx == null ? null : idx;
++        };
++        const raiseRightPriceScaleLayer = (plotRight: number) => {
++          const root = containerRef.current;
++          if (!root) return;
++          const rootRect = root.getBoundingClientRect();
++          for (const canvas of Array.from(root.querySelectorAll("canvas"))) {
++            const rect = canvas.getBoundingClientRect();
++            const left = rect.left - rootRect.left;
++            if (rect.width > 0 && left >= plotRight - 1) {
++              canvas.style.zIndex = "30";
++              const parent = canvas.parentElement;
++              if (parent) {
++                parent.style.position = parent.style.position || "relative";
++                parent.style.zIndex = "30";
++              }
++            }
++          }
+         };
+ 
++        // ── Cursor tracking + click-to-add (edit mode) ──────────────────
++        const root = containerRef.current;
++        const onPointerMove = (e: PointerEvent) => {
++          if (!root) return;
++          const r = root.getBoundingClientRect();
++          cursorRef.current = {
++            x: e.clientX - r.left,
++            y: e.clientY - r.top,
++            inside: true,
++          };
++        };
++        const onPointerLeave = () => {
++          cursorRef.current = { x: 0, y: 0, inside: false };
++        };
++        // Click-to-add: distinguish click from chart pan via mousedown→up
++        // displacement (chart pans on pressed-mouse-move).
++        let downAt: { x: number; y: number; t: number } | null = null;
++        const onPointerDown = (e: PointerEvent) => {
++          if (!editModeRef.current) return;
++          // If the press lands on a swing hit-rect, the swing-level handler
++          // takes over (drag or popover-click). Skip the canvas-add path.
++          const tgt = e.target as Element | null;
++          if (tgt && tgt.closest && tgt.closest("[data-swing-idx]")) {
++            downAt = null;
++            return;
++          }
++          downAt = { x: e.clientX, y: e.clientY, t: Date.now() };
++        };
++        const onPointerUp = (e: PointerEvent) => {
++          const start = downAt;
++          downAt = null;
++          // If a swing drag is in flight, the swing-level handler will commit;
++          // skip canvas-add to avoid double-adding a point.
++          if (dragRef.current) return;
++          if (!editModeRef.current || !start || !root) return;
++          if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 4) return;
++          if (Date.now() - start.t > 600) return;
++          const r = root.getBoundingClientRect();
++          const localX = e.clientX - r.left;
++          const localY = e.clientY - r.top;
++          let newPrice: number | null = null;
++          let newTs: number | null = null;
++          try {
++            const p = candles.coordinateToPrice(localY);
++            if (p != null && Number.isFinite(Number(p))) newPrice = Number(p);
++          } catch { /* noop */ }
++          try {
++            const tt = chart.timeScale().coordinateToTime?.(localX);
++            if (tt != null) newTs = Number(tt) * 1000;
++          } catch { /* noop */ }
++          if (newPrice == null || newTs == null) return;
++          onCanvasClickRef.current?.(newTs, newPrice);
++        };
++        // capture:true so we still see the events even if lightweight-charts
++        // installs its own listeners on inner canvases.
++        root?.addEventListener("pointermove", onPointerMove, true);
++        root?.addEventListener("pointerleave", onPointerLeave, true);
++        root?.addEventListener("pointerdown", onPointerDown, true);
++        root?.addEventListener("pointerup", onPointerUp, true);
++        cleanupListeners = () => {
++          root?.removeEventListener("pointermove", onPointerMove, true);
++          root?.removeEventListener("pointerleave", onPointerLeave, true);
++          root?.removeEventListener("pointerdown", onPointerDown, true);
++          root?.removeEventListener("pointerup", onPointerUp, true);
++        };
++
++        // ── rAF render loop ─────────────────────────────────────────────
++        // Repositions overlay only. NEVER calls setVisibleLogicalRange.
+         const update = () => {
+           try {
+             if (destroyed || !chart || !candles || !overlayRef.current || !containerRef.current) return;
+@@ -881,69 +994,72 @@ function CandleChart({
+ 
+             let psWidth = 60;
+             try { psWidth = chart.priceScale("right").width() || 60; } catch { /* pre-render */ }
+-            const plotRight = w - psWidth;
++            const plotRight = Math.max(0, Math.min(w, w - psWidth));
++            raiseRightPriceScaleLayer(plotRight);
+             overlayRef.current.setAttribute("viewBox", `0 0 ${w} ${h}`);
+             let timeScaleH = 0;
+-            try {
+-              timeScaleH = Number(chart.timeScale().height?.() ?? 0) || 0;
+-            } catch { /* noop */ }
+-            const plotBottom = Math.max(0, h - timeScaleH);
+-            // Layout: candles span [0, oteZoneLeft]; OTE zone [oteZoneLeft, plotRight];
+-            // price scale gutter [plotRight, w]. The OTE zone bg-rect (inside
+-            // fibBlockGroup) physically masks candles in [oteZoneLeft, plotRight].
+-            const oteZoneLeft = Math.max(0, plotRight - OTE_ZONE_WIDTH);
+-            // Clip overlay so FVG/fib don't bleed into the price-scale gutter
+-            // or onto the time axis. Swing layer clips to the same rect — tags
+-            // are pre-clamped below to stay inside.
+-            const clip = `inset(0px ${Math.max(0, w - plotRight)}px ${Math.max(0, timeScaleH)}px 0px)`;
+-            overlayRef.current.style.clipPath = clip;
+-            if (fibLabelLayer) fibLabelLayer.style.clipPath = clip;
++            try { timeScaleH = Number(chart.timeScale().height?.() ?? 0) || 0; } catch { /* noop */ }
++            const plotBottom = Math.max(0, Math.min(h, h - timeScaleH));
++            plotClipRect.setAttribute("x", "0");
++            plotClipRect.setAttribute("y", "0");
++            plotClipRect.setAttribute("width", String(plotRight));
++            plotClipRect.setAttribute("height", String(plotBottom));
++            if (plotRight <= 0 || plotBottom <= 0) return;
++
+             if (candleData.length > 0 && livePriceLine) {
+-              try {
+-                livePriceLine.applyOptions({ price: candleData[candleData.length - 1].close });
+-              } catch { /* noop */ }
++              try { livePriceLine.applyOptions({ price: candleData[candleData.length - 1].close }); } catch { /* noop */ }
+             }
+ 
+-            // Position the OTE zone group at oteZoneLeft. The bg rect inside
+-            // (oteZoneBg) tracks plot height every frame. Hide the mask when
+-            // there's no fib content — no need to reserve a zone.
+-            const showOteZone = isBullish || data.fib_direction === "bearish";
+-            fibBlockGroup.setAttribute("transform", `translate(${oteZoneLeft}, 0)`);
+-            oteZoneBg.setAttribute("height", String(plotBottom));
+-            oteZoneBg.setAttribute("opacity", showOteZone ? "1" : "0");
+-
+-            if (isBullish) {
+-              const fibHigh = data.fib_high!;
+-              const fibLow = data.fib_low!;
++            // Fib lines — chart-space primitives:
++            // X = logical bars, Y = price. Zoom/scroll/resize comes from the chart projection.
++            if (isBullish && data.fib_high != null && data.fib_low != null) {
++              const fibHigh = data.fib_high;
++              const fibLow = data.fib_low;
+               const range = fibHigh - fibLow;
+-              const lineX1 = OTE_ZONE_INNER_LEFT_PAD;
+-              const lineX2 = OTE_ZONE_INNER_LEFT_PAD + FIB_LINE_W;
+-              const labelX = lineX2 + FIB_LABEL_GAP_W;
++              const fibRange = getRightSideFibRange();
++              const lineX1 = fibRange == null ? null : safeLogicalX(fibRange.x1, plotRight);
++              const lineX2 = fibRange == null ? null : safeLogicalX(fibRange.x2, plotRight);
+               for (const f of fibElements) {
+-                const rawY = safePriceY(fibHigh - f.ratio * range);
+-                if (rawY == null || rawY < 0 || rawY > plotBottom) {
++                const y = safePriceY(fibHigh - f.ratio * range);
++                if (lineX1 == null || lineX2 == null || y == null || y < 0 || y > plotBottom) {
+                   f.group.setAttribute("opacity", "0");
+                   continue;
+                 }
+-                const y = rawY;
+                 f.group.setAttribute("opacity", "1");
+                 f.line.setAttribute("x1", String(lineX1));
+                 f.line.setAttribute("x2", String(lineX2));
+                 f.line.setAttribute("y1", String(y));
+                 f.line.setAttribute("y2", String(y));
+-                f.text.setAttribute("x", String(labelX));
++                f.text.setAttribute("x", String(lineX2 + FIB_LABEL_GAP));
+                 f.text.setAttribute("y", String(y));
+               }
+             }
+ 
+             if (placeholder) {
+-              const labelW = Math.max(120, OTE_ZONE_WIDTH - OTE_ZONE_INNER_LEFT_PAD - OTE_ZONE_INNER_RIGHT_PAD);
+-              placeholder.style.width = `${labelW}px`;
+-              placeholder.style.opacity = "1";
+-              placeholder.style.transform = `translate(${oteZoneLeft + OTE_ZONE_INNER_LEFT_PAD}px, ${Math.max(10, h / 2 - 6)}px)`;
++              const fibRange = getRightSideFibRange();
++              const lineX1 = fibRange == null ? null : safeLogicalX(fibRange.x1, plotRight);
++              const lineX2 = fibRange == null ? null : safeLogicalX(fibRange.x2, plotRight);
++              const cx = lineX1 != null && lineX2 != null ? (lineX1 + lineX2) / 2 : plotRight / 2;
++              // Y: center of bearish OTE zone (0.618–0.786 retracement from fib_low upward).
++              let cy = Math.max(12, h / 2);
++              let fontSize = 12;
++              if (data.fib_high != null && data.fib_low != null && data.fib_high > data.fib_low) {
++                const range = data.fib_high - data.fib_low;
++                const oteA = data.fib_low + range * 0.618;
++                const oteB = data.fib_low + range * 0.786;
++                const yA = safePriceY(oteA);
++                const yB = safePriceY(oteB);
++                if (yA != null && yB != null) {
++                  cy = (yA + yB) / 2;
++                  fontSize = Math.max(8, Math.min(20, Math.abs(yB - yA) * 0.6));
++                }
++              }
++              placeholder.setAttribute("x", String(cx));
++              placeholder.setAttribute("y", String(cy));
++              placeholder.setAttribute("font-size", String(Math.round(fontSize)));
+             }
+ 
+-            // FVG visibility is driven by live refs so toggle is instant
++            // FVG visibility is driven by live refs so toggle is instant.
+             const fvgOn = fvgEnabledRef.current;
+             const fvgLim = fvgLimitRef.current;
+             const fvgAll = fvgElementsRef.current;
+@@ -975,74 +1091,143 @@ function CandleChart({
+               fv.rect.setAttribute("height", String(Math.max(1, height)));
+             }
+ 
+-            for (const sw of swingElements) {
++            // Swings — visibility controlled by logical index range only.
++            // floor/ceil so bars at fractional edges stay visible (lightweight
++            // charts returns floating-point logical bounds when zoomed).
++            // x == null does not invalidate state; the group simply hides
++            // until coordinates resolve again on a future frame.
++            const lr = chart.timeScale().getVisibleLogicalRange?.();
++            const lrFrom = lr && Number.isFinite(Number(lr.from)) ? Math.floor(Number(lr.from)) : -Infinity;
++            const lrTo = lr && Number.isFinite(Number(lr.to)) ? Math.ceil(Number(lr.to)) : Infinity;
++            const currentSwings = swingElementsRef.current;
++            const drag = dragRef.current;
++            // Track on-screen positions so the zig-zag layer can connect
++            // them in this same frame (saves a second pass).
++            const zigzagPoints: { x: number; y: number }[] = [];
++            for (let si = 0; si < currentSwings.length; si++) {
++              const sw = currentSwings[si];
++              // While dragging, override this point's screen position with
++              // the cursor so the visual follows in real time before commit.
++              if (drag && drag.idx === si && containerRef.current) {
++                const r = containerRef.current.getBoundingClientRect();
++                const dx = drag.x - r.left;
++                const dy = drag.y - r.top;
++                sw.group.setAttribute("opacity", "1");
++                const offset = sw.isHigh ? -16 : 16;
++                const tagY = dy + offset - 6;
++                const tagX = dx - SWING_TAG_W / 2;
++                sw.stem.setAttribute("x1", String(dx));
++                sw.stem.setAttribute("x2", String(dx));
++                sw.stem.setAttribute("y1", String(dy));
++                sw.stem.setAttribute("y2", String(sw.isHigh ? tagY + SWING_TAG_H : tagY));
++                sw.dot.setAttribute("cx", String(dx));
++                sw.dot.setAttribute("cy", String(dy));
++                sw.tag.setAttribute("x", String(tagX));
++                sw.tag.setAttribute("y", String(tagY));
++                sw.tagText.setAttribute("x", String(dx));
++                sw.tagText.setAttribute("y", String(tagY + SWING_TAG_H / 2 + 0.5));
++                if (sw.hit) {
++                  sw.hit.setAttribute("x", String(dx - 16));
++                  sw.hit.setAttribute("y", String(Math.min(dy, tagY) - 4));
++                  sw.hit.setAttribute("height", String(Math.abs(tagY + SWING_TAG_H - dy) + 12));
++                }
++                zigzagPoints.push({ x: dx, y: dy });
++                continue;
++              }
++              const idx = logicalIndexFromTs(sw.ts);
++              if (idx == null || idx < lrFrom || idx > lrTo) {
++                sw.group.setAttribute("opacity", "0");
++                continue;
++              }
+               const x = safeTimeX(sw.ts);
+               const y = safePriceY(sw.price);
+-              // Hide ONLY when lightweight-charts can't compute coordinates
+-              // (off the timeScale entirely). When the point is at the plot
+-              // border the tag must still render — clamp it inside.
+               if (x == null || y == null) {
+                 sw.group.setAttribute("opacity", "0");
+-                sw.tag.setAttribute("x", String(SWING_OFFSCREEN));
+                 continue;
+               }
+               sw.group.setAttribute("opacity", "1");
+               const offset = sw.isHigh ? -16 : 16;
+               const rawTagY = y + offset - 6;
+-              const tagY = Math.max(2, Math.min(plotBottom - 15, rawTagY));
+-              // Tag is 22px wide centered on x. Clamp horizontally so it stays
+-              // inside the plot area at the right edge (otherwise the OTE-zone
+-              // mask or price-scale clip swallows the right half of HH/HL).
+-              const rawTagX = x - 11;
+-              const tagX = Math.max(2, Math.min(plotRight - 24, rawTagX));
+-              const tagCenterX = tagX + 11;
+-              sw.stem.setAttribute("x1", String(tagCenterX));
++              const tagY = rawTagY;
++              const tagX = x - SWING_TAG_W / 2;
++              sw.stem.setAttribute("x1", String(x));
+               sw.stem.setAttribute("x2", String(x));
+               sw.stem.setAttribute("y1", String(y));
+-              sw.stem.setAttribute("y2", String(sw.isHigh ? tagY + 13 : tagY));
++              sw.stem.setAttribute("y2", String(sw.isHigh ? tagY + SWING_TAG_H : tagY));
+               sw.dot.setAttribute("cx", String(x));
+               sw.dot.setAttribute("cy", String(y));
+               sw.tag.setAttribute("x", String(tagX));
+               sw.tag.setAttribute("y", String(tagY));
+-              sw.tagText.setAttribute("x", String(tagCenterX));
+-              sw.tagText.setAttribute("y", String(tagY + 10));
++              sw.tagText.setAttribute("x", String(x));
++              sw.tagText.setAttribute("y", String(tagY + SWING_TAG_H / 2 + 0.5));
++              if (sw.hit) {
++                sw.hit.setAttribute("x", String(x - 16));
++                sw.hit.setAttribute("y", String(Math.min(y, tagY) - 4));
++                sw.hit.setAttribute("height", String(Math.abs(tagY + SWING_TAG_H - y) + 12));
++              }
++              zigzagPoints.push({ x, y });
++            }
++            const zz = zigzagPolylineRef.current;
++            const inEdit = currentSwings.length > 0 && currentSwings[0].hit !== null;
++            if (zz) {
++              if (zigzagPoints.length > 1 && inEdit) {
++                zz.setAttribute(
++                  "points",
++                  zigzagPoints.map((p) => `${p.x},${p.y}`).join(" ")
++                );
++                zz.setAttribute("opacity", "0.7");
++              } else {
++                zz.setAttribute("opacity", "0");
++              }
++            }
++            // Preview leg from last swing to cursor while in edit mode.
++            const pv = previewLineRef.current;
++            if (pv) {
++              const cur = cursorRef.current;
++              if (
++                inEdit &&
++                cur.inside &&
++                !drag &&
++                zigzagPoints.length > 0 &&
++                cur.x >= 0 && cur.x <= plotRight &&
++                cur.y >= 0 && cur.y <= plotBottom
++              ) {
++                const last = zigzagPoints[zigzagPoints.length - 1];
++                pv.setAttribute("x1", String(last.x));
++                pv.setAttribute("y1", String(last.y));
++                pv.setAttribute("x2", String(cur.x));
++                pv.setAttribute("y2", String(cur.y));
++                pv.setAttribute("opacity", "0.5");
++              } else {
++                pv.setAttribute("opacity", "0");
++              }
++            }
++          } catch (e: any) {
++            if (!reportedRafErrorRef.current) {
++              reportedRafErrorRef.current = true;
++              void reportFrontendError({
++                kind: "chart.raf",
++                message: e?.message ?? "chart raf error",
++                stack: e?.stack,
++                source: "CandleChart.update",
++                context: { symbol, interval, theme, chartHeight, reloadKey },
++              });
+             }
+-          } catch {
+-            // Swallow — don't break the rAF loop on transient pan errors.
+           } finally {
+             if (!destroyed) rafId = requestAnimationFrame(update);
+           }
+         };
+         rafId = requestAnimationFrame(update);
+ 
+-        const forceInitialChartSync = () => {
+-          if (destroyed || !chart || !candles) return;
+-          try { candles.priceScale().setAutoScale(true); } catch { /* older builds */ }
+-          try { chart.priceScale("right").setAutoScale(true); } catch { /* older builds */ }
+-          try {
+-            const pos = chart.timeScale().scrollPosition?.();
+-            if (Number.isFinite(Number(pos))) chart.timeScale().scrollToPosition(Number(pos), false);
+-          } catch { /* noop */ }
+-          try {
+-            const lr = chart.timeScale().getVisibleLogicalRange?.();
+-            if (lr && Number.isFinite(Number(lr.from)) && Number.isFinite(Number(lr.to))) {
+-              chart.timeScale().setVisibleLogicalRange({ from: Number(lr.from), to: Number(lr.to) });
+-            }
+-          } catch { /* noop */ }
+-          enforceRightPadding();
+-        };
+-
+-        const firstRaf = requestAnimationFrame(() => {
+-          const secondRaf = requestAnimationFrame(forceInitialChartSync);
+-          initialSyncRafIds.push(secondRaf);
+-        });
+-        initialSyncRafIds.push(firstRaf);
+-        for (const delay of [0, 80, 180, 360]) {
+-          initialSyncTimerIds.push(window.setTimeout(forceInitialChartSync, delay));
+-        }
+-
+         setStatus("ok");
+       } catch (e: any) {
++        void reportFrontendError({
++          kind: "chart.init",
++          message: e?.message ?? "chart error",
++          stack: e?.stack,
++          source: "CandleChart.init",
++          context: { symbol, interval, theme, chartHeight, reloadKey },
++        });
+         if (!destroyed) { setErr(e.message ?? "chart error"); setStatus("error"); }
+       }
+     };
+@@ -1052,15 +1237,31 @@ function CandleChart({
+     return () => {
+       destroyed = true;
+       cancelAnimationFrame(rafId);
+-      for (const id of initialSyncRafIds) cancelAnimationFrame(id);
+-      for (const id of initialSyncTimerIds) window.clearTimeout(id);
+       fvgElementsRef.current = [];
+-      if (fibLabelLayerRef.current) fibLabelLayerRef.current.innerHTML = "";
++      rebuildSwingsRef.current = null;
++      zigzagPolylineRef.current = null;
++      previewLineRef.current = null;
++      swingElementsRef.current = [];
++      dragRef.current = null;
++      try { cleanupListeners?.(); } catch { /* noop */ }
++      cleanupListeners = null;
+       try { chart?.remove(); } catch { /* double-remove */ }
+       chart = null;
+       candles = null;
+     };
+-  }, [symbol, interval, theme, chartHeight]);
++  }, [symbol, interval, theme, chartHeight, reloadKey]);
++
++  // Rebuild swing layer when edit mode toggles or draft changes. Edit mode
++  // sources swings from the draft (instant feedback for clicks); outside
++  // edit mode we revert to the engine-computed swings from the server.
++  useEffect(() => {
++    const rebuild = rebuildSwingsRef.current;
++    if (!rebuild) return;
++    const source: SwingPoint[] = editMode && draft
++      ? draft.map((d) => ({ ts: d.ts, price: d.price, label: d.label }))
++      : serverSwingsRef.current;
++    rebuild(source, !!editMode);
++  }, [editMode, draft]);
+ 
+   return (
+     <div className="relative" style={{ height: chartHeight, background: t.bg }}>
+@@ -1068,15 +1269,10 @@ function CandleChart({
+       <svg
+         ref={overlayRef}
+         className="pointer-events-none absolute inset-0"
+-        style={{ zIndex: 10 }}
++        style={{ zIndex: 12 }}
+         width="100%"
+         height={chartHeight}
+       />
+-      <div
+-        ref={fibLabelLayerRef}
+-        className="pointer-events-none absolute inset-0"
+-        style={{ zIndex: 11 }}
+-      />
+       {status === "loading" && (
+         <div
+           className="absolute inset-0 flex items-center justify-center text-xs"
+@@ -1156,13 +1352,15 @@ function ChartModal({
+   source,
+   onSwitchSymbol,
+   onClose,
++  onAfterSave,
+ }: {
+   row: DashboardRow;
+   orderedSymbols: string[];
+   rows: DashboardRow[];
+   source: "local" | "global" | null;
+   onSwitchSymbol: (symbol: string) => void;
+-  onClose: () => void;
++  onClose: (reason?: string) => void;
++  onAfterSave: () => void;
+ }) {
+   const modalCardRef = useRef<HTMLDivElement>(null);
+   const [tab, setTab] = useState<ChartTab>(() => {
+@@ -1198,6 +1396,23 @@ function ChartModal({
+     typeof window !== "undefined" ? window.innerHeight : 900
+   );
+ 
++  // ── Structure edit mode ──────────────────────────────────────────────────
++  // Single source of truth for both the chart SVG and the screener tables.
++  // Entering edit mode seeds the draft from the override (if any) or from
++  // the engine-computed swings currently shown on the chart.
++  const [editMode, setEditMode] = useState(false);
++  const [draft, setDraft] = useState<StructureEvent[]>([]);
++  const [draftDirty, setDraftDirty] = useState(false);
++  const [editStatus, setEditStatus] = useState<
++    | { kind: "idle" }
++    | { kind: "loading" }
++    | { kind: "saving" }
++    | { kind: "saved" }
++    | { kind: "error"; message: string }
++  >({ kind: "idle" });
++  const [chartReloadKey, setChartReloadKey] = useState(0);
++  const [popover, setPopover] = useState<{ idx: number; x: number; y: number } | null>(null);
++
+   // Tracks which direction the user last navigated so CSS animations know
+   // which way the center coin should slide in. Empty string = initial open.
+   const navDirRef = useRef<"next" | "prev" | "">("");
+@@ -1233,6 +1448,181 @@ function ChartModal({
+   }
+ 
+   const interval: ChartInterval = TAB_INTERVAL[tab];
++
++  useEffect(() => {
++    if (typeof window === "undefined") return;
++    window.__kazusChartContext = {
++      symbol: activeSymbol,
++      interval,
++      tab,
++      theme,
++      editMode,
++    };
++    return () => {
++      if (window.__kazusChartContext?.symbol === activeSymbol) {
++        window.__kazusChartContext = null;
++      }
++    };
++  }, [activeSymbol, interval, tab, theme, editMode]);
++
++  useEffect(() => {
++    void reportFrontendError({
++      kind: "chart.modal",
++      message: `modal active ${activeSymbol} ${interval}`,
++      source: "ChartModal.lifecycle",
++      context: { symbol: activeSymbol, interval, tab, theme, editMode },
++    });
++    return () => {
++      void reportFrontendError({
++        kind: "chart.modal",
++        message: `modal cleanup ${activeSymbol} ${interval}`,
++        source: "ChartModal.lifecycle",
++        context: { symbol: activeSymbol, interval, tab, theme, editMode },
++      });
++    };
++  }, [activeSymbol, interval, tab, theme, editMode]);
++
++  // ── Edit-mode helpers ────────────────────────────────────────────────────
++  function confirmDiscardIfDirty(): boolean {
++    if (!editMode || !draftDirty) return true;
++    return window.confirm("Discard unsaved structure edits?");
++  }
++
++  async function enterEditMode() {
++    setEditStatus({ kind: "loading" });
++    try {
++      // Seed draft from the structure currently displayed on the chart so
++      // that toggling edit mode never changes what the user sees. The
++      // backend already applies any saved override before computing this
++      // timeline, so this captures override + engine extension as one.
++      const chart = await getChartCached(activeSymbol, interval);
++      const seed: StructureEvent[] = chart.swings
++        .filter((s) =>
++          s.label === "HH" || s.label === "HL" || s.label === "LL" || s.label === "LH"
++        )
++        .map((s) => ({
++          ts: s.ts,
++          price: s.price,
++          label: s.label as StructureEvent["label"],
++        }));
++      setDraft(seed);
++      setDraftDirty(false);
++      setEditMode(true);
++      setEditStatus({ kind: "idle" });
++    } catch (err: any) {
++      setEditStatus({
++        kind: "error",
++        message: err?.message ?? "failed to load structure",
++      });
++    }
++  }
++
++  function exitEditMode() {
++    if (!confirmDiscardIfDirty()) return;
++    setEditMode(false);
++    setDraft([]);
++    setDraftDirty(false);
++    setEditStatus({ kind: "idle" });
++    setPopover(null);
++  }
++
++  function updateDraft(next: StructureEvent[]) {
++    setDraft(next);
++    setDraftDirty(true);
++  }
++
++  async function saveDraft() {
++    setEditStatus({ kind: "saving" });
++    try {
++      // Sort by ts so storage matches what the engine will replay.
++      const events = [...draft].sort((a, b) => a.ts - b.ts);
++      await saveStructure(activeSymbol, interval, events);
++      invalidateChartCache(activeSymbol, interval);
++      setChartReloadKey((k) => k + 1);
++      setDraftDirty(false);
++      setEditStatus({ kind: "saved" });
++      onAfterSave();
++      // Keep edit mode open after save — common workflow is iterative.
++    } catch (err: any) {
++      setEditStatus({
++        kind: "error",
++        message: err?.message ?? "save failed",
++      });
++    }
++  }
++
++  async function resetToAuto() {
++    if (!window.confirm("Delete saved structure for this symbol/timeframe?")) return;
++    setEditStatus({ kind: "saving" });
++    try {
++      await deleteStructure(activeSymbol, interval);
++      invalidateChartCache(activeSymbol, interval);
++      setChartReloadKey((k) => k + 1);
++      // Re-seed draft from engine swings of the freshly-fetched chart.
++      const chart = await getChartCached(activeSymbol, interval);
++      const seed: StructureEvent[] = chart.swings
++        .filter((s) =>
++          s.label === "HH" || s.label === "HL" || s.label === "LL" || s.label === "LH"
++        )
++        .map((s) => ({
++          ts: s.ts,
++          price: s.price,
++          label: s.label as StructureEvent["label"],
++        }));
++      setDraft(seed);
++      setDraftDirty(false);
++      setEditStatus({ kind: "saved" });
++      onAfterSave();
++    } catch (err: any) {
++      setEditStatus({
++        kind: "error",
++        message: err?.message ?? "reset failed",
++      });
++    }
++  }
++
++  // Switching coin / tab / closing while editing must confirm discard.
++  function guardedSwitchSymbol(sym: string) {
++    if (!confirmDiscardIfDirty()) return;
++    if (editMode) {
++      setEditMode(false);
++      setDraft([]);
++      setDraftDirty(false);
++      setEditStatus({ kind: "idle" });
++      setPopover(null);
++    }
++    onSwitchSymbol(sym);
++  }
++  function guardedSetTab(t: ChartTab) {
++    if (t === tab) return;
++    if (!confirmDiscardIfDirty()) return;
++    if (editMode) {
++      setEditMode(false);
++      setDraft([]);
++      setDraftDirty(false);
++      setEditStatus({ kind: "idle" });
++      setPopover(null);
++    }
++    setTab(t);
++    localStorage.setItem(CHART_TAB_KEY, t);
++  }
++  function guardedClose(reason = "unknown") {
++    if (!confirmDiscardIfDirty()) return;
++    void reportFrontendError({
++      kind: "chart.close",
++      message: `close chart ${activeSymbol} ${interval} via ${reason}`,
++      source: "ChartModal.guardedClose",
++      context: {
++        symbol: activeSymbol,
++        interval,
++        tab,
++        theme,
++        editMode,
++        reason,
++      },
++    });
++    onClose(reason);
++  }
+   const isDark = theme === "dark";
+   const effectiveChartHeight = isFullscreen
+     ? Math.max(360, viewportHeight - 250)
+@@ -1267,23 +1657,24 @@ function ChartModal({
+       if (e.key === "ArrowLeft" && prevSymbol) {
+         e.preventDefault();
+         navDirRef.current = "prev";
+-        onSwitchSymbol(prevSymbol);
++        guardedSwitchSymbol(prevSymbol);
+       } else if (e.key === "ArrowRight" && nextSymbol) {
+         e.preventDefault();
+         navDirRef.current = "next";
+-        onSwitchSymbol(nextSymbol);
++        guardedSwitchSymbol(nextSymbol);
+       } else if (e.key === "Escape") {
+         if (document.fullscreenElement) {
+           e.preventDefault();
+           void document.exitFullscreen();
+         } else {
+-          onClose();
++          guardedClose("escape");
+         }
+       }
+     };
+     window.addEventListener("keydown", onKey);
+     return () => window.removeEventListener("keydown", onKey);
+-  }, [prevSymbol, nextSymbol, onSwitchSymbol, onClose]);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [prevSymbol, nextSymbol, editMode, draftDirty]);
+ 
+   useEffect(() => {
+     const onFsChange = () => {
+@@ -1338,7 +1729,6 @@ function ChartModal({
+   return (
+     <div
+       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm kz-modal-enter"
+-      onClick={onClose}
+     >
+       <div
+         ref={modalCardRef}
+@@ -1362,7 +1752,7 @@ function ChartModal({
+             <span className="sideCoin sideCoin-far truncate" title={farPrevLabel}>{farPrevLabel}</span>
+             <button
+               type="button"
+-              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; onSwitchSymbol(prevSymbol); } }}
++              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
+               disabled={!prevSymbol}
+               className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[90px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+               title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
+@@ -1371,7 +1761,7 @@ function ChartModal({
+             </button>
+             <button
+               type="button"
+-              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; onSwitchSymbol(prevSymbol); } }}
++              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
+               disabled={!prevSymbol}
+               className="kz-nav arrow kz-coin-arrow h-7 w-[28px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+               aria-label="Previous coin"
+@@ -1383,7 +1773,7 @@ function ChartModal({
+             </span>
+             <button
+               type="button"
+-              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; onSwitchSymbol(nextSymbol); } }}
++              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
+               disabled={!nextSymbol}
+               className="kz-nav arrow kz-coin-arrow h-7 w-[28px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+               aria-label="Next coin"
+@@ -1392,7 +1782,7 @@ function ChartModal({
+             </button>
+             <button
+               type="button"
+-              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; onSwitchSymbol(nextSymbol); } }}
++              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
+               disabled={!nextSymbol}
+               className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[90px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+               title={nearNextLabel ? `${nearNextLabel} →` : ""}
+@@ -1409,10 +1799,7 @@ function ChartModal({
+             {(Object.keys(TAB_LABELS) as ChartTab[]).map((t) => (
+               <button
+                 key={t}
+-                onClick={() => {
+-                  setTab(t);
+-                  localStorage.setItem(CHART_TAB_KEY, t);
+-                }}
++                onClick={() => guardedSetTab(t)}
+                 className={`kz-tab h-8 px-3 inline-flex items-center rounded-md text-[11px] uppercase tracking-[0.22em] ${
+                   tab === t ? "kz-tab-active" : ""
+                 }`}
+@@ -1429,17 +1816,19 @@ function ChartModal({
+           <div className="kz-toolbar-actions">
+             <button
+               onClick={() => resizeChart(-60)}
+-              className={btnIcon}
++              disabled={isFullscreen}
++              className={`${btnIcon} disabled:opacity-30 disabled:pointer-events-none`}
+               style={btnStyle}
+-              title="Smaller chart"
++              title={isFullscreen ? "Disabled in full screen" : "Smaller chart"}
+             >
+               −
+             </button>
+             <button
+               onClick={() => resizeChart(60)}
+-              className={btnIcon}
++              disabled={isFullscreen}
++              className={`${btnIcon} disabled:opacity-30 disabled:pointer-events-none`}
+               style={btnStyle}
+-              title="Larger chart"
++              title={isFullscreen ? "Disabled in full screen" : "Larger chart"}
+             >
+               +
+             </button>
+@@ -1512,8 +1901,64 @@ function ChartModal({
+                 +
+               </button>
+             </div>
++            {/* ── Structure edit controls ── */}
++            {!editMode ? (
++              <button
++                onClick={enterEditMode}
++                className="kz-btn h-8 px-3 inline-flex items-center rounded-md border text-[11px] tracking-[0.22em] uppercase"
++                style={btnStyle}
++                title="Edit structure (manual swings)"
++                disabled={editStatus.kind === "loading"}
++              >
++                {editStatus.kind === "loading" ? "…" : "✎ Edit"}
++              </button>
++            ) : (
++              <>
++                <button
++                  onClick={saveDraft}
++                  disabled={!draftDirty || editStatus.kind === "saving"}
++                  className="kz-btn h-8 px-3 inline-flex items-center rounded-md border text-[11px] tracking-[0.22em] uppercase disabled:opacity-40 disabled:pointer-events-none"
++                  style={{ ...btnStyle, color: "#7fb678", borderColor: "#7fb678" }}
++                  title="Save manual structure"
++                >
++                  {editStatus.kind === "saving" ? "…" : "Save"}
++                </button>
++                <button
++                  onClick={exitEditMode}
++                  className="kz-btn h-8 px-3 inline-flex items-center rounded-md border text-[11px] tracking-[0.22em] uppercase"
++                  style={btnStyle}
++                  title="Cancel edits"
++                >
++                  Cancel
++                </button>
++                <button
++                  onClick={resetToAuto}
++                  disabled={editStatus.kind === "saving"}
++                  className="kz-btn h-8 px-3 inline-flex items-center rounded-md border text-[11px] tracking-[0.22em] uppercase"
++                  style={{ ...btnStyle, color: "#d68b8b", borderColor: "#d68b8b" }}
++                  title="Delete saved structure (revert to auto)"
++                >
++                  Reset
++                </button>
++                {editStatus.kind === "saving" && (
++                  <span className="text-[10px] font-mono ml-1" style={{ color: subText }}>
++                    saving…
++                  </span>
++                )}
++                {editStatus.kind === "saved" && (
++                  <span className="text-[10px] font-mono ml-1" style={{ color: "#7fb678" }}>
++                    saved · tables update ~15s
++                  </span>
++                )}
++                {editStatus.kind === "error" && (
++                  <span className="text-[10px] font-mono ml-1" style={{ color: "#d68b8b" }}>
++                    {editStatus.message}
++                  </span>
++                )}
++              </>
++            )}
+             <button
+-              onClick={onClose}
++              onClick={() => guardedClose("button")}
+               className={btnIcon}
+               style={btnStyle}
+               title="Close"
+@@ -1555,9 +2000,176 @@ function ChartModal({
+               chartHeight={effectiveChartHeight}
+               fvgEnabled={fvgEnabled}
+               fvgLimit={fvgLimit}
++              reloadKey={chartReloadKey}
++              editMode={editMode}
++              draft={draft}
++              onSwingClick={(a) =>
++                setPopover({ idx: a.idx, x: a.clientX, y: a.clientY })
++              }
++              onCanvasClick={(ts, price) => {
++                // Auto-label by direction relative to the previous opposite-
++                // side swing: above prior high → HH, below → LH; above prior
++                // low → HL, below → LL. With no prior counterpart, default
++                // to the natural alternation from the last point.
++                const sorted = [...draft].sort((a, b) => a.ts - b.ts);
++                const last = sorted[sorted.length - 1];
++                const isHigh = (l: StructureEvent["label"]) => l === "HH" || l === "LH";
++                const isLow = (l: StructureEvent["label"]) => l === "HL" || l === "LL";
++                let label: StructureEvent["label"];
++                if (!last) {
++                  label = "HH";
++                } else if (isHigh(last.label)) {
++                  // New point is a low.
++                  const prevLow = [...sorted].reverse().find((s) => isLow(s.label));
++                  label = prevLow ? (price > prevLow.price ? "HL" : "LL") : "HL";
++                } else {
++                  // New point is a high.
++                  const prevHigh = [...sorted].reverse().find((s) => isHigh(s.label));
++                  label = prevHigh ? (price > prevHigh.price ? "HH" : "LH") : "HH";
++                }
++                const next = [...draft, { ts, price, label }].sort((a, b) => a.ts - b.ts);
++                updateDraft(next);
++              }}
++              onSwingDragEnd={(idx, ts, price) => {
++                const next = draft.map((d, i) =>
++                  i === idx ? { ...d, ts, price } : d
++                );
++                next.sort((a, b) => a.ts - b.ts);
++                updateDraft(next);
++              }}
+             />
+           </div>
+         </div>
++        {popover && editMode && draft[popover.idx] && (
++          <SwingPopover
++            event={draft[popover.idx]}
++            anchor={popover}
++            onClose={() => setPopover(null)}
++            onChangeLabel={(label) => {
++              updateDraft(
++                draft.map((d, i) =>
++                  i === popover.idx ? { ...d, label } : d
++                )
++              );
++            }}
++            onDelete={() => {
++              updateDraft(draft.filter((_, i) => i !== popover.idx));
++              setPopover(null);
++            }}
++          />
++        )}
++
++      </div>
++    </div>
++  );
++}
++
++// ── Swing Popover (edit-mode only) ──────────────────────────────────────────
++// Anchored to the swing's screen position via fixed positioning. The four
++// label pills swap the label in-place; ✕ deletes the swing from the draft.
++// Outside-click and Esc close the popover.
++
++const SWING_POPOVER_LABELS: { value: StructureEvent["label"]; tone: "bull" | "bear" }[] = [
++  { value: "HH", tone: "bull" },
++  { value: "HL", tone: "bull" },
++  { value: "LH", tone: "bear" },
++  { value: "LL", tone: "bear" },
++];
++
++function SwingPopover({
++  event,
++  anchor,
++  onClose,
++  onChangeLabel,
++  onDelete,
++}: {
++  event: StructureEvent;
++  anchor: { x: number; y: number };
++  onClose: () => void;
++  onChangeLabel: (label: StructureEvent["label"]) => void;
++  onDelete: () => void;
++}) {
++  const ref = useRef<HTMLDivElement>(null);
++
++  useEffect(() => {
++    const onDocClick = (e: MouseEvent) => {
++      if (!ref.current) return;
++      if (!ref.current.contains(e.target as Node)) onClose();
++    };
++    const onKey = (e: KeyboardEvent) => {
++      if (e.key === "Escape") onClose();
++    };
++    // defer so the click that opened the popover doesn't immediately close it.
++    const id = window.setTimeout(() => {
++      document.addEventListener("mousedown", onDocClick);
++    }, 0);
++    document.addEventListener("keydown", onKey);
++    return () => {
++      window.clearTimeout(id);
++      document.removeEventListener("mousedown", onDocClick);
++      document.removeEventListener("keydown", onKey);
++    };
++  }, [onClose]);
++
++  const date = new Date(event.ts);
++  const pad = (n: number) => String(n).padStart(2, "0");
++  const formatted = `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC`;
++
++  return (
++    <div
++      ref={ref}
++      className="fixed z-[60] rounded-md border shadow-lg p-2 font-mono"
++      style={{
++        left: Math.max(8, Math.min(window.innerWidth - 220, anchor.x - 100)),
++        top: Math.max(8, anchor.y - 96),
++        background: "#18181b",
++        borderColor: "#3f3f46",
++        color: "#e4e4e7",
++        width: 200,
++      }}
++      onClick={(e) => e.stopPropagation()}
++    >
++      <div className="flex items-center justify-between mb-2">
++        <span className="text-[9px] uppercase tracking-[0.18em]" style={{ color: "#a1a1aa" }}>
++          Swing point
++        </span>
++        <button
++          type="button"
++          onClick={onDelete}
++          className="kz-btn h-5 w-5 inline-flex items-center justify-center rounded border text-[10px]"
++          style={{ color: "#d68b8b", borderColor: "#3f3f46" }}
++          title="Delete swing"
++        >
++          ✕
++        </button>
++      </div>
++      <div className="grid grid-cols-4 gap-1 mb-2">
++        {SWING_POPOVER_LABELS.map((opt) => {
++          const active = opt.value === event.label;
++          const tone =
++            opt.tone === "bull"
++              ? { fill: "#2a3d27", stroke: "#7fb678" }
++              : { fill: "#752727", stroke: "#d68b8b" };
++          return (
++            <button
++              key={opt.value}
++              type="button"
++              onClick={() => onChangeLabel(opt.value)}
++              className="h-7 rounded text-[11px] font-bold border"
++              style={{
++                background: active ? tone.fill : "transparent",
++                color: active ? "#ffffff" : tone.stroke,
++                borderColor: tone.stroke,
++              }}
++            >
++              {opt.value}
++            </button>
++          );
++        })}
++      </div>
++      <div className="text-[10px]" style={{ color: "#a1a1aa" }}>
++        <div>{formatted}</div>
++        <div>price {event.price}</div>
+       </div>
+     </div>
+   );
+@@ -1599,6 +2211,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
+       localStorage.getItem(LOCAL_EXPANDED_KEY) !== "0"
+   );
+   const [motionEnabled, setMotionEnabled] = useState<boolean>(true);
++  const lastChartRowRef = useRef<DashboardRow | null>(null);
+ 
+   function changeFontSize(delta: number) {
+     setFontSize((v) => {
+@@ -1629,7 +2242,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
+     symbol: string | null,
+     order?: string[],
+     source?: "local" | "global",
++    reason?: string,
+   ) {
++    void reportFrontendError({
++      kind: "chart.symbol",
++      message: symbol ? `open chart ${symbol}` : "close chart",
++      source: "Dashboard.setChartSymbol",
++      context: { symbol, source, orderSize: order?.length, reason },
++    });
+     setChartSymbolState(symbol);
+     if (symbol) localStorage.setItem(CHART_SYMBOL_KEY, symbol);
+     else localStorage.removeItem(CHART_SYMBOL_KEY);
+@@ -1792,7 +2412,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
+     ? new Date(data.last_refresh_at).toLocaleString()
+     : "—";
+ 
+-  const chartRow = chartSymbol ? rows.find((r) => r.symbol === chartSymbol) ?? null : null;
++  const freshChartRow = chartSymbol ? rows.find((r) => r.symbol === chartSymbol) ?? null : null;
++  if (freshChartRow) {
++    lastChartRowRef.current = freshChartRow;
++  }
++  const chartRow =
++    freshChartRow ??
++    (lastChartRowRef.current?.symbol === chartSymbol ? lastChartRowRef.current : null);
++
++  useEffect(() => {
++    if (!chartSymbol) return;
++    if (freshChartRow) return;
++    void reportFrontendError({
++      kind: "chart.row_missing",
++      message: `chart row missing for ${chartSymbol}`,
++      source: "Dashboard.chartRow",
++      context: {
++        symbol: chartSymbol,
++        rows: rows.length,
++        hasFallback: lastChartRowRef.current?.symbol === chartSymbol,
++      },
++    });
++  }, [chartSymbol, freshChartRow, rows.length]);
+ 
+   const leftPick = swapped
+     ? (r: DashboardRow) => r.local
+@@ -2045,7 +2686,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
+           orderedSymbols={chartOrder.length > 0 ? chartOrder : rows.map((r) => r.symbol)}
+           source={chartSource}
+           onSwitchSymbol={(sym) => setChartSymbol(sym)}
+-          onClose={() => setChartSymbol(null)}
++          onClose={(reason) => setChartSymbol(null, undefined, undefined, reason)}
++          onAfterSave={() => {
++            void refresh();
++          }}
+         />
+       )}
+ 
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index 6b1575a..974e7e1 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -165,6 +165,10 @@ export type SwingPoint = {
+   label: "HH" | "HL" | "LL" | "LH" | string;
+ };
+ 
++// Compatibility shim for older chart-modal backups that supported manual
++// structure editing directly from the frontend.
++export type StructureEvent = SwingPoint;
++
+ export type FvgBox = {
+   ts: number;
+   end_ts: number;
+@@ -195,6 +199,42 @@ export async function getChart(symbol: string, interval: string, limit?: number)
+   );
+ }
+ 
++export async function reportFrontendError(payload: {
++  kind: string;
++  message: string;
++  source?: string;
++  stack?: string;
++  url?: string;
++  user_agent?: string;
++  context?: Record<string, unknown>;
++}) {
++  try {
++    const headers = new Headers({ "Content-Type": "application/json" });
++    const token = getToken();
++    if (token) headers.set("Authorization", `Bearer ${token}`);
++    await fetch("/api/frontend-errors", {
++      method: "POST",
++      headers,
++      body: JSON.stringify(payload),
++      keepalive: true,
++    });
++  } catch {
++    // Never throw while reporting frontend crashes.
++  }
++}
++
++export async function saveStructure(
++  _symbol: string,
++  _interval: string,
++  _events: StructureEvent[]
++) {
++  throw new Error("manual structure editing is unavailable in this preview");
++}
++
++export async function deleteStructure(_symbol: string, _interval: string) {
++  throw new Error("manual structure editing is unavailable in this preview");
++}
++
+ export type TDAState = {
+   coins: string[];
+   data: Record<string, Record<string, string>>;
+diff --git a/frontend/src/main.tsx b/frontend/src/main.tsx
+index ed0b9b9..c32bafe 100644
+--- a/frontend/src/main.tsx
++++ b/frontend/src/main.tsx
+@@ -1,13 +1,17 @@
+ import React from "react";
+ import ReactDOM from "react-dom/client";
+ import App from "./App";
++import { FrontendErrorBoundary, installFrontendErrorReporter } from "./lib/frontendErrors";
+ import "./index.css";
+ 
+ document.documentElement.dataset.motion =
+   localStorage.getItem("kazus_motion") === "0" ? "off" : "on";
++installFrontendErrorReporter();
+ 
+ ReactDOM.createRoot(document.getElementById("root")!).render(
+   <React.StrictMode>
+-    <App />
++    <FrontendErrorBoundary>
++      <App />
++    </FrontendErrorBoundary>
+   </React.StrictMode>
+ );
