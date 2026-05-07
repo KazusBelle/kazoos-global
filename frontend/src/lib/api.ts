@@ -165,6 +165,10 @@ export type SwingPoint = {
   label: "HH" | "HL" | "LL" | "LH" | string;
 };
 
+// Compatibility shim for older chart-modal backups that supported manual
+// structure editing directly from the frontend.
+export type StructureEvent = SwingPoint;
+
 export type FvgBox = {
   ts: number;
   end_ts: number;
@@ -193,6 +197,42 @@ export async function getChart(symbol: string, interval: string, limit?: number)
   return request<ChartData>(
     `/chart/${encodeURIComponent(symbol)}?${params.toString()}`
   );
+}
+
+export async function reportFrontendError(payload: {
+  kind: string;
+  message: string;
+  source?: string;
+  stack?: string;
+  url?: string;
+  user_agent?: string;
+  context?: Record<string, unknown>;
+}) {
+  try {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    const token = getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    await fetch("/api/frontend-errors", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      keepalive: true,
+    });
+  } catch {
+    // Never throw while reporting frontend crashes.
+  }
+}
+
+export async function saveStructure(
+  _symbol: string,
+  _interval: string,
+  _events: StructureEvent[]
+) {
+  throw new Error("manual structure editing is unavailable in this preview");
+}
+
+export async function deleteStructure(_symbol: string, _interval: string) {
+  throw new Error("manual structure editing is unavailable in this preview");
 }
 
 export type TDAState = {

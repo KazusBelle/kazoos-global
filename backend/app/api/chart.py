@@ -94,37 +94,90 @@ def _analyze(
     else:
         return [], [], None, None, "none"
 
-    closed = bars[:-1] if len(bars) > 1 else bars
-    for b in closed:
+    # The chart modal should visually match TradingView, which includes the
+    # currently forming candle and the live/potential structure it can imply.
+    # Screener + alerts still use closed-bar compute in shared/kazus_logic.
+    chart_bars = list(bars)
+    for b in chart_bars:
         engine.feed(Bar(ts=b.ts, open=b.open, high=b.high, low=b.low, close=b.close))
 
-    # Structure timeline. The engines already collapse HH*/LL* repeats inside
-    # one leg, but we still de-dupe defensively (multiple writes can land on
-    # the same bar+label when a trend change confirms a pending event).
+    # Structure timeline. The engines already collapse repeated swing writes
+    # inside one leg, but we still de-dupe defensively (multiple writes can
+    # land on the same bar+label when a trend change confirms a pending event).
     swings: List[SwingPoint] = []
     seen_keys: set = set()
     for bar_index, price, label in engine.structure_events:
-        if not (0 <= bar_index < len(closed)):
+        if not (0 <= bar_index < len(chart_bars)):
             continue
         key = (bar_index, label)
         if key in seen_keys:
             continue
         seen_keys.add(key)
         swings.append(
-            SwingPoint(ts=closed[bar_index].ts, price=price, label=label)
+            SwingPoint(ts=chart_bars[bar_index].ts, price=price, label=label)
         )
+
+    # Global/D1 chart parity with TradingView: when the active bullish fib has
+    # already extended above the last confirmed high pivot (or the active
+    # bearish fib has already extended below the last confirmed low pivot),
+    # Pine shows a provisional HH/LL on the live leg. The engine keeps the fib
+    # state, but does not surface that provisional label in `structure_events`,
+    # so the chart would otherwise look like the move was "missed".
+    if interval == "1d":
+        if engine.fib_state.direction == "bullish":
+            potential_idx = getattr(engine, "tracked_fib_high_index", None)
+            potential_price = getattr(engine, "tracked_fib_high", None)
+            last_high = getattr(engine, "last_swing_high", None)
+            if (
+                potential_idx is not None
+                and potential_price is not None
+                and last_high is not None
+                and potential_price > last_high
+                and 0 <= potential_idx < len(chart_bars)
+            ):
+                key = (potential_idx, "HH")
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    swings.append(
+                        SwingPoint(
+                            ts=chart_bars[potential_idx].ts,
+                            price=potential_price,
+                            label="HH",
+                        )
+                    )
+        elif engine.fib_state.direction == "bearish":
+            potential_idx = getattr(engine, "tracked_fib_low_index", None)
+            potential_price = getattr(engine, "tracked_fib_low", None)
+            last_low = getattr(engine, "last_swing_low", None)
+            if (
+                potential_idx is not None
+                and potential_price is not None
+                and last_low is not None
+                and potential_price < last_low
+                and 0 <= potential_idx < len(chart_bars)
+            ):
+                key = (potential_idx, "LL")
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    swings.append(
+                        SwingPoint(
+                            ts=chart_bars[potential_idx].ts,
+                            price=potential_price,
+                            label="LL",
+                        )
+                    )
 
     # FVG boxes — extend each gap to the right edge of the closed-bar window.
     # The frontend draws them as semi-transparent rectangles spanning that range.
     fvgs: List[FvgBox] = []
-    if closed:
-        end_ts = closed[-1].ts
+    if chart_bars:
+        end_ts = chart_bars[-1].ts
         for bar_index, top, bottom, kind in engine.fvg_events:
-            if not (0 <= bar_index < len(closed)):
+            if not (0 <= bar_index < len(chart_bars)):
                 continue
             fvgs.append(
                 FvgBox(
-                    ts=closed[bar_index].ts,
+                    ts=chart_bars[bar_index].ts,
                     end_ts=end_ts,
                     top=top,
                     bottom=bottom,
