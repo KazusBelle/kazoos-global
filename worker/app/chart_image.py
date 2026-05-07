@@ -20,11 +20,30 @@ matplotlib.use("Agg")  # no display, must be set before pyplot import.
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-from kazus_logic.compute import _scan_fvgs, _is_fvg_mitigated
 from kazus_logic.engine import Bar, ZoneResult
 
 
 logger = logging.getLogger("kazus.worker.chart_image")
+
+
+# 3-bar FVG scan + mitigation check, inlined here from the old compute.py.
+# chart_image.py is the only remaining consumer and is slated for removal in
+# the Playwright render-export migration; not worth re-exposing as shared API.
+def _scan_fvgs(bars: List[Bar]):
+    out = []
+    for i in range(2, len(bars)):
+        if bars[i].low > bars[i - 2].high:
+            out.append((i, bars[i].low, bars[i - 2].high, "bullish"))
+        if bars[i].high < bars[i - 2].low:
+            out.append((i, bars[i - 2].low, bars[i].high, "bearish"))
+    return out
+
+
+def _is_fvg_mitigated(bars: List[Bar], fvg_idx: int, fvg_top: float, fvg_bottom: float) -> bool:
+    for j in range(fvg_idx + 1, len(bars)):
+        if bars[j].low <= fvg_top and bars[j].high >= fvg_bottom:
+            return True
+    return False
 
 
 def render_setup_png(

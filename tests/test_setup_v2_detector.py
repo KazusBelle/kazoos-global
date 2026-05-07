@@ -322,3 +322,54 @@ def test_only_first_bearish_fvg_is_used_for_inv():
     assert len(inv) == 1
     assert inv[0].fvg.top == 114.0
     assert inv[0].fvg.bottom == 110.0
+
+
+# --- 9. Fire on first observation of a closed-bar trigger --------------------
+# Worker polls every few minutes while LTF candles close every 15m, and
+# restarts/missed cycles are normal. A still-valid setup whose trigger bar
+# closed before this cycle began must alert on first observation, not be
+# silently dropped because formed_at_ts != last_bar.ts.
+
+def test_cre_fires_on_first_observation_when_bull_fvg_was_formed_earlier():
+    """Fresh start (prev_state=None) and the bullish FVG already exists in
+    the window — its formation bar is several bars before last_bar."""
+    zone = _bullish_ote()
+    bars = [
+        _bar(1000, 105, 106, 104, 105),   # enter OTE
+        _bar(2000, 105, 106, 104, 105),
+        _bar(3000, 105, 107, 104, 106),   # i-2 anchor for bullish FVG
+        _bar(4000, 106, 108, 105, 107),
+        _bar(5000, 108, 110, 108, 109),   # bullish FVG: bar[5].low=108 > bar[3].high=107
+        _bar(6000, 109, 110, 108, 109),   # several bars pass — worker still hasn't observed
+        _bar(7000, 108, 109, 107, 108),
+        _bar(8000, 108, 109, 107, 108),
+    ]
+    state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
+    cre = [e for e in events if e.kind == "CRE"]
+    assert state.state == "CRE"
+    assert len(cre) == 1
+    assert cre[0].trigger_ts == 5000
+    assert cre[0].event_id == "cre:TEST:M15:5000"
+
+
+def test_inv_fires_on_first_observation_when_body_close_was_earlier():
+    """Body-close-above-bear-FVG happened on a bar that is no longer the
+    last bar by the time the worker observes the session."""
+    zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
+    bars = [
+        _bar(1000, 108, 109, 107, 108),    # enter OTE
+        _bar(2000, 108, 109, 107, 108),
+        _bar(3000, 107, 108, 105, 106),
+        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG: top=107, bottom=105
+        _bar(5000, 109, 110, 108, 109.5),  # body=[108, 109.5] > 107 → trigger
+        # subsequent bars must not break swing_low (=103) and must not
+        # accidentally form a bullish FVG (would upgrade INV→STB).
+        _bar(6000, 106, 107, 104, 106),    # low=104 ≤ bar[4].high=105 → no bull FVG
+        _bar(7000, 106, 107, 104, 106),    # low=104 ≤ bar[5].high=110 → no bull FVG
+    ]
+    state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
+    inv = [e for e in events if e.kind == "INV"]
+    assert state.state == "INV"
+    assert len(inv) == 1
+    assert inv[0].trigger_ts == 5000
+    assert inv[0].event_id == "inv:TEST:M15:5000"

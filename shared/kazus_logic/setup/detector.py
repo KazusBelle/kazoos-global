@@ -13,6 +13,14 @@ Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
   STB — INV and CRE both fired within the same OTE session, in any order.
         Trigger ts is the later of the two.
 
+We fire on first observation of a closed-bar trigger, not only when the
+trigger bar happens to be the latest one in the window: the worker polls
+every few minutes while LTF candles close every 15m, so a setup can
+already be hours old by the time it is first observed (fresh start,
+restart, missed cycle). Once a closed-bar trigger has fired and not been
+invalidated, it stays valid and the runner-level sent_event_ids dedup
+keeps the same trigger from re-alerting on later cycles.
+
 Reset (within a live session):
   If the last closed LTF bar's low breaks the session swing_low (the
   minimum that "spawned" the search), all event flags wipe and we
@@ -103,30 +111,42 @@ def detect_setup(
     events: List[SetupEvent] = []
     swing_low_for_event = state.swing_low if state.swing_low is not None else last_bar.low
 
+    # INV trigger: first session bar (after the bear FVG formed) whose body
+    # closes strictly above the FVG's top. Scanning the whole arc (not only
+    # last_bar) means a still-valid trigger that closed before the worker
+    # observed the session is not silently dropped.
     if state.first_bear_fvg is not None and not state.inv_fired:
-        body_low = min(last_bar.open, last_bar.close)
-        if body_low > state.first_bear_fvg.top and last_bar.ts > state.first_bear_fvg.formed_at_ts:
-            state.inv_fired = True
-            state.inv_at_ts = last_bar.ts
-            events.append(SetupEvent(
-                kind="INV",
-                event_id=_event_id("inv", symbol, timeframe, last_bar.ts),
-                trigger_ts=last_bar.ts,
-                fvg=state.first_bear_fvg,
-                swing_low=swing_low_for_event,
-            ))
+        bear_top = state.first_bear_fvg.top
+        bear_formed_ts = state.first_bear_fvg.formed_at_ts
+        for b in session_bars:
+            if b.ts < state.search_start_ts or b.ts <= bear_formed_ts:
+                continue
+            body_low = min(b.open, b.close)
+            if body_low > bear_top:
+                state.inv_fired = True
+                state.inv_at_ts = b.ts
+                events.append(SetupEvent(
+                    kind="INV",
+                    event_id=_event_id("inv", symbol, timeframe, b.ts),
+                    trigger_ts=b.ts,
+                    fvg=state.first_bear_fvg,
+                    swing_low=swing_low_for_event,
+                ))
+                break
 
+    # CRE trigger: formation of the first bullish FVG. Once first_bull_fvg
+    # is locked in for this arc the formation bar is fixed; firing on first
+    # observation captures it across worker restarts and missed cycles.
     if state.first_bull_fvg is not None and not state.cre_fired:
-        if state.first_bull_fvg.formed_at_ts == last_bar.ts:
-            state.cre_fired = True
-            state.cre_at_ts = last_bar.ts
-            events.append(SetupEvent(
-                kind="CRE",
-                event_id=_event_id("cre", symbol, timeframe, last_bar.ts),
-                trigger_ts=last_bar.ts,
-                fvg=state.first_bull_fvg,
-                swing_low=swing_low_for_event,
-            ))
+        state.cre_fired = True
+        state.cre_at_ts = state.first_bull_fvg.formed_at_ts
+        events.append(SetupEvent(
+            kind="CRE",
+            event_id=_event_id("cre", symbol, timeframe, state.cre_at_ts),
+            trigger_ts=state.cre_at_ts,
+            fvg=state.first_bull_fvg,
+            swing_low=swing_low_for_event,
+        ))
 
     if state.inv_fired and state.cre_fired and not state.stb_fired:
         state.stb_fired = True
