@@ -196,7 +196,7 @@ def _analyze(
 
 # Per-interval defaults match shared/kazus_logic/compute.py worker so the
 # chart engine state matches what the screener table shows.
-_INTERVAL_DEFAULT_LIMIT = {"1d": 500, "1h": 900, "15m": 600}
+_INTERVAL_DEFAULT_LIMIT = {"1d": 500, "1h": 900, "15m": 600, "5m": 600}
 
 
 @router.get("/chart/{symbol}", response_model=ChartResponse)

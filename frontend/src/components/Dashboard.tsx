@@ -85,7 +85,12 @@ function TDAIcon({ size = 20 }: { size?: number }) {
 
 // ── Chart Modal (lightweight-charts candlestick + Fibonacci) ────────────────
 
-type ChartInterval = "1d" | "1h" | "15m";
+type ChartInterval = "1d" | "1h" | "15m" | "5m";
+
+// Symbols that get an extra M5 chart tab. Mirrors M5_SYMBOLS in
+// shared/kazus_logic/compute.py — these run an additional H1→M5 setup
+// detector path on top of the standard H1→M15 one.
+const M5_TAB_SYMBOLS = new Set(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
 
 const FVG_ENABLED_KEY = "kazus_fvg_enabled";
 const FVG_LIMIT_KEY = "kazus_fvg_limit";
@@ -1293,19 +1298,27 @@ function CandleChart({
   );
 }
 
-type ChartTab = "global" | "local" | "entry";
+type ChartTab = "global" | "local" | "entry" | "entry5";
 
 const TAB_LABELS: Record<ChartTab, string> = {
   global: "Global · D1",
   local: "Local · H1",
   entry: "Entry · M15",
+  entry5: "Entry · M5",
 };
 
 const TAB_INTERVAL: Record<ChartTab, ChartInterval> = {
   global: "1d",
   local: "1h",
   entry: "15m",
+  entry5: "5m",
 };
+
+function tabsForSymbol(symbol: string): ChartTab[] {
+  const base: ChartTab[] = ["global", "local", "entry"];
+  if (M5_TAB_SYMBOLS.has(symbol.toUpperCase())) base.push("entry5");
+  return base;
+}
 
 const CHART_CAROUSEL_MS = 360;
 
@@ -1313,6 +1326,7 @@ function snapshotForChartTab(row: DashboardRow | null | undefined, tab: ChartTab
   if (!row) return null;
   if (tab === "global") return row.global;
   if (tab === "local") return row.local;
+  // entry / entry5 — confirmation timeframes have no separate snapshot row.
   return null;
 }
 
@@ -1367,7 +1381,10 @@ function ChartModal({
     if (source === "local") return "local";
     if (source === "global") return "global";
     const stored = localStorage.getItem(CHART_TAB_KEY);
-    if (stored === "global" || stored === "local" || stored === "entry") return stored;
+    if (stored === "global" || stored === "local" || stored === "entry" || stored === "entry5") {
+      // entry5 only valid for M5-eligible symbols; else fall through.
+      if (stored !== "entry5" || M5_TAB_SYMBOLS.has(row.symbol.toUpperCase())) return stored;
+    }
     return "global";
   });
   const [theme, setTheme] = useState<ChartTheme>(
@@ -1481,6 +1498,15 @@ function ChartModal({
       });
     };
   }, [activeSymbol, interval, tab, theme, editMode]);
+
+  // If the user navigates from a M5-eligible symbol to one without an M5
+  // tab while entry5 is active, fall back to the M15 entry tab so the
+  // chart stays mounted on a valid interval.
+  useEffect(() => {
+    if (tab === "entry5" && !M5_TAB_SYMBOLS.has(activeSymbol.toUpperCase())) {
+      setTab("entry");
+    }
+  }, [activeSymbol, tab]);
 
   // ── Edit-mode helpers ────────────────────────────────────────────────────
   function confirmDiscardIfDirty(): boolean {
@@ -1796,7 +1822,7 @@ function ChartModal({
         {/* Unified controls block — tabs on the left, ALL actions on the right */}
         <div className="kz-unified-toolbar">
           <div className="flex gap-1">
-            {(Object.keys(TAB_LABELS) as ChartTab[]).map((t) => (
+            {tabsForSymbol(activeSymbol).map((t) => (
               <button
                 key={t}
                 onClick={() => guardedSetTab(t)}

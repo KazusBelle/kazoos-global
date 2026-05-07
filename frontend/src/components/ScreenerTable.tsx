@@ -94,6 +94,24 @@ function trendTintClass(trend?: string) {
   return "text-muted";
 }
 
+function setupClass(setup?: string) {
+  switch (setup) {
+    case "STB":
+      return "text-accent font-semibold";
+    case "CRE":
+      return "text-discount";
+    case "INV":
+      return "text-amber-400";
+    default:
+      return "text-muted";
+  }
+}
+
+function setupLabel(setup?: string): string {
+  if (setup === "STB" || setup === "CRE" || setup === "INV") return setup;
+  return "—";
+}
+
 function Sparkline({ closes, trend }: { closes: number[]; trend?: string }) {
   const width = 84;
   const height = 18;
@@ -574,8 +592,8 @@ export function ScreenerTable({
                       ? `${(s.retracement * 100).toFixed(1)}%`
                       : <span className="text-muted">downtrend</span>}
                   </td>
-                  <td className={`px-2 ${rowPad} uppercase text-muted`}>
-                    no
+                  <td className={`px-2 ${rowPad} uppercase tracking-widest ${setupClass(s?.setup)}`}>
+                    {setupLabel(s?.setup)}
                   </td>
                   <td className={`px-2 ${rowPad}`}>
                     <CallCell row={row} onSetCall={onSetCall} />
