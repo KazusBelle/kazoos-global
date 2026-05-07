@@ -4,9 +4,11 @@ Integration tests for the worker's event-driven alert flow.
 Covered:
   - _load_sent_ids accepts None / "[]" / "[\"a\"]" / garbage
   - _collect_new_events: brand-new event is returned, dedupes against
-    sent_event_ids, clears state on OTE exit
-  - _send_setup_alert: persists event_id (and STB suppresses) only after
-    Telegram succeeds; failed Telegram leaves sent_event_ids untouched
+    sent_event_ids, clears state on OTE exit, ignores tfs the snapshot
+    didn't compute (e.g. H1-M5 for non-BTC/ETH/SOL).
+  - _send_setup_alert: persists event_id only after Telegram succeeds;
+    failed Telegram leaves sent_event_ids untouched.
+  - _persist_setup_states / _load_prev_states roundtrip.
 
 Uses an in-memory SQLite engine and monkeypatches `worker.app.runner.SessionLocal`
 plus the render / telegram functions so no photos are produced and no real
@@ -19,20 +21,14 @@ import asyncio
 import importlib.util
 import os
 import sys
-from typing import List, Tuple
+from typing import Dict, List
 
 import pytest
 
-# Force a sqlite URL so worker.app.db / worker.app.settings don't try to
-# connect to Postgres on import.
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "x")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "y")
 
-# `backend/app/__init__.py` and `worker/app/__init__.py` collide on the
-# top-level package name `app`. Conftest puts backend first, so `app.runner`
-# would resolve to backend. Load the worker runner under a unique module
-# name via importlib so we can test it in isolation.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WORKER_APP = os.path.join(_ROOT, "worker", "app")
 
@@ -44,7 +40,6 @@ def _load_worker_runner():
     if "worker_runner" in sys.modules:
         return sys.modules["worker_runner"]
 
-    # Establish the parent package `worker_app` pointing at worker/app/.
     pkg_spec = importlib.util.spec_from_file_location(
         "worker_app",
         os.path.join(_WORKER_APP, "__init__.py"),
@@ -62,9 +57,6 @@ def _load_worker_runner():
         sys.modules[f"worker_app.{name}"] = mod
         spec.loader.exec_module(mod)
 
-    # Load runner.py but rewrite its relative imports by pre-installing the
-    # submodules under worker_app.* and then loading runner with that
-    # parent package.
     spec = importlib.util.spec_from_file_location(
         "worker_app.runner", os.path.join(_WORKER_APP, "runner.py")
     )
@@ -77,8 +69,6 @@ def _load_worker_runner():
 
 @pytest.fixture()
 def runner_with_sqlite(monkeypatch):
-    """Rebuild a SessionLocal bound to in-memory SQLite, install it on the
-    runner module, and yield helpers."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
@@ -94,39 +84,52 @@ def runner_with_sqlite(monkeypatch):
     yield runner_mod, SessionLocal
 
 
-def _make_snap(events_d1=(), events_h1=(), in_ote_d1=True, in_ote_h1=True):
-    from kazus_logic.compute import SymbolSnapshot
+def _make_snap(*, events: Dict[str, list] | None = None,
+               states: Dict[str, "SetupState"] | None = None,
+               in_ote_d1: bool = True, in_ote_h1: bool = True,
+               symbol: str = "TESTUSDT"):
+    from kazus_logic.compute import (
+        ALERT_TF_D1, ALERT_TF_H1, SymbolSnapshot,
+    )
     from kazus_logic.engine import ZoneResult
+    from kazus_logic.setup import SetupState
 
     def _zr(in_ote: bool) -> ZoneResult:
         return ZoneResult(
             zone="ote" if in_ote else "discount",
             in_ote=in_ote,
-            setup=None,
+            setup="yes" if in_ote else "no",
             retracement=0.7,
-            direction="bearish",
+            direction="bullish",
             fib_low=0.0, fib_high=1.0,
-            ote_low_price=0.0, ote_high_price=1.0,
+            ote_low_price=100.0, ote_high_price=110.0,
         )
 
+    events = events or {}
+    states = states or {ALERT_TF_D1: SetupState(), ALERT_TF_H1: SetupState()}
+
     return SymbolSnapshot(
-        symbol="TESTUSDT",
-        price=100.0,
+        symbol=symbol,
+        price=105.0,
         global_result=_zr(in_ote_d1),
         local_result=_zr(in_ote_h1),
-        global_trend="down",
-        local_trend="down",
-        global_setup_events=list(events_d1),
-        local_setup_events=list(events_h1),
+        global_trend="up",
+        local_trend="up",
+        confirmation_bars={ALERT_TF_D1: [], ALERT_TF_H1: []},
+        htf_bars={ALERT_TF_D1: [], ALERT_TF_H1: []},
+        setup_states=states,
+        setup_events=events,
     )
 
 
-def _make_event(kind: str, event_id: str, suppresses=()):
-    from kazus_logic.compute import SetupEvent
+def _make_event(kind: str, event_id: str, fvg_kind: str = "bearish"):
+    from kazus_logic.setup import Fvg, SetupEvent
     return SetupEvent(
-        kind=kind, event_id=event_id,
-        fvg_top=102.0, fvg_bottom=101.0, fvg_kind="bullish",
-        trigger_open_ms=3000, direction="bearish", suppresses=tuple(suppresses),
+        kind=kind,
+        event_id=event_id,
+        trigger_ts=3000,
+        fvg=Fvg(formed_at_idx=2, formed_at_ts=2000, top=107.0, bottom=105.0, kind=fvg_kind),
+        swing_low=103.0,
     )
 
 
@@ -138,16 +141,16 @@ def test_load_sent_ids_handles_garbage():
     assert _load_sent_ids("[]") == set()
     assert _load_sent_ids('["a","b"]') == {"a", "b"}
     assert _load_sent_ids("not-json") == set()
-    assert _load_sent_ids('{"x":1}') == set()  # dict, not list
+    assert _load_sent_ids('{"x":1}') == set()
 
 
 def test_collect_new_events_returns_unseen_only(runner_with_sqlite):
     runner_mod, SessionLocal = runner_with_sqlite
-    snap = _make_snap(events_h1=[_make_event("Created", "new:3000")])
+    snap = _make_snap(events={"H1": [_make_event("INV", "INV:TESTUSDT:H1:3000")]})
     with SessionLocal() as db:
         pending = runner_mod._collect_new_events(db, snap, {"H1"})
         db.commit()
-    assert [(tf, e.event_id) for tf, e in pending] == [("H1", "new:3000")]
+    assert [(tf, e.event_id) for tf, e in pending] == [("H1", "INV:TESTUSDT:H1:3000")]
 
 
 def test_collect_new_events_skips_already_sent(runner_with_sqlite):
@@ -156,19 +159,30 @@ def test_collect_new_events_skips_already_sent(runner_with_sqlite):
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    # Pre-seed AlertState as if "new:3000" was already alerted.
     with SessionLocal() as db:
         db.add(AlertState(
             symbol="TESTUSDT", timeframe="H1", in_ote=True,
-            sent_event_ids=json.dumps(["new:3000"]),
+            sent_event_ids=json.dumps(["INV:TESTUSDT:H1:3000"]),
         ))
         db.commit()
 
-    snap = _make_snap(events_h1=[_make_event("Created", "new:3000")])
+    snap = _make_snap(events={"H1": [_make_event("INV", "INV:TESTUSDT:H1:3000")]})
     with SessionLocal() as db:
         pending = runner_mod._collect_new_events(db, snap, {"H1"})
         db.commit()
     assert pending == []
+
+
+def test_collect_new_events_ignores_h1_m5_when_not_in_snapshot(runner_with_sqlite):
+    """Non-BTC/ETH/SOL symbols don't produce H1-M5 events. The collector
+    should silently skip the tf rather than raising."""
+    runner_mod, SessionLocal = runner_with_sqlite
+    # snap has only D1/H1 events; H1-M5 missing from setup_events dict.
+    snap = _make_snap(events={"H1": [_make_event("INV", "INV:TESTUSDT:H1:3000")]})
+    with SessionLocal() as db:
+        pending = runner_mod._collect_new_events(db, snap, {"D1", "H1", "H1-M5"})
+        db.commit()
+    assert [(tf, e.event_id) for tf, e in pending] == [("H1", "INV:TESTUSDT:H1:3000")]
 
 
 def test_ote_exit_clears_sent_event_ids(runner_with_sqlite):
@@ -180,12 +194,11 @@ def test_ote_exit_clears_sent_event_ids(runner_with_sqlite):
     with SessionLocal() as db:
         db.add(AlertState(
             symbol="TESTUSDT", timeframe="H1", in_ote=True,
-            sent_event_ids=json.dumps(["new:3000", "inv:2000"]),
+            sent_event_ids=json.dumps(["INV:TESTUSDT:H1:3000"]),
         ))
         db.commit()
 
-    # Snapshot says we're OUT of OTE → state should be reset.
-    snap = _make_snap(in_ote_h1=False)
+    snap = _make_snap(in_ote_h1=False, events={"H1": []})
     with SessionLocal() as db:
         pending = runner_mod._collect_new_events(db, snap, {"H1"})
         db.commit()
@@ -202,36 +215,33 @@ def test_send_setup_alert_persists_event_id_after_send(runner_with_sqlite, monke
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    # Telegram OK; render returns nothing (text-only fallback path).
     sent_messages: List[str] = []
 
     async def fake_send_text(token, chat_id, text):
         sent_messages.append(text)
         return True
 
-    async def fake_send_photo(*a, **k):
-        return False  # force fallback to text
-
-    async def fake_send_media(*a, **k):
+    async def fake_no(*a, **k):
         return False
 
     monkeypatch.setattr(runner_mod, "send_telegram", fake_send_text)
-    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_send_photo)
-    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_send_media)
+    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_no)
+    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_no)
     monkeypatch.setattr(runner_mod, "render_setup_png", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "render_htf_png", lambda *a, **k: None)
 
-    snap = _make_snap(events_h1=[_make_event("Created", "new:3000")])
+    ev = _make_event("INV", "INV:TESTUSDT:H1:3000")
+    snap = _make_snap(events={"H1": [ev]})
 
     class FakeSettings:
         telegram_bot_token = "x"
         telegram_chat_id = "y"
 
-    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", snap.local_setup_events[0]))
+    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", ev))
 
     with SessionLocal() as db:
         row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").one()
-        assert "new:3000" in row.sent_event_ids
+        assert "INV:TESTUSDT:H1:3000" in (row.sent_event_ids or "")
     assert sent_messages, "telegram should have been called"
 
 
@@ -240,60 +250,56 @@ def test_send_setup_alert_does_not_persist_when_telegram_fails(runner_with_sqlit
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    async def fake_send_text(*a, **k):
+    async def fake_no(*a, **k):
         return False
 
-    async def fake_send_photo(*a, **k):
-        return False
-
-    async def fake_send_media(*a, **k):
-        return False
-
-    monkeypatch.setattr(runner_mod, "send_telegram", fake_send_text)
-    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_send_photo)
-    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_send_media)
+    monkeypatch.setattr(runner_mod, "send_telegram", fake_no)
+    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_no)
+    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_no)
     monkeypatch.setattr(runner_mod, "render_setup_png", lambda *a, **k: None)
     monkeypatch.setattr(runner_mod, "render_htf_png", lambda *a, **k: None)
 
-    snap = _make_snap(events_h1=[_make_event("Created", "new:3000")])
+    ev = _make_event("INV", "INV:TESTUSDT:H1:3000")
+    snap = _make_snap(events={"H1": [ev]})
 
     class FakeSettings:
         telegram_bot_token = "x"
         telegram_chat_id = "y"
 
-    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", snap.local_setup_events[0]))
+    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", ev))
 
     with SessionLocal() as db:
-        # No row should have been created (or if created, sent_event_ids is empty).
         row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").first()
         if row is not None:
-            assert "new:3000" not in (row.sent_event_ids or "")
+            assert "INV:TESTUSDT:H1:3000" not in (row.sent_event_ids or "")
 
 
-def test_stb_persists_suppressed_event_ids(runner_with_sqlite, monkeypatch):
-    from kazus_db.models import AlertState
+def test_persist_and_load_setup_state_roundtrip(runner_with_sqlite):
+    from kazus_logic.setup import Fvg, SetupState
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    async def ok(*a, **k):
-        return True
-
-    monkeypatch.setattr(runner_mod, "send_telegram", ok)
-    monkeypatch.setattr(runner_mod, "send_telegram_photo", ok)
-    monkeypatch.setattr(runner_mod, "send_telegram_media_group", ok)
-    monkeypatch.setattr(runner_mod, "render_setup_png", lambda *a, **k: None)
-    monkeypatch.setattr(runner_mod, "render_htf_png", lambda *a, **k: None)
-
-    stb = _make_event("STB", "stb:3000", suppresses=("new:3000", "inv:3000"))
-    snap = _make_snap(events_h1=[stb])
-
-    class FakeSettings:
-        telegram_bot_token = "x"
-        telegram_chat_id = "y"
-
-    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", stb))
+    state = SetupState(
+        state="STB", session_id="abc", search_start_ts=1000,
+        swing_low=100.5, swing_low_ts=1000,
+        first_bear_fvg=Fvg(formed_at_idx=2, formed_at_ts=2000, top=107.0, bottom=105.0, kind="bearish"),
+        first_bull_fvg=Fvg(formed_at_idx=5, formed_at_ts=5000, top=110.0, bottom=108.0, kind="bullish"),
+        inv_fired=True, cre_fired=True, stb_fired=True,
+        inv_at_ts=3000, cre_at_ts=5000,
+    )
+    snap = _make_snap(states={"H1": state})
 
     with SessionLocal() as db:
-        row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").one()
-        for needle in ("stb:3000", "new:3000", "inv:3000"):
-            assert needle in row.sent_event_ids, f"{needle} missing from {row.sent_event_ids}"
+        runner_mod._persist_setup_states(db, snap)
+        db.commit()
+
+    with SessionLocal() as db:
+        loaded = runner_mod._load_prev_states(db, "TESTUSDT")
+    assert "H1" in loaded
+    r = loaded["H1"]
+    assert r.state == "STB"
+    assert r.session_id == "abc"
+    assert r.swing_low == 100.5
+    assert r.first_bear_fvg.top == 107.0
+    assert r.first_bull_fvg.kind == "bullish"
+    assert r.inv_fired and r.cre_fired and r.stb_fired

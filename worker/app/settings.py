@@ -12,7 +12,7 @@ class WorkerSettings(BaseSettings):
     refresh_interval_sec: int = 300
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
-    alert_timeframes: str = "D1,H1"  # comma-separated
+    alert_timeframes: str = "D1,H1,H1-M5"  # comma-separated
 
     d1_bar_limit: int = 500
     h1_bar_limit: int = 900

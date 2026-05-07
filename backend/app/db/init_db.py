@@ -28,6 +28,7 @@ _ADDITIVE_MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_alert_events_created_at ON alert_events (created_at)",
     "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS last_setup_alert_at TIMESTAMP",
     "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS sent_event_ids TEXT",
+    "ALTER TABLE alert_states ADD COLUMN IF NOT EXISTS setup_state_json TEXT",
     "ALTER TABLE alert_states DROP COLUMN IF EXISTS last_setup_kind",
     "ALTER TABLE alert_states DROP COLUMN IF EXISTS in_setup",
     # Snapshot.setup widened from yes/no flag to setup-kind label.

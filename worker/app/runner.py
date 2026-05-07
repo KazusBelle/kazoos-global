@@ -25,8 +25,17 @@ from typing import Iterable, List, Tuple
 from sqlalchemy.orm import Session
 
 from kazus_logic.binance import BinanceFuturesClient
-from kazus_logic.compute import SetupEvent, SymbolSnapshot, compute_symbol
+from kazus_logic.compute import (
+    ALERT_TF_D1,
+    ALERT_TF_H1,
+    ALERT_TF_H1_M5,
+    ALL_ALERT_TFS,
+    SymbolSnapshot,
+    compute_symbol,
+    screener_label_for,
+)
 from kazus_logic.engine import Bar, ZoneResult
+from kazus_logic.setup import SetupEvent, SetupState
 from kazus_db.models import AlertEvent, AlertState, Coin, Snapshot, SystemStatus
 
 from .chart_image import render_htf_png, render_setup_png
@@ -57,10 +66,14 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
     last_error: str | None = None
     for symbol in coins:
         try:
+            with SessionLocal() as db:
+                prev_states = _load_prev_states(db, symbol)
+
             snap = await compute_symbol(
                 client, symbol,
                 d1_limit=settings.d1_bar_limit,
                 h1_limit=settings.h1_bar_limit,
+                prev_states=prev_states,
             )
         except Exception as exc:
             logger.warning("compute failed for %s: %s", symbol, exc)
@@ -70,6 +83,7 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
         with SessionLocal() as db:
             _upsert_snapshots(db, snap)
             new_events = _collect_new_events(db, snap, alert_timeframes)
+            _persist_setup_states(db, snap)
             db.commit()
 
         # Fire one Telegram message per new event. Persist the event_id only
@@ -98,7 +112,7 @@ def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
         row.direction = result.direction
         row.zone = result.zone
         row.in_ote = result.in_ote
-        row.setup = result.setup or ""
+        row.setup = screener_label_for(snap, tf)
         row.retracement = result.retracement
         row.fib_low = result.fib_low
         row.fib_high = result.fib_high
@@ -106,6 +120,35 @@ def _upsert_snapshots(db: Session, snap: SymbolSnapshot) -> None:
         row.ote_high_price = result.ote_high_price
         row.trend = trend
         row.closes_json = json.dumps(closes) if closes else None
+        row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _load_prev_states(db: Session, symbol: str) -> dict[str, SetupState]:
+    rows = (
+        db.query(AlertState)
+        .filter(AlertState.symbol == symbol, AlertState.timeframe.in_(ALL_ALERT_TFS))
+        .all()
+    )
+    out: dict[str, SetupState] = {}
+    for row in rows:
+        s = SetupState.from_json(row.setup_state_json)
+        if s is not None:
+            out[row.timeframe] = s
+    return out
+
+
+def _persist_setup_states(db: Session, snap: SymbolSnapshot) -> None:
+    for tf, state in snap.setup_states.items():
+        row = (
+            db.query(AlertState)
+            .filter(AlertState.symbol == snap.symbol, AlertState.timeframe == tf)
+            .first()
+        )
+        if row is None:
+            row = AlertState(symbol=snap.symbol, timeframe=tf, in_ote=False)
+            db.add(row)
+            db.flush()
+        row.setup_state_json = state.to_json()
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -123,12 +166,23 @@ def _collect_new_events(
     """
     pending: List[Tuple[str, SetupEvent]] = []
 
-    for tf, result, events in (
-        ("D1", snap.global_result, snap.global_setup_events),
-        ("H1", snap.local_result, snap.local_setup_events),
-    ):
+    # The HTF zone result for each alert tf — D1 zone for "D1", H1 zone
+    # for "H1" and "H1-M5".
+    zone_for_tf = {
+        ALERT_TF_D1: snap.global_result,
+        ALERT_TF_H1: snap.local_result,
+        ALERT_TF_H1_M5: snap.local_result,
+    }
+
+    for tf in ALL_ALERT_TFS:
         if tf not in timeframes:
             continue
+        if tf not in snap.setup_events:
+            # H1-M5 only exists for the M5_SYMBOLS subset.
+            continue
+
+        result = zone_for_tf[tf]
+        events = snap.setup_events[tf]
 
         row = (
             db.query(AlertState)
@@ -156,8 +210,6 @@ def _collect_new_events(
             new_for_tf.append(event)
 
         row.in_ote = True
-        # Persist OTE entry/state immediately; sent_event_ids is updated
-        # per-event in _send_setup_alert after Telegram acknowledges.
         if row.sent_event_ids is None:
             row.sent_event_ids = "[]"
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -183,16 +235,15 @@ def _load_sent_ids(raw: str | None) -> set[str]:
 async def _send_setup_alert(
     settings, snap: SymbolSnapshot, timeframe: str, event: SetupEvent
 ) -> None:
-    if timeframe == "D1":
+    if timeframe == ALERT_TF_D1:
         result: ZoneResult = snap.global_result
-        bars: list[Bar] = list(snap.global_confirmation_bars)
-        htf_bars: list[Bar] = list(snap.global_htf_bars)
         confirmation_tf = "H1"
     else:
+        # Both ALERT_TF_H1 and ALERT_TF_H1_M5 anchor on the H1 zone.
         result = snap.local_result
-        bars = list(snap.local_confirmation_bars)
-        htf_bars = list(snap.local_htf_bars)
-        confirmation_tf = "M15"
+        confirmation_tf = "M15" if timeframe == ALERT_TF_H1 else "M5"
+    bars: list[Bar] = list(snap.confirmation_bars.get(timeframe, []))
+    htf_bars: list[Bar] = list(snap.htf_bars.get(timeframe, []))
 
     symbol = snap.symbol
     price_str = f"{snap.price:g}" if snap.price else "—"
@@ -204,13 +255,14 @@ async def _send_setup_alert(
         if result.ote_low_price is not None and result.ote_high_price is not None
         else "—"
     )
-    fvg_str = f"{event.fvg_bottom:g} – {event.fvg_top:g}"
+    fvg_str = f"{event.fvg.bottom:g} – {event.fvg.top:g}"
     message = (
         f"🎯 <b>{event.kind}</b> setup: #{symbol} [{timeframe}]\n"
-        f"{event.direction} trend, retracement {retr_str}\n"
+        f"bullish trend, retracement {retr_str}\n"
         f"Price: {price_str}\n"
         f"OTE:   {ote_str}\n"
         f"FVG:   {fvg_str}\n"
+        f"Swing low: {event.swing_low:g}\n"
         f"Confirmation: {confirmation_tf} bars"
     )
     logger.info(
@@ -219,11 +271,11 @@ async def _send_setup_alert(
     )
 
     htf_photo = render_htf_png(
-        symbol, timeframe, htf_bars, result, event.kind, event.fvg_top, event.fvg_bottom
+        symbol, timeframe, htf_bars, result, event.kind, event.fvg.top, event.fvg.bottom
     )
     confirm_photo = render_setup_png(
         symbol, timeframe, confirmation_tf, bars, result,
-        event.kind, event.fvg_top, event.fvg_bottom,
+        event.kind, event.fvg.top, event.fvg.bottom,
     )
 
     photos = [p for p in (htf_photo, confirm_photo) if p is not None]
@@ -259,7 +311,6 @@ async def _send_setup_alert(
             db.flush()
         sent_ids = _load_sent_ids(row.sent_event_ids)
         sent_ids.add(event.event_id)
-        sent_ids.update(event.suppresses)
         row.sent_event_ids = json.dumps(sorted(sent_ids))
         row.last_setup_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)

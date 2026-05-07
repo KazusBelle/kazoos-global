@@ -85,6 +85,9 @@ class AlertState(Base):
     # JSON array of setup event_ids already alerted within the current OTE
     # window. Cleared when price exits OTE so re-entry restarts the stream.
     sent_event_ids: Mapped[Optional[str]] = mapped_column(Text)
+    # JSON-serialized SetupState carried across worker cycles (long-only
+    # INV/CRE/STB state machine). Null until the first detector run.
+    setup_state_json: Mapped[Optional[str]] = mapped_column(Text)
     last_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_setup_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
