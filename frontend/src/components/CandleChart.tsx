@@ -264,6 +264,22 @@ function makeAutoscaleProvider(data: ChartData) {
 
 export type SwingClickAnchor = { idx: number; clientX: number; clientY: number };
 
+// Setup overlay: caller-provided geometry for a specific FVG + swing low to
+// highlight on top of the regular chart. The state label drives a small
+// corner badge. Passed by the chart-export page so headless screenshots
+// match the Telegram alert preview.
+export type SetupOverlay = {
+  fvg: { ts: number; end_ts: number; top: number; bottom: number };
+  swingLow?: { ts: number; price: number };
+  state: "INV" | "CRE" | "STB";
+};
+
+const SETUP_STATE_COLOR: Record<SetupOverlay["state"], string> = {
+  INV: "#c08a3d",  // amber for inversion
+  CRE: "#5ca36a",  // green for creation
+  STB: "#7aa6ff",  // blue for setup
+};
+
 export function CandleChart({
   symbol,
   interval,
@@ -274,9 +290,11 @@ export function CandleChart({
   reloadKey,
   editMode,
   draft,
+  setupOverlay,
   onSwingClick,
   onCanvasClick,
   onSwingDragEnd,
+  onReady,
 }: {
   symbol: string;
   interval: ChartInterval;
@@ -287,9 +305,11 @@ export function CandleChart({
   reloadKey?: number;
   editMode?: boolean;
   draft?: StructureEvent[];
+  setupOverlay?: SetupOverlay | null;
   onSwingClick?: (a: SwingClickAnchor) => void;
   onCanvasClick?: (ts: number, price: number) => void;
   onSwingDragEnd?: (idx: number, ts: number, price: number) => void;
+  onReady?: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<SVGSVGElement>(null);
@@ -304,6 +324,21 @@ export function CandleChart({
   const fvgLimitRef = useRef(fvgLimit);
   useEffect(() => { fvgEnabledRef.current = fvgEnabled; }, [fvgEnabled]);
   useEffect(() => { fvgLimitRef.current = fvgLimit; }, [fvgLimit]);
+
+  // Setup overlay — null means no-op (preserves baseline behavior).
+  const setupOverlayRef = useRef<SetupOverlay | null>(setupOverlay ?? null);
+  useEffect(() => { setupOverlayRef.current = setupOverlay ?? null; }, [setupOverlay]);
+  const onReadyRef = useRef(onReady);
+  useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
+  const readyFiredRef = useRef(false);
+
+  type SetupEls = {
+    fvgRect: SVGRectElement;
+    swingLine: SVGLineElement;
+    swingTag: SVGRectElement;
+    swingText: SVGTextElement;
+  };
+  const setupElsRef = useRef<SetupEls | null>(null);
 
   type FvgEl = {
     ts: number;
@@ -362,6 +397,7 @@ export function CandleChart({
 
     const init = async () => {
       if (destroyed || !containerRef.current) return;
+      readyFiredRef.current = false;
       try {
         setStatus("loading");
         setErr(null);
@@ -768,6 +804,51 @@ export function CandleChart({
         serverSwingsRef.current = data.swings;
         buildSwings(data.swings, false);
 
+        // Setup overlay layer — highlight the FVG rect, swing-low line, and
+        // anchor for the optional state badge. Positions are updated every
+        // frame in the rAF loop from setupOverlayRef. Invisible until the
+        // caller supplies setupOverlay.
+        const setupLayer = document.createElementNS(SVG_NS, "g");
+        setupLayer.setAttribute("data-layer", "setup");
+        setupLayer.setAttribute("clip-path", plotClipUrl);
+        const setupFvgRect = document.createElementNS(SVG_NS, "rect");
+        setupFvgRect.setAttribute("fill", "rgba(245, 158, 11, 0.18)");
+        setupFvgRect.setAttribute("stroke", "#f59e0b");
+        setupFvgRect.setAttribute("stroke-width", "1.4");
+        setupFvgRect.setAttribute("opacity", "0");
+        setupLayer.appendChild(setupFvgRect);
+        const setupSwingLine = document.createElementNS(SVG_NS, "line");
+        setupSwingLine.setAttribute("stroke", "#f87171");
+        setupSwingLine.setAttribute("stroke-width", "1.2");
+        setupSwingLine.setAttribute("stroke-dasharray", "6 4");
+        setupSwingLine.setAttribute("opacity", "0");
+        setupLayer.appendChild(setupSwingLine);
+        const setupSwingTag = document.createElementNS(SVG_NS, "rect");
+        setupSwingTag.setAttribute("width", "28");
+        setupSwingTag.setAttribute("height", "13");
+        setupSwingTag.setAttribute("rx", "2");
+        setupSwingTag.setAttribute("fill", "#4a1f1f");
+        setupSwingTag.setAttribute("stroke", "#f87171");
+        setupSwingTag.setAttribute("stroke-width", "1");
+        setupSwingTag.setAttribute("opacity", "0");
+        setupLayer.appendChild(setupSwingTag);
+        const setupSwingText = document.createElementNS(SVG_NS, "text");
+        setupSwingText.setAttribute("text-anchor", "middle");
+        setupSwingText.setAttribute("dominant-baseline", "middle");
+        setupSwingText.setAttribute("font-size", "8");
+        setupSwingText.setAttribute("font-family", "Inter, sans-serif");
+        setupSwingText.setAttribute("fill", "#fecaca");
+        setupSwingText.setAttribute("opacity", "0");
+        setupSwingText.textContent = "low";
+        setupLayer.appendChild(setupSwingText);
+        svg.appendChild(setupLayer);
+        setupElsRef.current = {
+          fvgRect: setupFvgRect,
+          swingLine: setupSwingLine,
+          swingTag: setupSwingTag,
+          swingText: setupSwingText,
+        };
+
         // ── Coordinate helpers ──────────────────────────────────────────
         const safePriceY = (price: number): number | null => {
           try {
@@ -1121,6 +1202,76 @@ export function CandleChart({
                 pv.setAttribute("opacity", "0");
               }
             }
+
+            // Setup overlay — highlight a specific FVG + dashed swing-low
+            // line/tag. All elements stay invisible when setupOverlay is null.
+            const setupEls = setupElsRef.current;
+            const overlay = setupOverlayRef.current;
+            if (setupEls) {
+              if (overlay) {
+                const ox1 = safeTimeX(overlay.fvg.ts);
+                const ox2 = safeTimeX(overlay.fvg.end_ts);
+                const oyTop = safePriceY(overlay.fvg.top);
+                const oyBot = safePriceY(overlay.fvg.bottom);
+                if (ox1 != null && ox2 != null && oyTop != null && oyBot != null) {
+                  const left = Math.max(0, Math.min(ox1, ox2));
+                  const right = Math.min(plotRight, Math.max(ox1, ox2));
+                  const width = Math.max(0, right - left);
+                  const top = Math.min(oyTop, oyBot);
+                  const height = Math.max(1, Math.abs(oyBot - oyTop));
+                  setupEls.fvgRect.setAttribute("x", String(left));
+                  setupEls.fvgRect.setAttribute("y", String(top));
+                  setupEls.fvgRect.setAttribute("width", String(width));
+                  setupEls.fvgRect.setAttribute("height", String(height));
+                  setupEls.fvgRect.setAttribute("opacity", width > 0 ? "1" : "0");
+                } else {
+                  setupEls.fvgRect.setAttribute("opacity", "0");
+                }
+                if (overlay.swingLow) {
+                  const sy = safePriceY(overlay.swingLow.price);
+                  const sxStart = safeTimeX(overlay.swingLow.ts);
+                  if (sy != null) {
+                    const lineFrom = sxStart != null ? Math.max(0, sxStart) : 0;
+                    setupEls.swingLine.setAttribute("x1", String(lineFrom));
+                    setupEls.swingLine.setAttribute("y1", String(sy));
+                    setupEls.swingLine.setAttribute("x2", String(plotRight));
+                    setupEls.swingLine.setAttribute("y2", String(sy));
+                    setupEls.swingLine.setAttribute("opacity", "0.9");
+                    const tagW = 28;
+                    const tagH = 13;
+                    const tagX = Math.max(0, Math.min(plotRight - tagW, plotRight - tagW - 4));
+                    const tagY = sy - tagH / 2;
+                    setupEls.swingTag.setAttribute("x", String(tagX));
+                    setupEls.swingTag.setAttribute("y", String(tagY));
+                    setupEls.swingTag.setAttribute("opacity", "1");
+                    setupEls.swingText.setAttribute("x", String(tagX + tagW / 2));
+                    setupEls.swingText.setAttribute("y", String(sy + 0.5));
+                    setupEls.swingText.setAttribute("opacity", "1");
+                  } else {
+                    setupEls.swingLine.setAttribute("opacity", "0");
+                    setupEls.swingTag.setAttribute("opacity", "0");
+                    setupEls.swingText.setAttribute("opacity", "0");
+                  }
+                } else {
+                  setupEls.swingLine.setAttribute("opacity", "0");
+                  setupEls.swingTag.setAttribute("opacity", "0");
+                  setupEls.swingText.setAttribute("opacity", "0");
+                }
+              } else {
+                setupEls.fvgRect.setAttribute("opacity", "0");
+                setupEls.swingLine.setAttribute("opacity", "0");
+                setupEls.swingTag.setAttribute("opacity", "0");
+                setupEls.swingText.setAttribute("opacity", "0");
+              }
+            }
+
+            // Fire onReady once after the first frame where the plot has
+            // actual screen extent — that's our signal the chart is on
+            // screen and the headless renderer can capture it.
+            if (!readyFiredRef.current) {
+              readyFiredRef.current = true;
+              try { onReadyRef.current?.(); } catch { /* noop */ }
+            }
           } catch (e: any) {
             if (!reportedRafErrorRef.current) {
               reportedRafErrorRef.current = true;
@@ -1161,6 +1312,7 @@ export function CandleChart({
       zigzagPolylineRef.current = null;
       previewLineRef.current = null;
       swingElementsRef.current = [];
+      setupElsRef.current = null;
       dragRef.current = null;
       try { cleanupListeners?.(); } catch { /* noop */ }
       cleanupListeners = null;
@@ -1183,7 +1335,11 @@ export function CandleChart({
   }, [editMode, draft]);
 
   return (
-    <div className="relative" style={{ height: chartHeight, background: t.bg }}>
+    <div
+      className="relative"
+      style={{ height: chartHeight, background: t.bg }}
+      data-chart-status={status}
+    >
       <div ref={containerRef} style={{ width: "100%", height: chartHeight }} />
       <svg
         ref={overlayRef}
@@ -1192,6 +1348,22 @@ export function CandleChart({
         width="100%"
         height={chartHeight}
       />
+      {setupOverlay && (
+        <div
+          className="absolute top-2 left-2 pointer-events-none font-mono text-[10px] font-bold tracking-wider rounded px-2 py-1"
+          style={{
+            // Above the price-scale canvases (z 30) which raiseRightPriceScaleLayer
+            // promotes each frame. Positioned on the left so the right-side price
+            // scale never covers the state label.
+            zIndex: 40,
+            background: "rgba(10,10,10,0.78)",
+            color: SETUP_STATE_COLOR[setupOverlay.state],
+            border: `1px solid ${SETUP_STATE_COLOR[setupOverlay.state]}`,
+          }}
+        >
+          {setupOverlay.state}
+        </div>
+      )}
       {status === "loading" && (
         <div
           className="absolute inset-0 flex items-center justify-center text-xs"

@@ -53,6 +53,12 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       ALERT_TIMEFRAMES: ${ALERT_TIMEFRAMES:-D1,H1}
+      # Headless chart renderer (Stage 4b infra, wired in Stage 5). Shares
+      # JWT_SECRET with backend so the worker can mint tokens that the
+      # /api/chart endpoint accepts.
+      JWT_SECRET: ${JWT_SECRET:-change-me-please-32-bytes-minimum-xxxxxx}
+      CHART_RENDER_BASE_URL: ${CHART_RENDER_BASE_URL:-http://frontend}
+      CHART_RENDER_USERNAME: ${CHART_RENDER_USERNAME:-${ADMIN_USERNAME:-kazus}}
 
   frontend:
     build:

@@ -17,6 +17,15 @@ class WorkerSettings(BaseSettings):
     d1_bar_limit: int = 500
     h1_bar_limit: int = 900
 
+    # Headless chart renderer (Stage 4b infra, wired in Stage 5).
+    # The worker mints a short-lived HS256 token using the same secret as
+    # the backend, so the /chart-export route can hit /api/chart/{symbol}.
+    jwt_secret: str = ""
+    jwt_algorithm: str = "HS256"
+    chart_render_base_url: str = "http://frontend"
+    chart_render_username: str = "kazus"
+    chart_render_token_ttl_min: int = 15
+
 
 @lru_cache
 def get_settings() -> WorkerSettings:
