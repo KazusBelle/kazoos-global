@@ -67,8 +67,8 @@ export function ChartExportPage() {
     const swingLowPrice = numParam(params, "swing_low_price");
     const swingLowTs = numParam(params, "swing_low_ts");
     const swingLow =
-      swingLowPrice != null && swingLowTs != null
-        ? { ts: swingLowTs, price: swingLowPrice }
+      swingLowPrice != null
+        ? { ts: swingLowTs ?? undefined, price: swingLowPrice }
         : undefined;
     return {
       state: stateRaw as SetupOverlay["state"],

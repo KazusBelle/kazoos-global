@@ -6,13 +6,13 @@ Covered:
   - _collect_new_events: brand-new event is returned, dedupes against
     sent_event_ids, clears state on OTE exit, ignores tfs the snapshot
     didn't compute (e.g. H1-M5 for non-BTC/ETH/SOL).
-  - _send_setup_alert: persists event_id only after Telegram succeeds;
+  - _dispatch_setup_alert: persists event_id only after Telegram succeeds;
     failed Telegram leaves sent_event_ids untouched.
   - _persist_setup_states / _load_prev_states roundtrip.
 
 Uses an in-memory SQLite engine and monkeypatches `worker.app.runner.SessionLocal`
-plus the render / telegram functions so no photos are produced and no real
-network calls are made.
+plus the telegram_alerts.send_setup_alert call so no photos are rendered and
+no real network calls are made.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import asyncio
 import importlib.util
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pytest
 
@@ -35,8 +35,11 @@ _WORKER_APP = os.path.join(_ROOT, "worker", "app")
 
 def _load_worker_runner():
     """Import worker/app/runner.py as `worker_runner` (with its sibling
-    modules — db, settings, telegram, chart_image — also loaded under
-    worker_app.* prefixes so relative imports resolve)."""
+    modules — db, settings, telegram, chart_renderer, telegram_alerts —
+    also loaded under worker_app.* prefixes so relative imports resolve).
+
+    chart_renderer pulls in playwright at import time; tests therefore
+    require the worker container's pip env (sqlalchemy + playwright)."""
     if "worker_runner" in sys.modules:
         return sys.modules["worker_runner"]
 
@@ -49,7 +52,7 @@ def _load_worker_runner():
     sys.modules["worker_app"] = pkg
     pkg_spec.loader.exec_module(pkg)
 
-    for name in ("settings", "db", "telegram", "chart_image"):
+    for name in ("settings", "db", "telegram", "chart_renderer", "telegram_alerts"):
         spec = importlib.util.spec_from_file_location(
             f"worker_app.{name}", os.path.join(_WORKER_APP, f"{name}.py")
         )
@@ -210,25 +213,18 @@ def test_ote_exit_clears_sent_event_ids(runner_with_sqlite):
         assert row.sent_event_ids == "[]"
 
 
-def test_send_setup_alert_persists_event_id_after_send(runner_with_sqlite, monkeypatch):
+def test_dispatch_setup_alert_persists_event_id_after_send(runner_with_sqlite, monkeypatch):
     from kazus_db.models import AlertState
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    sent_messages: List[str] = []
+    sent_calls: List[Tuple[str, str, str]] = []
 
-    async def fake_send_text(token, chat_id, text):
-        sent_messages.append(text)
-        return True
+    async def fake_send(settings, renderer, snap, tf, event):
+        sent_calls.append((snap.symbol, tf, event.event_id))
+        return True, f"caption for {event.event_id}"
 
-    async def fake_no(*a, **k):
-        return False
-
-    monkeypatch.setattr(runner_mod, "send_telegram", fake_send_text)
-    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_no)
-    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_no)
-    monkeypatch.setattr(runner_mod, "render_setup_png", lambda *a, **k: None)
-    monkeypatch.setattr(runner_mod, "render_htf_png", lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod, "send_setup_alert", fake_send)
 
     ev = _make_event("INV", "INV:TESTUSDT:H1:3000")
     snap = _make_snap(events={"H1": [ev]})
@@ -237,27 +233,23 @@ def test_send_setup_alert_persists_event_id_after_send(runner_with_sqlite, monke
         telegram_bot_token = "x"
         telegram_chat_id = "y"
 
-    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", ev))
+    asyncio.run(runner_mod._dispatch_setup_alert(FakeSettings(), None, snap, "H1", ev))
 
     with SessionLocal() as db:
         row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").one()
         assert "INV:TESTUSDT:H1:3000" in (row.sent_event_ids or "")
-    assert sent_messages, "telegram should have been called"
+    assert sent_calls, "telegram_alerts.send_setup_alert should have been called"
 
 
-def test_send_setup_alert_does_not_persist_when_telegram_fails(runner_with_sqlite, monkeypatch):
+def test_dispatch_setup_alert_does_not_persist_when_send_fails(runner_with_sqlite, monkeypatch):
     from kazus_db.models import AlertState
 
     runner_mod, SessionLocal = runner_with_sqlite
 
-    async def fake_no(*a, **k):
-        return False
+    async def fake_send_fail(settings, renderer, snap, tf, event):
+        return False, "caption"
 
-    monkeypatch.setattr(runner_mod, "send_telegram", fake_no)
-    monkeypatch.setattr(runner_mod, "send_telegram_photo", fake_no)
-    monkeypatch.setattr(runner_mod, "send_telegram_media_group", fake_no)
-    monkeypatch.setattr(runner_mod, "render_setup_png", lambda *a, **k: None)
-    monkeypatch.setattr(runner_mod, "render_htf_png", lambda *a, **k: None)
+    monkeypatch.setattr(runner_mod, "send_setup_alert", fake_send_fail)
 
     ev = _make_event("INV", "INV:TESTUSDT:H1:3000")
     snap = _make_snap(events={"H1": [ev]})
@@ -266,7 +258,7 @@ def test_send_setup_alert_does_not_persist_when_telegram_fails(runner_with_sqlit
         telegram_bot_token = "x"
         telegram_chat_id = "y"
 
-    asyncio.run(runner_mod._send_setup_alert(FakeSettings(), snap, "H1", ev))
+    asyncio.run(runner_mod._dispatch_setup_alert(FakeSettings(), None, snap, "H1", ev))
 
     with SessionLocal() as db:
         row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").first()

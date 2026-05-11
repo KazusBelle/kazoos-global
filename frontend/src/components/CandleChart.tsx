@@ -268,9 +268,14 @@ export type SwingClickAnchor = { idx: number; clientX: number; clientY: number }
 // highlight on top of the regular chart. The state label drives a small
 // corner badge. Passed by the chart-export page so headless screenshots
 // match the Telegram alert preview.
+//
+// `swingLow.ts` is optional — when missing, the dashed line spans the full
+// plot width (which is the most common case: the swing-low price is known
+// from SetupEvent but its bar ts is only on SetupState and not always
+// forwarded).
 export type SetupOverlay = {
   fvg: { ts: number; end_ts: number; top: number; bottom: number };
-  swingLow?: { ts: number; price: number };
+  swingLow?: { ts?: number | null; price: number };
   state: "INV" | "CRE" | "STB";
 };
 
@@ -1229,7 +1234,10 @@ export function CandleChart({
                 }
                 if (overlay.swingLow) {
                   const sy = safePriceY(overlay.swingLow.price);
-                  const sxStart = safeTimeX(overlay.swingLow.ts);
+                  const sxStart =
+                    overlay.swingLow.ts != null
+                      ? safeTimeX(overlay.swingLow.ts)
+                      : null;
                   if (sy != null) {
                     const lineFrom = sxStart != null ? Math.max(0, sxStart) : 0;
                     setupEls.swingLine.setAttribute("x1", String(lineFrom));

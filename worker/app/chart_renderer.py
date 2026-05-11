@@ -1,9 +1,8 @@
 """Headless chart renderer: drives Playwright + chromium to take a PNG of
 the same CandleChart shown in the UI, plus an optional SetupOverlay.
 
-Used by the Stage-5 setup-alert pipeline. Stage 4 introduces this module
-and the underlying browser plumbing; the actual swap of chart_image.py
-over to this renderer happens in Stage 5 (see workplan).
+Used by telegram_alerts.send_setup_alert to produce the two PNGs
+attached to each Telegram alert.
 
 The headless URL is /chart-export?... served from the frontend container.
 Auth: the worker mints a short-lived HS256 JWT for the configured render
@@ -139,9 +138,9 @@ class ChartRenderer:
     ) -> bytes:
         """Render a single chart as a PNG. Returns the image bytes.
 
-        Raises RuntimeError if the chart fails to become ready within
-        ``timeout_ms``. Callers should fall back to a text-only alert or
-        the legacy chart_image.py renderer on failure.
+        Raises if the chart fails to become ready within ``timeout_ms`` or
+        if the headless browser errors out. Callers should fall back to a
+        text-only Telegram message on failure.
         """
         token = self._mint_token()
         target_url = self._build_url(

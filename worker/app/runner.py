@@ -34,20 +34,19 @@ from kazus_logic.compute import (
     compute_symbol,
     screener_label_for,
 )
-from kazus_logic.engine import Bar, ZoneResult
 from kazus_logic.setup import SetupEvent, SetupState
 from kazus_db.models import AlertEvent, AlertState, Coin, Snapshot, SystemStatus
 
-from .chart_image import render_htf_png, render_setup_png
+from .chart_renderer import ChartRenderer
 from .db import SessionLocal
 from .settings import get_settings
-from .telegram import send_telegram, send_telegram_media_group, send_telegram_photo
+from .telegram_alerts import send_setup_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("kazus.worker")
 
 
-async def run_once(client: BinanceFuturesClient, settings) -> None:
+async def run_once(client: BinanceFuturesClient, renderer: ChartRenderer, settings) -> None:
     with SessionLocal() as db:
         coins: list[str] = [
             c.symbol
@@ -90,7 +89,7 @@ async def run_once(client: BinanceFuturesClient, settings) -> None:
         # AFTER successful send (commit-after-send), so a transient Telegram
         # failure causes a retry on the next cycle rather than a lost alert.
         for tf, event in new_events:
-            await _send_setup_alert(settings, snap, tf, event)
+            await _dispatch_setup_alert(settings, renderer, snap, tf, event)
 
     _touch_status(last_error)
 
@@ -232,81 +231,36 @@ def _load_sent_ids(raw: str | None) -> set[str]:
     return {str(x) for x in data}
 
 
-async def _send_setup_alert(
-    settings, snap: SymbolSnapshot, timeframe: str, event: SetupEvent
+async def _dispatch_setup_alert(
+    settings,
+    renderer: ChartRenderer,
+    snap: SymbolSnapshot,
+    timeframe: str,
+    event: SetupEvent,
 ) -> None:
-    if timeframe == ALERT_TF_D1:
-        result: ZoneResult = snap.global_result
-        confirmation_tf = "H1"
-    else:
-        # Both ALERT_TF_H1 and ALERT_TF_H1_M5 anchor on the H1 zone.
-        result = snap.local_result
-        confirmation_tf = "M15" if timeframe == ALERT_TF_H1 else "M5"
-    bars: list[Bar] = list(snap.confirmation_bars.get(timeframe, []))
-    htf_bars: list[Bar] = list(snap.htf_bars.get(timeframe, []))
+    """Render + send a setup alert, and persist the dedup record on success.
 
-    symbol = snap.symbol
-    price_str = f"{snap.price:g}" if snap.price else "—"
-    retr_str = (
-        f"{result.retracement * 100:.1f}%" if result.retracement is not None else "—"
-    )
-    ote_str = (
-        f"{result.ote_low_price:g} – {result.ote_high_price:g}"
-        if result.ote_low_price is not None and result.ote_high_price is not None
-        else "—"
-    )
-    fvg_str = f"{event.fvg.bottom:g} – {event.fvg.top:g}"
-    message = (
-        f"🎯 <b>{event.kind}</b> setup: #{symbol} [{timeframe}]\n"
-        f"bullish trend, retracement {retr_str}\n"
-        f"Price: {price_str}\n"
-        f"OTE:   {ote_str}\n"
-        f"FVG:   {fvg_str}\n"
-        f"Swing low: {event.swing_low:g}\n"
-        f"Confirmation: {confirmation_tf} bars"
-    )
+    Charting + Telegram delivery live in telegram_alerts.send_setup_alert;
+    this wrapper handles the DB-side bookkeeping (sent_event_ids, AlertEvent
+    feed, last_setup_alert_at).
+    """
     logger.info(
         "setup alert: %s %s kind=%s id=%s",
-        symbol, timeframe, event.kind, event.event_id,
+        snap.symbol, timeframe, event.kind, event.event_id,
     )
-
-    htf_photo = render_htf_png(
-        symbol, timeframe, htf_bars, result, event.kind, event.fvg.top, event.fvg.bottom
-    )
-    confirm_photo = render_setup_png(
-        symbol, timeframe, confirmation_tf, bars, result,
-        event.kind, event.fvg.top, event.fvg.bottom,
-    )
-
-    photos = [p for p in (htf_photo, confirm_photo) if p is not None]
-    sent = False
-    if len(photos) >= 2:
-        sent = await send_telegram_media_group(
-            settings.telegram_bot_token, settings.telegram_chat_id, photos, message
-        )
-    elif len(photos) == 1:
-        sent = await send_telegram_photo(
-            settings.telegram_bot_token, settings.telegram_chat_id, photos[0], message
-        )
-    if not sent:
-        sent = await send_telegram(
-            settings.telegram_bot_token, settings.telegram_chat_id, message
-        )
-
+    sent, caption = await send_setup_alert(settings, renderer, snap, timeframe, event)
     if not sent:
         # Don't persist the event_id — let the next cycle retry.
         return
 
-    # Telegram acknowledged: persist the event_id (plus any STB-suppressed
-    # ids) so subsequent cycles dedupe.
     with SessionLocal() as db:
         row = (
             db.query(AlertState)
-            .filter(AlertState.symbol == symbol, AlertState.timeframe == timeframe)
+            .filter(AlertState.symbol == snap.symbol, AlertState.timeframe == timeframe)
             .first()
         )
         if row is None:
-            row = AlertState(symbol=symbol, timeframe=timeframe, in_ote=True)
+            row = AlertState(symbol=snap.symbol, timeframe=timeframe, in_ote=True)
             db.add(row)
             db.flush()
         sent_ids = _load_sent_ids(row.sent_event_ids)
@@ -314,7 +268,7 @@ async def _send_setup_alert(
         row.sent_event_ids = json.dumps(sorted(sent_ids))
         row.last_setup_alert_at = datetime.now(timezone.utc).replace(tzinfo=None)
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        db.add(AlertEvent(timeframe=timeframe, message=message))
+        db.add(AlertEvent(timeframe=timeframe, message=caption))
         db.flush()
         _prune_alert_events(db)
         db.commit()
@@ -362,10 +316,11 @@ async def main() -> None:
         pass
 
     client = BinanceFuturesClient()
+    renderer = ChartRenderer(settings)
     try:
         while not stop_event.is_set():
             try:
-                await run_once(client, settings)
+                await run_once(client, renderer, settings)
             except Exception as exc:
                 logger.exception("cycle failed: %s", exc)
             try:
@@ -375,6 +330,7 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 continue
     finally:
+        await renderer.close()
         await client.close()
 
 
