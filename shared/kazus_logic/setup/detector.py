@@ -6,12 +6,17 @@ previous SetupState; returns the new state plus any events that fired
 this cycle.
 
 Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
-  INV — first bearish FVG formed AFTER price enters OTE; fires when an
-        LTF candle closes its body above that FVG's top.
+  INV — bearish FVG formed within BEAR_FVG_LOOKBACK_BARS strictly before
+        the session swing_low (inclusive of the swing_low bar); fires when
+        an LTF candle later closes its body above that FVG's top. If no
+        bear FVG sits inside that window the setup is unarmed until a new
+        swing_low appears.
   CRE — first bullish FVG formed AFTER price enters OTE; fires on the
         formation bar itself (no body-reclaim required).
-  STB — INV and CRE both fired within the same OTE session, in any order.
-        Trigger ts is the later of the two.
+  STB — INV and CRE both fired AND their anchor bars are within
+        STB_WINDOW_BARS of each other (symmetric, no order required).
+        If the gap is wider than the window the standalone INV and CRE
+        fire as separate events but STB does not.
 
 We fire on first observation of a closed-bar trigger, not only when the
 trigger bar happens to be the latest one in the window: the worker polls
@@ -21,10 +26,16 @@ restart, missed cycle). Once a closed-bar trigger has fired and not been
 invalidated, it stays valid and the runner-level sent_event_ids dedup
 keeps the same trigger from re-alerting on later cycles.
 
-Reset (within a live session):
-  If the last closed LTF bar's low breaks the session swing_low (the
-  minimum that "spawned" the search), all event flags wipe and we
-  re-arm from a fresh swing_low. Already-emitted events are not recalled.
+Swing-low replay (within a live session):
+  Each cycle replays arc bars forward from the bar where the prior
+  cycle's swing_low was last anchored. For every newer bar:
+    - body close strictly below swing_low (min(open, close) < swing_low)
+      → body-break: full reset within the same session. search_start_ts
+        advances to the breaking bar, FVG locks and event flags clear,
+        a new search arc begins. This is the "stop setup" condition.
+    - bar.low strictly below swing_low but body close at-or-above it
+      → wick-only break: swing_low moves down to the new wick low.
+        Locked FVGs, event flags, and search_start_ts are preserved.
 
 Session boundary:
   A new session starts when the HTF OTE bounds change OR price had left
@@ -38,6 +49,16 @@ from typing import List, Optional, Tuple
 
 from ..engine import Bar, ZoneResult
 from .types import Fvg, SetupEvent, SetupState
+
+
+# A bearish FVG qualifies as an INV anchor only if its formation bar lies
+# within this many bars strictly BEFORE the current swing_low bar (the
+# swing_low bar itself is the right edge and is inclusive).
+BEAR_FVG_LOOKBACK_BARS = 5
+
+# INV and CRE compose into STB only if their anchor bars are within this
+# many bars of each other (symmetric — CRE may precede or follow INV).
+STB_WINDOW_BARS = 5
 
 
 def detect_setup(
@@ -77,32 +98,31 @@ def detect_setup(
     else:
         state = _clone_state(prev_state)
 
+    _apply_swing_low_events(state, session_bars)
+
     last_bar = session_bars[-1]
 
-    swing_was_broken = (
-        state.swing_low is not None
-        and last_bar.low < state.swing_low
-    )
-    if swing_was_broken:
-        state = SetupState(
-            session_id=session_id,
-            search_start_ts=last_bar.ts,
-            swing_low=last_bar.low,
-            swing_low_ts=last_bar.ts,
-        )
-    else:
-        # Track minimum within the current search arc (since last reset).
-        arc_bars = [b for b in session_bars if b.ts >= state.search_start_ts]
-        cur_swing_low, cur_swing_low_ts = _session_swing_low(arc_bars)
-        state.swing_low = cur_swing_low
-        state.swing_low_ts = cur_swing_low_ts
+    all_fvgs = _scan_fvgs_in_session(session_bars)
+    eligible_fvgs = [f for f in all_fvgs if f.formed_at_ts >= state.search_start_ts]
 
-    fvgs = _scan_fvgs_in_session(session_bars)
-    eligible_fvgs = [f for f in fvgs if f.formed_at_ts >= state.search_start_ts]
+    # Bear FVG selection — must lie inside the lookback window ending at
+    # the current swing_low bar. Once locked, the bear FVG is kept across
+    # wick-only swing_low updates (which can shift the window away from
+    # the FVG). Only a body-break clears it via the full state reset.
     if state.first_bear_fvg is None:
-        state.first_bear_fvg = next(
-            (f for f in eligible_fvgs if f.kind == "bearish"), None
-        )
+        swing_low_idx = _idx_of_ts(session_bars, state.swing_low_ts)
+        if swing_low_idx is not None:
+            lo_idx = max(0, swing_low_idx - BEAR_FVG_LOOKBACK_BARS)
+            state.first_bear_fvg = next(
+                (
+                    f
+                    for f in eligible_fvgs
+                    if f.kind == "bearish"
+                    and lo_idx <= f.formed_at_idx <= swing_low_idx
+                ),
+                None,
+            )
+
     if state.first_bull_fvg is None:
         state.first_bull_fvg = next(
             (f for f in eligible_fvgs if f.kind == "bullish"), None
@@ -148,25 +168,39 @@ def detect_setup(
             swing_low=swing_low_for_event,
         ))
 
+    # STB only composes if INV's body-close bar and CRE's bull-FVG bar are
+    # within STB_WINDOW_BARS of each other (symmetric). Outside the window
+    # the two events stand alone — INV and CRE are still emitted but no
+    # STB is produced.
     if state.inv_fired and state.cre_fired and not state.stb_fired:
-        state.stb_fired = True
-        stb_ts = max(state.inv_at_ts or 0, state.cre_at_ts or 0)
-        stb_fvg = state.first_bull_fvg or state.first_bear_fvg
-        assert stb_fvg is not None
-        events.append(SetupEvent(
-            kind="STB",
-            event_id=_event_id("stb", symbol, timeframe, stb_ts),
-            trigger_ts=stb_ts,
-            fvg=stb_fvg,
-            swing_low=swing_low_for_event,
-        ))
+        inv_idx = _idx_of_ts(session_bars, state.inv_at_ts)
+        bull_idx = (
+            _idx_of_ts(session_bars, state.first_bull_fvg.formed_at_ts)
+            if state.first_bull_fvg is not None else None
+        )
+        if (
+            inv_idx is not None
+            and bull_idx is not None
+            and abs(bull_idx - inv_idx) <= STB_WINDOW_BARS
+        ):
+            state.stb_fired = True
+            stb_ts = max(state.inv_at_ts or 0, state.cre_at_ts or 0)
+            stb_fvg = state.first_bull_fvg or state.first_bear_fvg
+            assert stb_fvg is not None
+            events.append(SetupEvent(
+                kind="STB",
+                event_id=_event_id("stb", symbol, timeframe, stb_ts),
+                trigger_ts=stb_ts,
+                fvg=stb_fvg,
+                swing_low=swing_low_for_event,
+            ))
 
     if state.stb_fired:
         state.state = "STB"
-    elif state.inv_fired:
-        state.state = "INV"
     elif state.cre_fired:
         state.state = "CRE"
+    elif state.inv_fired:
+        state.state = "INV"
     else:
         state.state = "NO"
 
@@ -193,6 +227,59 @@ def _find_session_start(
     if last_in_ote == -1:
         return None
     return last_in_ote
+
+
+def _apply_swing_low_events(state: SetupState, session_bars: List[Bar]) -> None:
+    """Replay arc bars after the current swing_low anchor and mutate state
+    in place. Two break classes:
+      - body close < swing_low → full reset within the same session.
+      - bar.low < swing_low, body close ≥ swing_low → swing_low moves
+        to the new wick low; FVG locks and event flags are preserved.
+    Fresh state (swing_low None) seeds swing_low from the first arc bar
+    and then replays forward from the next bar.
+    """
+    arc = [b for b in session_bars if b.ts >= state.search_start_ts]
+    if not arc:
+        return
+
+    if state.swing_low is None:
+        state.swing_low = arc[0].low
+        state.swing_low_ts = arc[0].ts
+        i = 1
+    else:
+        anchor_ts = (
+            state.swing_low_ts
+            if state.swing_low_ts is not None
+            else state.search_start_ts
+        )
+        i = len(arc)
+        for j, b in enumerate(arc):
+            if b.ts > anchor_ts:
+                i = j
+                break
+
+    while i < len(arc):
+        b = arc[i]
+        body_low = min(b.open, b.close)
+        if body_low < state.swing_low:
+            state.search_start_ts = b.ts
+            state.swing_low = b.low
+            state.swing_low_ts = b.ts
+            state.first_bear_fvg = None
+            state.first_bull_fvg = None
+            state.inv_fired = False
+            state.cre_fired = False
+            state.stb_fired = False
+            state.inv_at_ts = None
+            state.cre_at_ts = None
+            arc = [bb for bb in session_bars if bb.ts >= state.search_start_ts]
+            i = 1
+        elif b.low < state.swing_low:
+            state.swing_low = b.low
+            state.swing_low_ts = b.ts
+            i += 1
+        else:
+            i += 1
 
 
 def _scan_fvgs_in_session(bars: List[Bar]) -> List[Fvg]:
@@ -224,14 +311,13 @@ def _scan_fvgs_in_session(bars: List[Bar]) -> List[Fvg]:
     return out
 
 
-def _session_swing_low(bars: List[Bar]) -> Tuple[float, int]:
-    lo = bars[0].low
-    lo_ts = bars[0].ts
-    for b in bars[1:]:
-        if b.low < lo:
-            lo = b.low
-            lo_ts = b.ts
-    return lo, lo_ts
+def _idx_of_ts(bars: List[Bar], ts: Optional[int]) -> Optional[int]:
+    if ts is None:
+        return None
+    for i, b in enumerate(bars):
+        if b.ts == ts:
+            return i
+    return None
 
 
 def _make_session_id(ote_low: float, ote_high: float, entry_ts: int) -> str:
