@@ -11,8 +11,11 @@ Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
         an LTF candle later closes its body above that FVG's top. If no
         bear FVG sits inside that window the setup is unarmed until a new
         swing_low appears.
-  CRE — first bullish FVG formed AFTER price enters OTE; fires on the
-        formation bar itself (no body-reclaim required).
+  CRE — first bullish FVG of the reaction off the swing_low, i.e. the
+        first bullish FVG whose formation bar lies strictly AFTER the
+        current swing_low bar; fires on the formation bar itself (no
+        body-reclaim required). FVGs from the descent into the low or
+        from later secondary price action are not eligible.
   STB — INV and CRE both fired AND their anchor bars are within
         STB_WINDOW_BARS of each other (symmetric, no order required).
         If the gap is wider than the window the standalone INV and CRE
@@ -105,27 +108,39 @@ def detect_setup(
     all_fvgs = _scan_fvgs_in_session(session_bars)
     eligible_fvgs = [f for f in all_fvgs if f.formed_at_ts >= state.search_start_ts]
 
+    swing_low_idx = _idx_of_ts(session_bars, state.swing_low_ts)
+
     # Bear FVG selection — must lie inside the lookback window ending at
     # the current swing_low bar. Once locked, the bear FVG is kept across
     # wick-only swing_low updates (which can shift the window away from
     # the FVG). Only a body-break clears it via the full state reset.
-    if state.first_bear_fvg is None:
-        swing_low_idx = _idx_of_ts(session_bars, state.swing_low_ts)
-        if swing_low_idx is not None:
-            lo_idx = max(0, swing_low_idx - BEAR_FVG_LOOKBACK_BARS)
-            state.first_bear_fvg = next(
-                (
-                    f
-                    for f in eligible_fvgs
-                    if f.kind == "bearish"
-                    and lo_idx <= f.formed_at_idx <= swing_low_idx
-                ),
-                None,
-            )
+    if state.first_bear_fvg is None and swing_low_idx is not None:
+        lo_idx = max(0, swing_low_idx - BEAR_FVG_LOOKBACK_BARS)
+        state.first_bear_fvg = next(
+            (
+                f
+                for f in eligible_fvgs
+                if f.kind == "bearish"
+                and lo_idx <= f.formed_at_idx <= swing_low_idx
+            ),
+            None,
+        )
 
-    if state.first_bull_fvg is None:
+    # Bull FVG (CRE) selection — must be the FIRST bullish FVG of the
+    # reaction OFF the swing_low, i.e. formed strictly after the swing_low
+    # bar. Without this anchor the detector would lock any earlier bullish
+    # FVG from the descent into the low, or skip the genuine first one and
+    # pick a later local FVG from secondary price action. Once locked the
+    # FVG is kept across wick-only swing_low updates; a body-break clears
+    # it via the full state reset.
+    if state.first_bull_fvg is None and swing_low_idx is not None:
         state.first_bull_fvg = next(
-            (f for f in eligible_fvgs if f.kind == "bullish"), None
+            (
+                f
+                for f in eligible_fvgs
+                if f.kind == "bullish" and f.formed_at_idx > swing_low_idx
+            ),
+            None,
         )
 
     events: List[SetupEvent] = []
