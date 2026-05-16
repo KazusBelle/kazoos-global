@@ -104,10 +104,7 @@ async def send_setup_alert(
     except Exception as exc:  # noqa: BLE001
         logger.warning("htf chart render failed (%s %s): %s", symbol, htf_tf, exc)
     try:
-        ltf_png = await renderer.render(
-            symbol, ltf_tf, overlay=overlay,
-            zoom=getattr(settings, "chart_render_zoom", 1.0),
-        )
+        ltf_png = await renderer.render(symbol, ltf_tf, overlay=overlay)
     except Exception as exc:  # noqa: BLE001
         logger.warning("ltf chart render failed (%s %s): %s", symbol, ltf_tf, exc)
 

@@ -25,10 +25,6 @@ class WorkerSettings(BaseSettings):
     chart_render_base_url: str = "http://frontend"
     chart_render_username: str = "kazus"
     chart_render_token_ttl_min: int = 15
-    # X-zoom for the setup (LTF) chart only: shrinks the visible bar window
-    # around the right edge so the drawn FVG/setup is rendered larger in the
-    # Telegram image. 1.0 = no zoom. Env-tunable without a code redeploy.
-    chart_render_zoom: float = 3.0
 
 
 @lru_cache

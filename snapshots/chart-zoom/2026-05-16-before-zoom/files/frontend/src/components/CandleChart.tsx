@@ -172,18 +172,9 @@ function computeSwingStartIndex(
 }
 
 // Initial fit — the SOLE source of truth for the X range. Pure function.
-//
-// `zoom` and `setupAnchorIndex` are export-only knobs. With zoom <= 1 (the
-// default — the dashboard modal never passes a zoom) the result is
-// byte-identical to the baseline fit. With zoom > 1 the visible window is
-// shrunk around the right edge so the drawn setup renders larger; the
-// setup anchor then clamps the left edge so a setup sitting further back is
-// never cropped out of frame.
 function computeInitialFit(
   currentIndex: number,
   swingStartIndex: number,
-  zoom: number = 1,
-  setupAnchorIndex: number = -1,
 ): LogicalRange {
   if (currentIndex < 0) return { from: 0, to: 0 };
   let span: number;
@@ -192,40 +183,15 @@ function computeInitialFit(
   } else {
     span = currentIndex - swingStartIndex;
   }
-  let visibleBars = Math.min(VISIBLE_BARS_MAX, Math.max(VISIBLE_BARS_MIN, span));
-  let paddingBars = Math.min(
+  const visibleBars = Math.min(VISIBLE_BARS_MAX, Math.max(VISIBLE_BARS_MIN, span));
+  const paddingBars = Math.min(
     PADDING_BARS_MAX,
     Math.max(PADDING_BARS_MIN, Math.round(visibleBars * PADDING_RATIO)),
   );
-  if (zoom > 1) {
-    visibleBars = Math.max(1, Math.round(visibleBars / zoom));
-    paddingBars = Math.max(0, Math.round(paddingBars / zoom));
-  }
-  let from = Math.max(0, currentIndex - visibleBars);
-  const to = currentIndex + paddingBars;
-  if (zoom > 1 && setupAnchorIndex >= 0) {
-    const margin = Math.max(2, Math.round(visibleBars * 0.15));
-    from = Math.min(from, Math.max(0, setupAnchorIndex - margin));
-  }
-  return { from, to };
-}
-
-// Earliest bar index touched by the setup overlay (swing low or FVG
-// formation), or -1 when there is no overlay. Used only to clamp the
-// zoomed export window so the setup stays in frame.
-function computeSetupAnchorIndex(
-  overlay: SetupOverlay | null | undefined,
-  barIndexByTime: Map<number, number>,
-): number {
-  if (!overlay) return -1;
-  let best = -1;
-  const tsCandidates = [overlay.swingLow?.ts, overlay.fvg?.ts];
-  for (const ts of tsCandidates) {
-    if (ts == null) continue;
-    const idx = barIndexByTime.get(Math.floor(ts / 1000));
-    if (idx != null && (best < 0 || idx < best)) best = idx;
-  }
-  return best;
+  return {
+    from: Math.max(0, currentIndex - visibleBars),
+    to: currentIndex + paddingBars,
+  };
 }
 
 function getBullishOteZone(
@@ -326,7 +292,6 @@ export function CandleChart({
   chartHeight,
   fvgEnabled,
   fvgLimit,
-  exportZoom,
   reloadKey,
   editMode,
   draft,
@@ -342,9 +307,6 @@ export function CandleChart({
   chartHeight: number;
   fvgEnabled: boolean;
   fvgLimit: number;
-  // Export-only X-zoom (>1 shrinks the visible window). Omitted by the
-  // dashboard modal, so its fit is unchanged.
-  exportZoom?: number;
   reloadKey?: number;
   editMode?: boolean;
   draft?: StructureEvent[];
@@ -561,10 +523,7 @@ export function CandleChart({
         if (candleData.length > 0) {
           const currentIndex = candleData.length - 1;
           const swingStartIndex = computeSwingStartIndex(data, barIndexByTime);
-          const setupAnchorIndex = computeSetupAnchorIndex(setupOverlay, barIndexByTime);
-          const range = computeInitialFit(
-            currentIndex, swingStartIndex, exportZoom ?? 1, setupAnchorIndex,
-          );
+          const range = computeInitialFit(currentIndex, swingStartIndex);
           try { chart.timeScale().setVisibleLogicalRange(range); } catch { /* ignore */ }
         }
 

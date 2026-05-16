@@ -59,8 +59,6 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-please-32-bytes-minimum-xxxxxx}
       CHART_RENDER_BASE_URL: ${CHART_RENDER_BASE_URL:-http://frontend}
       CHART_RENDER_USERNAME: ${CHART_RENDER_USERNAME:-${ADMIN_USERNAME:-kazus}}
-      # X-zoom for the setup (LTF) chart in Telegram alerts. 1.0 = no zoom.
-      CHART_RENDER_ZOOM: ${CHART_RENDER_ZOOM:-3.0}
 
   frontend:
     build:
