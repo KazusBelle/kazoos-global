@@ -16,10 +16,28 @@ Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
         current swing_low bar; fires on the formation bar itself (no
         body-reclaim required). FVGs from the descent into the low or
         from later secondary price action are not eligible.
-  STB — INV and CRE both fired AND their anchor bars are within
-        STB_WINDOW_BARS of each other (symmetric, no order required).
-        If the gap is wider than the window the standalone INV and CRE
-        fire as separate events but STB does not.
+        CRE is currently FROZEN as a standalone setup: `cre_fired` is
+        still tracked because it is a required ingredient of STB, but no
+        CRE SetupEvent is emitted and the state never settles on "CRE".
+        CRE only ever surfaces folded into STB.
+  STB — INV and CRE both fired in the same search arc. How the two
+        anchors compose depends on the order they formed:
+          * CRE formed at or before the inversion bar → STB composes
+            immediately, with no window. A body-break of the swing_low
+            resets the arc and clears both flags, so two surviving
+            flags already prove the market printed no new low between
+            the events — one base, one inversion of the same locked
+            bearish FVG, any bar-distance allowed (same-arc rule).
+          * CRE formed AFTER the inversion bar → its bull FVG must
+            fully form within STB_CRE_WINDOW_BARS LTF closes of the
+            inversion bar (the closing 3rd bar of the FVG must land in
+            inv+1..inv+STB_CRE_WINDOW_BARS). This case is strict on
+            LTF-close cadence: a CRE that completes later, or one the
+            detector first observes only after the window has already
+            elapsed, does NOT compose — no catch-up STB is emitted.
+        Once the window has elapsed without CRE, stb_window_expired is
+        latched and STB can never form on this arc; a swing-low
+        body-break clears it together with the rest of the flags.
 
 We fire on first observation of a closed-bar trigger, not only when the
 trigger bar happens to be the latest one in the window: the worker polls
@@ -27,7 +45,9 @@ every few minutes while LTF candles close every 15m, so a setup can
 already be hours old by the time it is first observed (fresh start,
 restart, missed cycle). Once a closed-bar trigger has fired and not been
 invalidated, it stays valid and the runner-level sent_event_ids dedup
-keeps the same trigger from re-alerting on later cycles.
+keeps the same trigger from re-alerting on later cycles. The one
+exception is the INV→CRE window for STB (above): it is gated on
+LTF-close cadence and never emits a catch-up STB.
 
 Swing-low replay (within a live session):
   Each cycle replays arc bars forward from the bar where the prior
@@ -41,8 +61,23 @@ Swing-low replay (within a live session):
         Locked FVGs, event flags, and search_start_ts are preserved.
 
 Session boundary:
-  A new session starts when the HTF OTE bounds change OR price had left
-  OTE and re-entered. session_id encodes both.
+  A session is tied to one OTE level for its whole lifetime. It begins at
+  the first bar that entered the OTE band and lives until the HTF OTE
+  bounds themselves change. Price dipping below OTE — even to print the
+  swing low — stays in-session and does NOT re-anchor it; price leaving
+  and re-entering OTE does not start a new session either. session_id
+  encodes the OTE bounds only.
+
+OTE invalidation:
+  A body close below the 0.85-retracement level (OTE_INVALIDATION_
+  RETRACEMENT — deeper than the OTE band's 0.79 lower edge, above the 1.0
+  swing-low anchor) permanently kills the OTE level. From that point the
+  detector returns NO for this session_id and does not search the setup
+  again, even if price climbs back into the OTE band — a fresh OTE level
+  (a different session_id) is required to resume. The kill is re-derived
+  from the session bars each cycle, so it holds across the stretch where
+  price is out of OTE entirely. The swing_low is still the absolute LTF
+  minimum of the session, never re-anchored to a later re-entry bar.
 """
 
 from __future__ import annotations
@@ -50,7 +85,7 @@ from __future__ import annotations
 import hashlib
 from typing import List, Optional, Tuple
 
-from ..engine import Bar, ZoneResult
+from ..engine import Bar, OTE_HIGH, OTE_LOW, ZoneResult
 from .types import Fvg, SetupEvent, SetupState
 
 
@@ -59,9 +94,19 @@ from .types import Fvg, SetupEvent, SetupState
 # swing_low bar itself is the right edge and is inclusive).
 BEAR_FVG_LOOKBACK_BARS = 5
 
-# INV and CRE compose into STB only if their anchor bars are within this
-# many bars of each other (symmetric — CRE may precede or follow INV).
-STB_WINDOW_BARS = 5
+# Once INV has fired, a CRE that forms AFTER the inversion bar has at
+# most this many LTF-candle closes to fully form: the bull FVG's closing
+# formation bar must land in inv+1..inv+STB_CRE_WINDOW_BARS. A CRE that
+# completes later — or one the detector first observes only after the
+# window has elapsed — does not compose into STB. A bull FVG formed at or
+# before the inversion bar is exempt (same-arc rule, any distance).
+STB_CRE_WINDOW_BARS = 3
+
+# A body close below this retracement level permanently kills the OTE
+# level: the setup is never searched on it again, even if price climbs
+# back into the OTE band. 0.85 sits below the band's lower edge
+# (OTE_HIGH) but above the 1.0 swing-low anchor.
+OTE_INVALIDATION_RETRACEMENT = 0.85
 
 
 def detect_setup(
@@ -91,7 +136,28 @@ def detect_setup(
     if not session_bars:
         return SetupState(state="NO"), []
 
-    session_id = _make_session_id(ote_low, ote_high, session_bars[0].ts)
+    session_id = _make_session_id(ote_low, ote_high)
+
+    # OTE invalidation. A body close below the 0.85-retracement level kills
+    # this OTE level for good — no setup is searched on it again, even if
+    # price climbs back into the band. Recovery requires a brand-new OTE
+    # level (a different session_id). Re-derived from the session bars
+    # every cycle so it survives the stretch where price is out of OTE and
+    # this function returns NO without persisting state.
+    invalidation_price = _invalidation_price(ote_low, ote_high)
+    invalidated = (
+        prev_state is not None
+        and prev_state.session_id == session_id
+        and prev_state.ote_invalidated
+    )
+    if not invalidated and invalidation_price is not None:
+        invalidated = any(
+            min(b.open, b.close) < invalidation_price for b in session_bars
+        )
+    if invalidated:
+        return SetupState(
+            state="NO", session_id=session_id, ote_invalidated=True
+        ), []
 
     if prev_state is None or prev_state.session_id != session_id:
         state = SetupState(
@@ -169,35 +235,49 @@ def detect_setup(
                 ))
                 break
 
-    # CRE trigger: formation of the first bullish FVG. Once first_bull_fvg
-    # is locked in for this arc the formation bar is fixed; firing on first
-    # observation captures it across worker restarts and missed cycles.
+    # CRE detection: formation of the first bullish FVG. Once first_bull_fvg
+    # is locked in for this arc the formation bar is fixed; recording it on
+    # first observation captures it across worker restarts and missed
+    # cycles. CRE is FROZEN as a standalone setup — `cre_fired` is tracked
+    # purely so STB can compose; no CRE SetupEvent is emitted here.
     if state.first_bull_fvg is not None and not state.cre_fired:
         state.cre_fired = True
         state.cre_at_ts = state.first_bull_fvg.formed_at_ts
-        events.append(SetupEvent(
-            kind="CRE",
-            event_id=_event_id("cre", symbol, timeframe, state.cre_at_ts),
-            trigger_ts=state.cre_at_ts,
-            fvg=state.first_bull_fvg,
-            swing_low=swing_low_for_event,
-        ))
 
-    # STB only composes if INV's body-close bar and CRE's bull-FVG bar are
-    # within STB_WINDOW_BARS of each other (symmetric). Outside the window
-    # the two events stand alone — INV and CRE are still emitted but no
-    # STB is produced.
-    if state.inv_fired and state.cre_fired and not state.stb_fired:
+    # STB composition. INV and CRE must both have fired in this arc; how
+    # they compose depends on the order their anchor bars formed:
+    #   * bull FVG at or before the inversion bar → same-arc rule, STB
+    #     composes immediately with no window. A body-break would have
+    #     reset both flags, so two surviving flags prove one continuous
+    #     base — any bar-distance is allowed.
+    #   * bull FVG after the inversion bar → it must fully form within
+    #     STB_CRE_WINDOW_BARS LTF closes of the inversion bar, AND the
+    #     detector must observe it while the window is still open
+    #     (last closed bar no later than inv+STB_CRE_WINDOW_BARS). A CRE
+    #     completing later, or first seen after the window elapsed, does
+    #     not compose — no catch-up STB.
+    if (
+        state.inv_fired
+        and state.cre_fired
+        and not state.stb_fired
+        and not state.stb_window_expired
+    ):
         inv_idx = _idx_of_ts(session_bars, state.inv_at_ts)
         bull_idx = (
             _idx_of_ts(session_bars, state.first_bull_fvg.formed_at_ts)
             if state.first_bull_fvg is not None else None
         )
-        if (
-            inv_idx is not None
-            and bull_idx is not None
-            and abs(bull_idx - inv_idx) <= STB_WINDOW_BARS
-        ):
+        last_idx = len(session_bars) - 1
+        compose = False
+        if inv_idx is not None and bull_idx is not None:
+            if bull_idx <= inv_idx:
+                compose = True
+            elif (
+                bull_idx <= inv_idx + STB_CRE_WINDOW_BARS
+                and last_idx <= inv_idx + STB_CRE_WINDOW_BARS
+            ):
+                compose = True
+        if compose:
             state.stb_fired = True
             stb_ts = max(state.inv_at_ts or 0, state.cre_at_ts or 0)
             stb_fvg = state.first_bull_fvg or state.first_bear_fvg
@@ -210,10 +290,25 @@ def detect_setup(
                 swing_low=swing_low_for_event,
             ))
 
+    # Window expiry. INV has fired but no STB composed and the LTF has
+    # closed past inv+STB_CRE_WINDOW_BARS — the INV→CRE window is over for
+    # good. Latch stb_window_expired so a CRE that only appears (or is
+    # only observed) later can never compose into STB on this arc. A
+    # swing-low body-break clears the latch with the rest of the flags.
+    if (
+        state.inv_fired
+        and not state.stb_fired
+        and not state.stb_window_expired
+    ):
+        inv_idx = _idx_of_ts(session_bars, state.inv_at_ts)
+        last_idx = len(session_bars) - 1
+        if inv_idx is not None and last_idx > inv_idx + STB_CRE_WINDOW_BARS:
+            state.stb_window_expired = True
+
+    # CRE is frozen as a standalone state — a bullish FVG without INV
+    # produces no setup. Only NO / INV / STB are ever surfaced.
     if state.stb_fired:
         state.state = "STB"
-    elif state.cre_fired:
-        state.state = "CRE"
     elif state.inv_fired:
         state.state = "INV"
     else:
@@ -225,23 +320,22 @@ def detect_setup(
 def _find_session_start(
     bars: List[Bar], ote_low: float, ote_high: float
 ) -> Optional[int]:
-    """Return the index of the bar where the current OTE-session began.
+    """Return the index of the bar where the current OTE session began.
 
-    Walks back from the end of `bars`, finds the most recent bar that was
-    fully outside the OTE band (below or above), and returns the index
-    immediately after it. If the entire window is inside OTE, returns 0.
-    Returns None if no bar in the window touches OTE.
+    The session is tied to one OTE level for its whole lifetime, so the
+    start is the FIRST bar in the window that entered the OTE band. Every
+    bar after it belongs to the session, including bars that later dipped
+    below OTE to print the swing low — those do NOT re-anchor the start.
+    Scanning back from the end (the old behaviour) wrongly re-anchored the
+    session to a recent OTE re-touch during the reaction, which dropped
+    the real swing low from the session window.
+
+    Returns None if no bar in the window ever touched the OTE band.
     """
-    last_in_ote = -1
-    for i in range(len(bars) - 1, -1, -1):
-        b = bars[i]
+    for i, b in enumerate(bars):
         if b.low <= ote_high and b.high >= ote_low:
-            last_in_ote = i
-        else:
-            break
-    if last_in_ote == -1:
-        return None
-    return last_in_ote
+            return i
+    return None
 
 
 def _apply_swing_low_events(state: SetupState, session_bars: List[Bar]) -> None:
@@ -287,6 +381,7 @@ def _apply_swing_low_events(state: SetupState, session_bars: List[Bar]) -> None:
             state.stb_fired = False
             state.inv_at_ts = None
             state.cre_at_ts = None
+            state.stb_window_expired = False
             arc = [bb for bb in session_bars if bb.ts >= state.search_start_ts]
             i = 1
         elif b.low < state.swing_low:
@@ -335,8 +430,30 @@ def _idx_of_ts(bars: List[Bar], ts: Optional[int]) -> Optional[int]:
     return None
 
 
-def _make_session_id(ote_low: float, ote_high: float, entry_ts: int) -> str:
-    raw = f"{ote_low:.10g}|{ote_high:.10g}|{entry_ts}"
+def _invalidation_price(
+    ote_low_price: float, ote_high_price: float
+) -> Optional[float]:
+    """Price of the OTE_INVALIDATION_RETRACEMENT (0.85) level.
+
+    Derived from the two OTE-band prices: ote_high_price is the OTE_LOW
+    (0.618) level, ote_low_price the OTE_HIGH (0.79) level. The fib is
+    linear in retracement, so the per-retracement-unit price span — and
+    the deeper 0.85 level below the band — follow directly. Returns None
+    if the band is degenerate.
+    """
+    band = ote_high_price - ote_low_price
+    span = OTE_HIGH - OTE_LOW
+    if band <= 0 or span <= 0:
+        return None
+    per_unit = band / span
+    return ote_low_price - (OTE_INVALIDATION_RETRACEMENT - OTE_HIGH) * per_unit
+
+
+def _make_session_id(ote_low: float, ote_high: float) -> str:
+    # Keyed on the OTE bounds only — the session lives as long as the OTE
+    # level does. Entry ts is deliberately excluded so price leaving and
+    # re-entering OTE cannot spawn a fresh session (and reseed swing_low).
+    raw = f"{ote_low:.10g}|{ote_high:.10g}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -359,4 +476,6 @@ def _clone_state(s: SetupState) -> SetupState:
         stb_fired=s.stb_fired,
         inv_at_ts=s.inv_at_ts,
         cre_at_ts=s.cre_at_ts,
+        ote_invalidated=s.ote_invalidated,
+        stb_window_expired=s.stb_window_expired,
     )

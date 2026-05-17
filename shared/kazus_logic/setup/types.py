@@ -62,7 +62,7 @@ class SetupState:
     persists the returned state for the next cycle.
 
     Reset rules:
-      - new session_id (HTF OTE changed or price re-entered OTE) → wipe.
+      - new session_id (HTF OTE bounds changed) → wipe.
       - last LTF bar low < swing_low → wipe but keep session_id.
     """
     state: SetupKind = "NO"
@@ -80,6 +80,14 @@ class SetupState:
     stb_fired: bool = False
     inv_at_ts: Optional[int] = None
     cre_at_ts: Optional[int] = None
+    # Set once price body-closes below the 0.85-retracement level: the OTE
+    # level is dead and no setup is searched on it again — a fresh OTE
+    # level (new session_id) is required to resume.
+    ote_invalidated: bool = False
+    # Set once the INV→CRE window (STB_CRE_WINDOW_BARS LTF closes after the
+    # inversion bar) has elapsed without CRE composing into STB. STB can no
+    # longer form on this arc; a swing-low body-break clears it.
+    stb_window_expired: bool = False
 
     def to_json(self) -> str:
         return json.dumps({
@@ -95,6 +103,8 @@ class SetupState:
             "stb_fired": self.stb_fired,
             "inv_at_ts": self.inv_at_ts,
             "cre_at_ts": self.cre_at_ts,
+            "ote_invalidated": self.ote_invalidated,
+            "stb_window_expired": self.stb_window_expired,
         })
 
     @staticmethod
@@ -120,4 +130,6 @@ class SetupState:
             stb_fired=bool(d.get("stb_fired", False)),
             inv_at_ts=d.get("inv_at_ts"),
             cre_at_ts=d.get("cre_at_ts"),
+            ote_invalidated=bool(d.get("ote_invalidated", False)),
+            stb_window_expired=bool(d.get("stb_window_expired", False)),
         )

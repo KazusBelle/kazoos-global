@@ -134,9 +134,11 @@ def test_inv_does_not_fire_when_body_only_touches_fvg_top():
     assert [e.kind for e in events] == []
 
 
-# --- 3. CRE fires on first bullish FVG formation -----------------------------
+# --- 3. CRE is detected internally but FROZEN as a standalone setup ----------
+# A bullish FVG sets `cre_fired` (needed to compose STB) but emits no CRE
+# event and never settles the state on "CRE".
 
-def test_cre_fires_on_formation_of_first_bullish_fvg():
+def test_cre_detection_is_internal_only_no_event_no_state():
     zone = _bullish_ote()
     bars = [
         _bar(1000, 105, 106, 104, 105),   # enter OTE
@@ -146,20 +148,19 @@ def test_cre_fires_on_formation_of_first_bullish_fvg():
         _bar(5000, 108, 110, 108, 109),   # bullish FVG: bars[4].low=108 > bars[2].high=107
     ]
     state, events = _replay(zone, bars)
-    cre = [e for e in events if e.kind == "CRE"]
-    assert len(cre) == 1
-    assert cre[0].trigger_ts == 5000
-    assert cre[0].fvg.kind == "bullish"
-    assert cre[0].fvg.top == 108.0    # bars[4].low
-    assert cre[0].fvg.bottom == 107.0  # bars[2].high
-    assert state.state == "CRE"
+    assert [e.kind for e in events] == []     # no standalone CRE event
+    assert state.state == "NO"                # CRE never surfaces as a state
+    assert state.cre_fired is True            # but tracked for STB composition
+    assert state.first_bull_fvg is not None
+    assert state.first_bull_fvg.top == 108.0
 
 
 # --- 4. STB sequences --------------------------------------------------------
 
 def test_stb_fires_after_inv_then_cre():
     """All bars stay inside OTE [100, 110]; INV at bar 5000 then bullish
-    FVG at bar 6000 (i-2 anchor=bar4.high=105) → CRE + STB on the same bar."""
+    FVG at bar 6000 (i-2 anchor=bar4.high=105) → STB on the same bar.
+    CRE is frozen, so the event stream is INV then STB (no CRE event)."""
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),    # enter
@@ -167,11 +168,11 @@ def test_stb_fires_after_inv_then_cre():
         _bar(3000, 107, 108, 105, 106),
         _bar(4000, 104, 105, 103, 103.5),  # bearish FVG (top=107, bottom=105)
         _bar(5000, 109, 110, 108, 109.5),  # INV (body 108..109.5 > 107)
-        _bar(6000, 108, 109.5, 108, 109),  # bullish FVG: low=108 > bar4.high=105 → CRE + STB
+        _bar(6000, 108, 109.5, 108, 109),  # bullish FVG: low=108 > bar4.high=105 → STB
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
-    assert kinds == ["INV", "CRE", "STB"]
+    assert kinds == ["INV", "STB"]
     assert state.state == "STB"
     stb = [e for e in events if e.kind == "STB"][0]
     assert stb.trigger_ts == 6000
@@ -284,20 +285,21 @@ def test_new_ote_zone_starts_fresh_session():
     assert events2 == []
 
 
-# --- 7. CRE without INV is a valid terminal state ----------------------------
+# --- 7. CRE without INV produces nothing (CRE frozen as standalone) ----------
 
-def test_cre_alone_without_inv():
+def test_cre_alone_without_inv_produces_nothing():
     zone = _bullish_ote()
     bars = [
         _bar(1000, 105, 106, 104, 105),
         _bar(2000, 105, 106, 104, 105),
         _bar(3000, 105, 107, 104, 106),
         _bar(4000, 106, 109, 106, 108),
-        _bar(5000, 108, 110, 108, 109),    # bullish FVG → CRE only
+        _bar(5000, 108, 110, 108, 109),    # bullish FVG: cre_fired only, no event
     ]
     state, events = _replay(zone, bars)
-    assert state.state == "CRE"
-    assert [e.kind for e in events] == ["CRE"]
+    assert state.state == "NO"
+    assert [e.kind for e in events] == []
+    assert state.cre_fired is True
 
 
 # --- 8. First-FVG locking — later same-kind FVGs are ignored -----------------
@@ -330,9 +332,10 @@ def test_only_first_bearish_fvg_is_used_for_inv():
 # closed before this cycle began must alert on first observation, not be
 # silently dropped because formed_at_ts != last_bar.ts.
 
-def test_cre_fires_on_first_observation_when_bull_fvg_was_formed_earlier():
+def test_cre_recorded_on_first_observation_when_bull_fvg_was_formed_earlier():
     """Fresh start (prev_state=None) and the bullish FVG already exists in
-    the window — its formation bar is several bars before last_bar."""
+    the window — its formation bar is several bars before last_bar. CRE is
+    frozen: cre_fired is set but no event is emitted and state stays NO."""
     zone = _bullish_ote()
     bars = [
         _bar(1000, 105, 106, 104, 105),   # enter OTE
@@ -345,11 +348,10 @@ def test_cre_fires_on_first_observation_when_bull_fvg_was_formed_earlier():
         _bar(8000, 108, 109, 107, 108),
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
-    cre = [e for e in events if e.kind == "CRE"]
-    assert state.state == "CRE"
-    assert len(cre) == 1
-    assert cre[0].trigger_ts == 5000
-    assert cre[0].event_id == "cre:TEST:M15:5000"
+    assert [e.kind for e in events] == []
+    assert state.state == "NO"
+    assert state.cre_fired is True
+    assert state.cre_at_ts == 5000
 
 
 def test_inv_fires_on_first_observation_when_body_close_was_earlier():
@@ -475,14 +477,40 @@ def test_inv_does_not_arm_when_bear_fvg_outside_lookback_window():
     assert inv == []
 
 
-# --- 12. STB composition window ----------------------------------------------
-# STB fires only when the INV anchor (body-close bar) and the CRE anchor
-# (bull-FVG bar) are within STB_WINDOW_BARS of each other. Order is
-# symmetric — either may come first.
+# --- 12. STB composition (INV→CRE window + same-arc rule) --------------------
+# When CRE forms AFTER the inversion bar it must complete within
+# STB_CRE_WINDOW_BARS (3) LTF closes of that bar, and the detector must
+# observe it while the window is still open — no catch-up STB. When CRE
+# formed at or before the inversion bar there is no window: STB composes
+# immediately at any bar-distance (same-arc rule).
 
-def test_stb_does_not_fire_when_bull_fvg_too_far_after_inv():
-    """INV at idx=4, bull FVG at idx=10 → distance 6 > 5. INV and CRE
-    fire standalone; STB does not compose."""
+def test_stb_fires_when_cre_within_3bar_window_after_inv():
+    """INV at idx=4, bull FVG completes at idx=6 (inv+2) — inside the
+    3-bar window → STB composes."""
+    zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
+    bars = [
+        _bar(1000, 108, 109, 107, 108),
+        _bar(2000, 108, 109, 107, 108),
+        _bar(3000, 107, 108, 105, 106),
+        _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
+        _bar(5000, 109, 110, 108, 109.5),     # INV at idx=4
+        _bar(6000, 106, 108, 104, 107),       # filler: no bull FVG (low=104 ≤ bar3.high=105)
+        _bar(7000, 111, 112, 110.5, 111.5),   # bull FVG at idx=6 (low=110.5 > bar4.high=110)
+    ]
+    state, events = _replay(zone, bars)
+    kinds = [e.kind for e in events]
+    assert "INV" in kinds
+    assert "CRE" not in kinds          # CRE frozen as a standalone event
+    assert state.cre_fired is True
+    assert kinds.count("STB") == 1
+    assert state.stb_fired is True
+    assert state.state == "STB"
+
+
+def test_stb_does_not_compose_when_cre_forms_after_3bar_window():
+    """INV at idx=4, bull FVG only completes at idx=10 (inv+6) — past the
+    3-bar window. STB never composes, INV stays standalone and
+    stb_window_expired is latched."""
     zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
@@ -500,14 +528,43 @@ def test_stb_does_not_fire_when_bull_fvg_too_far_after_inv():
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
     assert "INV" in kinds
-    assert "CRE" in kinds
-    assert "STB" not in kinds
+    assert kinds.count("STB") == 0
+    assert state.cre_fired is True          # CRE still detected internally
     assert state.stb_fired is False
-    assert state.state == "CRE"   # CRE outranks standalone INV per architecture priority
+    assert state.stb_window_expired is True
+    assert state.state == "INV"
 
 
-def test_stb_fires_when_cre_precedes_inv_within_window():
-    """STB is symmetric: bull FVG at idx=6, INV at idx=8 (|8-6|=2 ≤ 5) → STB."""
+def test_stb_no_catch_up_when_window_already_elapsed_on_first_observation():
+    """The bull FVG completed inside the window (idx=6, inv+2) but the
+    detector first sees the session only after the window has elapsed
+    (last bar idx=8 > inv+3). No catch-up STB is emitted."""
+    zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
+    bars = [
+        _bar(1000, 108, 109, 107, 108),
+        _bar(2000, 108, 109, 107, 108),
+        _bar(3000, 107, 108, 105, 106),
+        _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
+        _bar(5000, 109, 110, 108, 109.5),     # INV at idx=4
+        _bar(6000, 106, 108, 104, 107),       # filler: no bull FVG
+        _bar(7000, 111, 112, 110.5, 111.5),   # bull FVG at idx=6 (inv+2, inside window)
+        _bar(8000, 111, 112, 110, 111),       # filler past the window
+        _bar(9000, 111, 112, 110, 111),       # last bar idx=8 → window elapsed
+    ]
+    state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
+    kinds = [e.kind for e in events]
+    assert "INV" in kinds
+    assert kinds.count("STB") == 0
+    assert state.cre_fired is True
+    assert state.stb_fired is False
+    assert state.stb_window_expired is True
+    assert state.state == "INV"
+
+
+def test_stb_composes_when_cre_precedes_inv_with_no_window():
+    """A bull FVG that formed BEFORE the inversion bar is exempt from the
+    3-bar window: bull FVG at idx=6, INV only at idx=12 (gap 6) → STB
+    still composes (same-arc rule, any distance)."""
     zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
@@ -516,19 +573,62 @@ def test_stb_fires_when_cre_precedes_inv_within_window():
         _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
         _bar(5000, 104, 105, 104, 104),
         _bar(6000, 105, 106, 104, 105.5),
-        _bar(7000, 106, 107, 105.5, 106.5),   # bull FVG (low=105.5 > bar4.high=105) → CRE
-        _bar(8000, 107, 108, 106, 107.5),
-        _bar(9000, 108, 110, 107, 109),       # body 108..109 > 107 → INV
+        _bar(7000, 106, 107, 105.5, 106.5),   # bull FVG at idx=6 (low=105.5 > bar4.high=105)
+        _bar(8000, 106, 107, 105, 106),       # filler: body < 107, low > swing_low
+        _bar(9000, 106, 107, 105, 106),       # filler
+        _bar(10000, 106, 107, 105, 106),      # filler
+        _bar(11000, 106, 107, 105, 106),      # filler
+        _bar(12000, 106, 107, 105, 106),      # filler
+        _bar(13000, 109, 110, 108, 109.5),    # body 108..109.5 > 107 → INV at idx=12
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
-    assert kinds.count("CRE") == 1
+    assert "CRE" not in kinds          # CRE frozen as a standalone event
+    assert state.cre_fired is True
+    assert state.cre_at_ts == 7000
     assert kinds.count("INV") == 1
     assert kinds.count("STB") == 1
     assert state.state == "STB"
-    cre_e = next(e for e in events if e.kind == "CRE")
     inv_e = next(e for e in events if e.kind == "INV")
     stb_e = next(e for e in events if e.kind == "STB")
-    assert cre_e.trigger_ts == 7000
-    assert inv_e.trigger_ts == 9000
-    assert stb_e.trigger_ts == max(inv_e.trigger_ts, cre_e.trigger_ts)
+    assert inv_e.trigger_ts == 13000
+    assert stb_e.trigger_ts == max(inv_e.trigger_ts, state.cre_at_ts)
+
+
+# --- 13. OTE invalidation (body close below the 0.85 level) ------------------
+# A body close below the 0.85-retracement level kills the OTE level for
+# good. With ote_low_price=100, ote_high_price=110 the 0.85 level is
+# ~96.51 (per _invalidation_price). Recovery needs a fresh OTE level.
+
+def test_ote_invalidated_when_body_closes_below_085_level():
+    """A body close below the 0.85 level kills the OTE level: the detector
+    returns NO and stays there even though later bars climb back into the
+    band and would otherwise form a setup."""
+    zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
+    bars = [
+        _bar(1000, 105, 106, 104, 105),   # enter OTE
+        _bar(2000, 104, 105, 95, 96),     # body close 96 < ~96.51 → KILL
+        _bar(3000, 105, 107, 104, 106),
+        _bar(4000, 106, 109, 106, 108),
+        _bar(5000, 108, 110, 108, 109),   # bullish FVG — would arm CRE, but dead
+    ]
+    state, events = _replay(zone, bars)
+    assert state.state == "NO"
+    assert state.ote_invalidated is True
+    assert events == []
+
+
+def test_ote_not_invalidated_on_wick_below_085():
+    """A wick below the 0.85 level with the body closing above it does not
+    kill the level — only a body close below does."""
+    zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
+    bars = [
+        _bar(1000, 105, 106, 104, 105),
+        _bar(2000, 105, 106, 95, 105),    # wick to 95, body 105 — survives
+        _bar(3000, 105, 107, 104, 106),
+        _bar(4000, 106, 109, 106, 108),
+        _bar(5000, 108, 110, 108, 109),   # bullish FVG → cre_fired
+    ]
+    state, events = _replay(zone, bars)
+    assert state.ote_invalidated is False
+    assert state.cre_fired is True
