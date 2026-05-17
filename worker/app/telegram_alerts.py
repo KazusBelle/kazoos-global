@@ -100,7 +100,7 @@ async def send_setup_alert(
     htf_png: Optional[bytes] = None
     ltf_png: Optional[bytes] = None
     try:
-        htf_png = await renderer.render(symbol, htf_tf)
+        htf_png = await renderer.render(symbol, htf_tf, fvg_nearest_pair=True)
     except Exception as exc:  # noqa: BLE001
         logger.warning("htf chart render failed (%s %s): %s", symbol, htf_tf, exc)
     try:

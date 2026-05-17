@@ -47,6 +47,9 @@ export function ChartExportPage() {
 
   const fvgEnabled = params.get("fvg") !== "0";
   const fvgLimit = Math.max(1, numParam(params, "fvg_limit") ?? 6);
+  // Export-only: HTF render passes fvg_pair=1 to keep just the nearest
+  // bullish + bearish imbalance. Modal/LTF never set it.
+  const fvgNearestPairOnly = params.get("fvg_pair") === "1";
   // Export-only X-zoom. Clamped to [1, 5]; 1 = baseline fit. Only the
   // headless export passes this — the dashboard modal never does.
   const zoom = Math.min(5, Math.max(1, numParam(params, "zoom") ?? 1));
@@ -110,6 +113,7 @@ export function ChartExportPage() {
         chartHeight={h}
         fvgEnabled={fvgEnabled}
         fvgLimit={fvgLimit}
+        fvgNearestPairOnly={fvgNearestPairOnly}
         exportZoom={zoom}
         setupOverlay={setupOverlay}
         onReady={() => {

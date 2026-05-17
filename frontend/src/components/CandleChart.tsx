@@ -228,6 +228,28 @@ function computeSetupAnchorIndex(
   return best;
 }
 
+// Baseline (zoom=1) candle price range over the unzoomed fit window.
+// The export's uniform magnification divides this range by the zoom
+// factor, so the Y axis magnifies by exactly the same factor as the X
+// axis (fewer bars across the same width). Candles then keep their
+// normal aspect ratio instead of being stretched only horizontally.
+function computeBaselinePriceRange(
+  candleData: { high: number; low: number }[],
+  baselineFit: LogicalRange,
+): ChartPriceRange | null {
+  const from = Math.max(0, Math.floor(baselineFit.from));
+  const to = Math.min(candleData.length - 1, Math.ceil(baselineFit.to));
+  if (to < from) return null;
+  let low = Infinity;
+  let high = -Infinity;
+  for (let i = from; i <= to; i++) {
+    if (candleData[i].low < low) low = candleData[i].low;
+    if (candleData[i].high > high) high = candleData[i].high;
+  }
+  if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return null;
+  return { minValue: low, maxValue: high };
+}
+
 function getBullishOteZone(
   data: { fib_high: number | null; fib_low: number | null; fib_direction?: string },
 ): { low: number; high: number } | null {
@@ -266,11 +288,43 @@ function padRangeToHeight(
 // Y autoscale: include OTE band only if its vertical extent does not dwarf
 // the visible candle range. Otherwise the band is ignored entirely so the
 // candles stay proportional. No clamping, no edge stretching.
-function makeAutoscaleProvider(data: ChartData) {
+function makeAutoscaleProvider(
+  data: ChartData,
+  magnify: { zoom: number; baseRange: ChartPriceRange } | null = null,
+) {
   return (baseImplementation: () => { priceRange: ChartPriceRange | null; margins?: any } | null) => {
     const base = baseImplementation();
     const baseRange = base?.priceRange;
     if (baseRange == null) return base;
+
+    // Export uniform magnification: the Y range is the padded baseline
+    // range divided by the zoom factor, centred on the visible candles.
+    // This makes the Y zoom factor equal the X zoom factor so candles
+    // keep their normal aspect ratio. The visible candles are never
+    // clipped — if they would not fit, the range widens to contain them.
+    if (magnify != null && magnify.zoom > 1) {
+      const paddedBase = padRangeToHeight(
+        magnify.baseRange.minValue,
+        magnify.baseRange.maxValue,
+        (magnify.baseRange.minValue + magnify.baseRange.maxValue) / 2,
+      );
+      if (paddedBase != null) {
+        const targetHeight =
+          (paddedBase.maxValue - paddedBase.minValue) / magnify.zoom;
+        const center = (baseRange.minValue + baseRange.maxValue) / 2;
+        let lo = center - targetHeight / 2;
+        let hi = center + targetHeight / 2;
+        if (baseRange.minValue < lo || baseRange.maxValue > hi) {
+          const fit = padRangeToHeight(baseRange.minValue, baseRange.maxValue, center);
+          if (fit != null) {
+            lo = Math.min(lo, fit.minValue);
+            hi = Math.max(hi, fit.maxValue);
+          }
+        }
+        return { priceRange: { minValue: lo, maxValue: hi }, margins: { above: 0, below: 0 } };
+      }
+    }
+
     const candleLow = baseRange.minValue;
     const candleHigh = baseRange.maxValue;
     const candleHeight = Math.max(candleHigh - candleLow, Math.abs(candleHigh) * 0.002, 1e-9);
@@ -326,6 +380,7 @@ export function CandleChart({
   chartHeight,
   fvgEnabled,
   fvgLimit,
+  fvgNearestPairOnly,
   exportZoom,
   reloadKey,
   editMode,
@@ -342,6 +397,10 @@ export function CandleChart({
   chartHeight: number;
   fvgEnabled: boolean;
   fvgLimit: number;
+  // Export-only: keep just the nearest bullish + nearest bearish FVG
+  // (by price distance to the last close). Omitted by the dashboard
+  // modal, so its FVG layer is unchanged.
+  fvgNearestPairOnly?: boolean;
   // Export-only X-zoom (>1 shrinks the visible window). Omitted by the
   // dashboard modal, so its fit is unchanged.
   exportZoom?: number;
@@ -365,8 +424,15 @@ export function CandleChart({
   // visibility never forces a chart remount.
   const fvgEnabledRef = useRef(fvgEnabled);
   const fvgLimitRef = useRef(fvgLimit);
-  useEffect(() => { fvgEnabledRef.current = fvgEnabled; }, [fvgEnabled]);
-  useEffect(() => { fvgLimitRef.current = fvgLimit; }, [fvgLimit]);
+  const fvgPrimitiveUpdateRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    fvgEnabledRef.current = fvgEnabled;
+    fvgPrimitiveUpdateRef.current?.();
+  }, [fvgEnabled]);
+  useEffect(() => {
+    fvgLimitRef.current = fvgLimit;
+    fvgPrimitiveUpdateRef.current?.();
+  }, [fvgLimit]);
 
   // Setup overlay — null means no-op (preserves baseline behavior).
   const setupOverlayRef = useRef<SetupOverlay | null>(setupOverlay ?? null);
@@ -388,7 +454,7 @@ export function CandleChart({
     end_ts: number;
     top: number;
     bottom: number;
-    rect: SVGRectElement;
+    fill: string;
   };
   const fvgElementsRef = useRef<FvgEl[]>([]);
 
@@ -466,7 +532,22 @@ export function CandleChart({
         const fibActive =
           data.fib_high != null && data.fib_low != null && data.fib_high > data.fib_low;
         const isBullish = fibActive && data.fib_direction === "bullish";
-        const autoscaleOverride = makeAutoscaleProvider(data);
+
+        // X-zoom fit anchors (also reused by the initial fit below).
+        const currentIndex = candleData.length - 1;
+        const swingStartIndex = computeSwingStartIndex(data, barIndexByTime);
+
+        // Export uniform magnification: when an X-zoom is active, capture
+        // the unzoomed baseline price range so the autoscale provider can
+        // magnify the Y axis by the same factor as the X axis.
+        let magnifyRange: { zoom: number; baseRange: ChartPriceRange } | null = null;
+        const exportZoomVal = exportZoom ?? 1;
+        if (exportZoomVal > 1 && currentIndex >= 0) {
+          const baselineFit = computeInitialFit(currentIndex, swingStartIndex, 1, -1);
+          const baseRange = computeBaselinePriceRange(candleData, baselineFit);
+          if (baseRange != null) magnifyRange = { zoom: exportZoomVal, baseRange };
+        }
+        const autoscaleOverride = makeAutoscaleProvider(data, magnifyRange);
         const pricePrecision = inferPricePrecision(data.bars);
         const minMove = 10 ** (-pricePrecision);
 
@@ -559,11 +640,9 @@ export function CandleChart({
         // ── INITIAL FIT — sole place that touches the X range. After this
         // point, no subscribe→set, no resize→set, no timers, no enforce.
         if (candleData.length > 0) {
-          const currentIndex = candleData.length - 1;
-          const swingStartIndex = computeSwingStartIndex(data, barIndexByTime);
           const setupAnchorIndex = computeSetupAnchorIndex(setupOverlay, barIndexByTime);
           const range = computeInitialFit(
-            currentIndex, swingStartIndex, exportZoom ?? 1, setupAnchorIndex,
+            currentIndex, swingStartIndex, exportZoomVal, setupAnchorIndex,
           );
           try { chart.timeScale().setVisibleLogicalRange(range); } catch { /* ignore */ }
         }
@@ -586,25 +665,43 @@ export function CandleChart({
         const halfColor = isLocal ? "#5c7bd5" : "#752727";
         const plotClipUrl = `url(#${plotClipId})`;
 
-        // FVG layer (created here, visibility per-frame from refs).
-        const allFvgs = data.fvgs ?? [];
+        // FVG layer. Drawn as a lightweight-charts bottom primitive so it
+        // lives behind candles, while every other SVG overlay stays unchanged.
+        let allFvgs = data.fvgs ?? [];
+        // Export-only: collapse to the single nearest bullish + bearish FVG.
+        // A kind with no FVG in the loaded window simply yields nothing —
+        // off-screen primitives are already skipped by the renderer below.
+        if (fvgNearestPairOnly && allFvgs.length > 0) {
+          const lastBar = data.bars[data.bars.length - 1];
+          const price = lastBar ? lastBar.close : null;
+          if (price != null) {
+            const gap = (f: { top: number; bottom: number }) =>
+              price >= f.bottom && price <= f.top
+                ? 0
+                : price > f.top ? price - f.top : f.bottom - price;
+            const nearest = (kind: string) =>
+              allFvgs
+                .filter((f) => f.kind === kind)
+                .reduce<typeof allFvgs[number] | null>(
+                  (best, f) => (best == null || gap(f) < gap(best) ? f : best),
+                  null,
+                );
+            allFvgs = [nearest("bullish"), nearest("bearish")].filter(
+              (f): f is typeof allFvgs[number] => f != null,
+            );
+          }
+        }
         const newFvgElements: FvgEl[] = [];
         for (const fvg of allFvgs) {
           const fill = fvg.kind === "bullish"
             ? "rgba(38, 166, 154, 0.18)"
             : "rgba(117, 39, 39, 0.24)";
-          const rect = document.createElementNS(SVG_NS, "rect");
-          rect.setAttribute("fill", fill);
-          rect.setAttribute("stroke", fill);
-          rect.setAttribute("stroke-width", "0.5");
-          rect.setAttribute("clip-path", plotClipUrl);
-          svg.appendChild(rect);
           newFvgElements.push({
             ts: fvg.ts,
             end_ts: fvg.end_ts,
             top: fvg.top,
             bottom: fvg.bottom,
-            rect,
+            fill,
           });
         }
         fvgElementsRef.current = newFvgElements;
@@ -962,6 +1059,50 @@ export function CandleChart({
             }
           }
         };
+        const fvgPrimitive = {
+          paneViews: () => [{
+            zOrder: () => "bottom",
+            renderer: () => ({
+              draw: (target: any) => {
+                target.useMediaCoordinateSpace(({ context: ctx, mediaSize }: any) => {
+                  const fvgOn = fvgEnabledRef.current;
+                  const fvgLim = fvgLimitRef.current;
+                  const fvgAll = fvgElementsRef.current;
+                  if (!fvgOn || fvgAll.length === 0) return;
+                  const fvgThreshold = fvgAll.length - Math.max(1, fvgLim);
+                  for (let i = 0; i < fvgAll.length; i++) {
+                    if (i < fvgThreshold) continue;
+                    const fv = fvgAll[i];
+                    const x1 = safeTimeX(fv.ts);
+                    const x2 = safeTimeX(fv.end_ts);
+                    const yTop = safePriceY(fv.top);
+                    const yBot = safePriceY(fv.bottom);
+                    if (x1 == null || x2 == null || yTop == null || yBot == null) continue;
+                    const left = Math.max(0, Math.min(x1, x2));
+                    const right = Math.min(mediaSize.width, Math.max(x1, x2));
+                    const width = right - left;
+                    if (width <= 0) continue;
+                    const top = Math.min(yTop, yBot);
+                    const height = Math.max(1, Math.abs(yBot - yTop));
+                    ctx.fillStyle = fv.fill;
+                    ctx.strokeStyle = fv.fill;
+                    ctx.lineWidth = 0.5;
+                    ctx.fillRect(left, top, width, height);
+                    ctx.strokeRect(left, top, width, height);
+                  }
+                });
+              },
+            }),
+          }],
+          attached: ({ requestUpdate }: { requestUpdate: () => void }) => {
+            fvgPrimitiveUpdateRef.current = requestUpdate;
+            requestUpdate();
+          },
+          detached: () => {
+            fvgPrimitiveUpdateRef.current = null;
+          },
+        };
+        try { candles.attachPrimitive(fvgPrimitive); } catch { /* older builds */ }
 
         // ── Cursor tracking + click-to-add (edit mode) ──────────────────
         const root = containerRef.current;
@@ -1052,6 +1193,14 @@ export function CandleChart({
             plotClipRect.setAttribute("height", String(plotBottom));
             if (plotRight <= 0 || plotBottom <= 0) return;
 
+            // Fire onReady once the plot has measurable extent. Must happen
+            // before any overlay code so a stray throw downstream doesn't
+            // block the headless screenshot (window.__chartReady).
+            if (!readyFiredRef.current) {
+              readyFiredRef.current = true;
+              try { onReadyRef.current?.(); } catch { /* noop */ }
+            }
+
             if (candleData.length > 0 && livePriceLine) {
               try { livePriceLine.applyOptions({ price: candleData[candleData.length - 1].close }); } catch { /* noop */ }
             }
@@ -1103,38 +1252,6 @@ export function CandleChart({
               placeholder.setAttribute("x", String(cx));
               placeholder.setAttribute("y", String(cy));
               placeholder.setAttribute("font-size", String(Math.round(fontSize)));
-            }
-
-            // FVG visibility is driven by live refs so toggle is instant.
-            const fvgOn = fvgEnabledRef.current;
-            const fvgLim = fvgLimitRef.current;
-            const fvgAll = fvgElementsRef.current;
-            const fvgThreshold = fvgAll.length - Math.max(1, fvgLim);
-            for (let i = 0; i < fvgAll.length; i++) {
-              const fv = fvgAll[i];
-              if (!fvgOn || i < fvgThreshold) {
-                fv.rect.setAttribute("opacity", "0");
-                continue;
-              }
-              const x1 = safeTimeX(fv.ts);
-              const x2 = safeTimeX(fv.end_ts);
-              const yTop = safePriceY(fv.top);
-              const yBot = safePriceY(fv.bottom);
-              if (x1 == null || x2 == null || yTop == null || yBot == null) {
-                fv.rect.setAttribute("opacity", "0");
-                continue;
-              }
-              const left = Math.max(0, Math.min(x1, x2));
-              const right = Math.min(plotRight, Math.max(x1, x2));
-              const width = right - left;
-              if (width <= 0) { fv.rect.setAttribute("opacity", "0"); continue; }
-              const top = Math.min(yTop, yBot);
-              const height = Math.abs(yBot - yTop);
-              fv.rect.setAttribute("opacity", "1");
-              fv.rect.setAttribute("x", String(left));
-              fv.rect.setAttribute("y", String(top));
-              fv.rect.setAttribute("width", String(width));
-              fv.rect.setAttribute("height", String(Math.max(1, height)));
             }
 
             // Swings — visibility controlled by logical index range only.
@@ -1314,13 +1431,6 @@ export function CandleChart({
               }
             }
 
-            // Fire onReady once after the first frame where the plot has
-            // actual screen extent — that's our signal the chart is on
-            // screen and the headless renderer can capture it.
-            if (!readyFiredRef.current) {
-              readyFiredRef.current = true;
-              try { onReadyRef.current?.(); } catch { /* noop */ }
-            }
           } catch (e: any) {
             if (!reportedRafErrorRef.current) {
               reportedRafErrorRef.current = true;

@@ -100,6 +100,7 @@ class ChartRenderer:
         overlay: Optional[SetupOverlay],
         fvg_limit: int,
         zoom: float,
+        fvg_nearest_pair: bool,
     ) -> str:
         params: dict[str, str] = {
             "symbol": symbol,
@@ -111,6 +112,8 @@ class ChartRenderer:
         }
         if zoom > 1.0:
             params["zoom"] = repr(zoom)
+        if fvg_nearest_pair:
+            params["fvg_pair"] = "1"
         if overlay is not None:
             params.update(
                 {
@@ -138,6 +141,7 @@ class ChartRenderer:
         overlay: Optional[SetupOverlay] = None,
         fvg_limit: int = 6,
         zoom: float = 1.0,
+        fvg_nearest_pair: bool = False,
         timeout_ms: int = 20_000,
     ) -> bytes:
         """Render a single chart as a PNG. Returns the image bytes.
@@ -156,6 +160,7 @@ class ChartRenderer:
             overlay=overlay,
             fvg_limit=fvg_limit,
             zoom=zoom,
+            fvg_nearest_pair=fvg_nearest_pair,
         )
         base = self._settings.chart_render_base_url.rstrip("/")
         browser = await self._ensure_browser()
