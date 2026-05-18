@@ -56,20 +56,41 @@ export function ChartExportPage() {
 
   const setupOverlay: SetupOverlay | null = useMemo(() => {
     const stateRaw = params.get("state");
-    const fvgTop = numParam(params, "fvg_top");
-    const fvgBottom = numParam(params, "fvg_bottom");
-    const fvgTs = numParam(params, "fvg_ts");
-    const fvgEndTs = numParam(params, "fvg_end_ts");
+    const fvgsRaw = params.get("fvgs");
     if (
       stateRaw == null ||
       !(ALLOWED_STATES as string[]).includes(stateRaw) ||
-      fvgTop == null ||
-      fvgBottom == null ||
-      fvgTs == null ||
-      fvgEndTs == null
+      !fvgsRaw
     ) {
       return null;
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fvgsRaw);
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(parsed)) return null;
+    const fvgs: SetupOverlay["fvgs"] = [];
+    for (const raw of parsed) {
+      if (raw == null || typeof raw !== "object") continue;
+      const r = raw as Record<string, unknown>;
+      const top = Number(r.top);
+      const bottom = Number(r.bottom);
+      const ts = Number(r.ts);
+      const endTs = Number(r.end_ts);
+      const kind = r.kind === "bearish" ? "bearish" : "bullish";
+      if (
+        !Number.isFinite(top) ||
+        !Number.isFinite(bottom) ||
+        !Number.isFinite(ts) ||
+        !Number.isFinite(endTs)
+      ) {
+        continue;
+      }
+      fvgs.push({ ts, end_ts: endTs, top, bottom, kind });
+    }
+    if (fvgs.length === 0) return null;
     const swingLowPrice = numParam(params, "swing_low_price");
     const swingLowTs = numParam(params, "swing_low_ts");
     const swingLow =
@@ -78,7 +99,7 @@ export function ChartExportPage() {
         : undefined;
     return {
       state: stateRaw as SetupOverlay["state"],
-      fvg: { ts: fvgTs, end_ts: fvgEndTs, top: fvgTop, bottom: fvgBottom },
+      fvgs,
       swingLow,
     };
   }, [params]);

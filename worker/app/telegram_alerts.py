@@ -22,7 +22,7 @@ from kazus_logic.compute import (
 )
 from kazus_logic.setup import SetupEvent
 
-from .chart_renderer import ChartRenderer, SetupOverlay
+from .chart_renderer import ChartRenderer, OverlayFvg, SetupOverlay
 from .telegram import (
     send_telegram,
     send_telegram_media_group,
@@ -87,12 +87,30 @@ async def send_setup_alert(
     ltf_bars = snap.confirmation_bars.get(timeframe, [])
     fvg_end_ts = ltf_bars[-1].ts if ltf_bars else event.fvg.formed_at_ts
 
+    # Only the FVGs that actually compose the setup are drawn. STB is the
+    # union of an inversion (bear FVG) and a creation (bull FVG), so it
+    # carries both; INV/CRE carry the single FVG on the event. The frontend
+    # colours each by `kind`, so no per-state colour is needed here.
+    def _overlay_fvg(fvg) -> OverlayFvg:
+        return OverlayFvg(
+            top=fvg.top,
+            bottom=fvg.bottom,
+            ts=fvg.formed_at_ts,
+            end_ts=fvg_end_ts,
+            kind=fvg.kind,
+        )
+
+    setup_fvgs: list[OverlayFvg] = []
+    if event.kind == "STB" and state is not None:
+        for f in (state.first_bear_fvg, state.first_bull_fvg):
+            if f is not None:
+                setup_fvgs.append(_overlay_fvg(f))
+    if not setup_fvgs:
+        setup_fvgs.append(_overlay_fvg(event.fvg))
+
     overlay = SetupOverlay(
         state=event.kind,
-        fvg_top=event.fvg.top,
-        fvg_bottom=event.fvg.bottom,
-        fvg_ts=event.fvg.formed_at_ts,
-        fvg_end_ts=fvg_end_ts,
+        fvgs=tuple(setup_fvgs),
         swing_low_ts=swing_low_ts,
         swing_low_price=event.swing_low,
     )
@@ -100,12 +118,14 @@ async def send_setup_alert(
     htf_png: Optional[bytes] = None
     ltf_png: Optional[bytes] = None
     try:
-        htf_png = await renderer.render(symbol, htf_tf, fvg_nearest_pair=True)
+        htf_png = await renderer.render(
+            symbol, htf_tf, theme="light", fvg_nearest_pair=True
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("htf chart render failed (%s %s): %s", symbol, htf_tf, exc)
     try:
         ltf_png = await renderer.render(
-            symbol, ltf_tf, overlay=overlay,
+            symbol, ltf_tf, overlay=overlay, theme="light",
             zoom=getattr(settings, "chart_render_zoom", 1.0),
         )
     except Exception as exc:  # noqa: BLE001

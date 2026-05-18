@@ -34,12 +34,20 @@ logger = logging.getLogger("kazus.worker.chart_renderer")
 
 
 @dataclass(frozen=True)
+class OverlayFvg:
+    """One FVG to highlight in a setup export. ``kind`` drives the fill
+    colour on the frontend (bullish = CRE, bearish = INV)."""
+    top: float
+    bottom: float
+    ts: int                  # ms — formation bar
+    end_ts: int              # ms — right edge of the box
+    kind: str                # "bullish" | "bearish"
+
+
+@dataclass(frozen=True)
 class SetupOverlay:
     state: str               # "INV" | "CRE" | "STB"
-    fvg_top: float
-    fvg_bottom: float
-    fvg_ts: int              # ms
-    fvg_end_ts: int          # ms
+    fvgs: tuple[OverlayFvg, ...]
     swing_low_ts: Optional[int] = None     # ms
     swing_low_price: Optional[float] = None
 
@@ -115,14 +123,18 @@ class ChartRenderer:
         if fvg_nearest_pair:
             params["fvg_pair"] = "1"
         if overlay is not None:
-            params.update(
-                {
-                    "state": overlay.state,
-                    "fvg_top": repr(overlay.fvg_top),
-                    "fvg_bottom": repr(overlay.fvg_bottom),
-                    "fvg_ts": str(overlay.fvg_ts),
-                    "fvg_end_ts": str(overlay.fvg_end_ts),
-                }
+            params["state"] = overlay.state
+            params["fvgs"] = json.dumps(
+                [
+                    {
+                        "top": f.top,
+                        "bottom": f.bottom,
+                        "ts": f.ts,
+                        "end_ts": f.end_ts,
+                        "kind": f.kind,
+                    }
+                    for f in overlay.fvgs
+                ]
             )
             if overlay.swing_low_ts is not None and overlay.swing_low_price is not None:
                 params["swing_low_ts"] = str(overlay.swing_low_ts)
@@ -231,4 +243,4 @@ class ChartRenderer:
             self._playwright = None
 
 
-__all__ = ["ChartRenderer", "SetupOverlay"]
+__all__ = ["ChartRenderer", "SetupOverlay", "OverlayFvg"]

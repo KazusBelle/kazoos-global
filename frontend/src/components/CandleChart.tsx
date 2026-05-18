@@ -219,7 +219,10 @@ function computeSetupAnchorIndex(
 ): number {
   if (!overlay) return -1;
   let best = -1;
-  const tsCandidates = [overlay.swingLow?.ts, overlay.fvg?.ts];
+  const tsCandidates = [
+    overlay.swingLow?.ts,
+    ...overlay.fvgs.map((f) => f.ts),
+  ];
   for (const ts of tsCandidates) {
     if (ts == null) continue;
     const idx = barIndexByTime.get(Math.floor(ts / 1000));
@@ -362,7 +365,15 @@ export type SwingClickAnchor = { idx: number; clientX: number; clientY: number }
 // from SetupEvent but its bar ts is only on SetupState and not always
 // forwarded).
 export type SetupOverlay = {
-  fvg: { ts: number; end_ts: number; top: number; bottom: number };
+  // Only the FVGs that compose the setup. INV/CRE carry one; STB carries
+  // both (inversion bear FVG + creation bull FVG).
+  fvgs: {
+    ts: number;
+    end_ts: number;
+    top: number;
+    bottom: number;
+    kind: "bullish" | "bearish";
+  }[];
   swingLow?: { ts?: number | null; price: number };
   state: "INV" | "CRE" | "STB";
 };
@@ -371,6 +382,12 @@ const SETUP_STATE_COLOR: Record<SetupOverlay["state"], string> = {
   INV: "#c08a3d",  // amber for inversion
   CRE: "#5ca36a",  // green for creation
   STB: "#7aa6ff",  // blue for setup
+};
+
+// Setup-FVG fill, keyed by gap kind. Drawn behind candles, no stroke.
+const SETUP_FVG_COLOR: Record<"bullish" | "bearish", string> = {
+  bullish: "#a3a5b5",  // CRE
+  bearish: "#a7a1ac",  // INV
 };
 
 export function CandleChart({
@@ -442,7 +459,6 @@ export function CandleChart({
   const readyFiredRef = useRef(false);
 
   type SetupEls = {
-    fvgRect: SVGRectElement;
     swingLine: SVGLineElement;
     swingTag: SVGRectElement;
     swingText: SVGTextElement;
@@ -455,6 +471,9 @@ export function CandleChart({
     top: number;
     bottom: number;
     fill: string;
+    // Setup FVGs are always drawn (ignoring the fvg toggle/limit) and
+    // have no stroke; regular FVGs respect the toggle and get a hairline.
+    setup: boolean;
   };
   const fvgElementsRef = useRef<FvgEl[]>([]);
 
@@ -667,42 +686,60 @@ export function CandleChart({
 
         // FVG layer. Drawn as a lightweight-charts bottom primitive so it
         // lives behind candles, while every other SVG overlay stays unchanged.
-        let allFvgs = data.fvgs ?? [];
-        // Export-only: collapse to the single nearest bullish + bearish FVG.
-        // A kind with no FVG in the loaded window simply yields nothing —
-        // off-screen primitives are already skipped by the renderer below.
-        if (fvgNearestPairOnly && allFvgs.length > 0) {
-          const lastBar = data.bars[data.bars.length - 1];
-          const price = lastBar ? lastBar.close : null;
-          if (price != null) {
-            const gap = (f: { top: number; bottom: number }) =>
-              price >= f.bottom && price <= f.top
-                ? 0
-                : price > f.top ? price - f.top : f.bottom - price;
-            const nearest = (kind: string) =>
-              allFvgs
-                .filter((f) => f.kind === kind)
-                .reduce<typeof allFvgs[number] | null>(
-                  (best, f) => (best == null || gap(f) < gap(best) ? f : best),
-                  null,
-                );
-            allFvgs = [nearest("bullish"), nearest("bearish")].filter(
-              (f): f is typeof allFvgs[number] => f != null,
-            );
-          }
-        }
         const newFvgElements: FvgEl[] = [];
-        for (const fvg of allFvgs) {
-          const fill = fvg.kind === "bullish"
-            ? "rgba(38, 166, 154, 0.18)"
-            : "rgba(117, 39, 39, 0.24)";
-          newFvgElements.push({
-            ts: fvg.ts,
-            end_ts: fvg.end_ts,
-            top: fvg.top,
-            bottom: fvg.bottom,
-            fill,
-          });
+        if (setupOverlay && setupOverlay.fvgs.length > 0) {
+          // Setup export: show ONLY the FVGs that compose the setup, each
+          // coloured by gap kind, no stroke. The generic FVG scan is
+          // skipped entirely so unrelated imbalances don't clutter the
+          // alert chart.
+          for (const f of setupOverlay.fvgs) {
+            newFvgElements.push({
+              ts: f.ts,
+              end_ts: f.end_ts,
+              top: f.top,
+              bottom: f.bottom,
+              fill: SETUP_FVG_COLOR[f.kind],
+              setup: true,
+            });
+          }
+        } else {
+          let allFvgs = data.fvgs ?? [];
+          // Export-only: collapse to the single nearest bullish + bearish
+          // FVG. A kind with no FVG in the loaded window simply yields
+          // nothing — off-screen primitives are skipped by the renderer.
+          if (fvgNearestPairOnly && allFvgs.length > 0) {
+            const lastBar = data.bars[data.bars.length - 1];
+            const price = lastBar ? lastBar.close : null;
+            if (price != null) {
+              const gap = (f: { top: number; bottom: number }) =>
+                price >= f.bottom && price <= f.top
+                  ? 0
+                  : price > f.top ? price - f.top : f.bottom - price;
+              const nearest = (kind: string) =>
+                allFvgs
+                  .filter((f) => f.kind === kind)
+                  .reduce<typeof allFvgs[number] | null>(
+                    (best, f) => (best == null || gap(f) < gap(best) ? f : best),
+                    null,
+                  );
+              allFvgs = [nearest("bullish"), nearest("bearish")].filter(
+                (f): f is typeof allFvgs[number] => f != null,
+              );
+            }
+          }
+          for (const fvg of allFvgs) {
+            const fill = fvg.kind === "bullish"
+              ? "rgba(38, 166, 154, 0.18)"
+              : "rgba(117, 39, 39, 0.24)";
+            newFvgElements.push({
+              ts: fvg.ts,
+              end_ts: fvg.end_ts,
+              top: fvg.top,
+              bottom: fvg.bottom,
+              fill,
+              setup: false,
+            });
+          }
         }
         fvgElementsRef.current = newFvgElements;
 
@@ -947,19 +984,13 @@ export function CandleChart({
         serverSwingsRef.current = data.swings;
         buildSwings(data.swings, false);
 
-        // Setup overlay layer — highlight the FVG rect, swing-low line, and
-        // anchor for the optional state badge. Positions are updated every
-        // frame in the rAF loop from setupOverlayRef. Invisible until the
-        // caller supplies setupOverlay.
+        // Setup overlay layer — the swing-low line/tag and anchor for the
+        // optional state badge. The setup FVGs themselves are drawn by the
+        // bottom FVG primitive (behind candles), not here. Positions are
+        // updated every frame in the rAF loop from setupOverlayRef.
         const setupLayer = document.createElementNS(SVG_NS, "g");
         setupLayer.setAttribute("data-layer", "setup");
         setupLayer.setAttribute("clip-path", plotClipUrl);
-        const setupFvgRect = document.createElementNS(SVG_NS, "rect");
-        setupFvgRect.setAttribute("fill", "rgba(245, 158, 11, 0.18)");
-        setupFvgRect.setAttribute("stroke", "#f59e0b");
-        setupFvgRect.setAttribute("stroke-width", "1.4");
-        setupFvgRect.setAttribute("opacity", "0");
-        setupLayer.appendChild(setupFvgRect);
         const setupSwingLine = document.createElementNS(SVG_NS, "line");
         setupSwingLine.setAttribute("stroke", "#f87171");
         setupSwingLine.setAttribute("stroke-width", "1.2");
@@ -986,7 +1017,6 @@ export function CandleChart({
         setupLayer.appendChild(setupSwingText);
         svg.appendChild(setupLayer);
         setupElsRef.current = {
-          fvgRect: setupFvgRect,
           swingLine: setupSwingLine,
           swingTag: setupSwingTag,
           swingText: setupSwingText,
@@ -1068,11 +1098,13 @@ export function CandleChart({
                   const fvgOn = fvgEnabledRef.current;
                   const fvgLim = fvgLimitRef.current;
                   const fvgAll = fvgElementsRef.current;
-                  if (!fvgOn || fvgAll.length === 0) return;
+                  if (fvgAll.length === 0) return;
                   const fvgThreshold = fvgAll.length - Math.max(1, fvgLim);
                   for (let i = 0; i < fvgAll.length; i++) {
-                    if (i < fvgThreshold) continue;
                     const fv = fvgAll[i];
+                    // Regular FVGs honour the on/off toggle and recency
+                    // limit; setup FVGs are always drawn.
+                    if (!fv.setup && (!fvgOn || i < fvgThreshold)) continue;
                     const x1 = safeTimeX(fv.ts);
                     const x2 = safeTimeX(fv.end_ts);
                     const yTop = safePriceY(fv.top);
@@ -1085,10 +1117,13 @@ export function CandleChart({
                     const top = Math.min(yTop, yBot);
                     const height = Math.max(1, Math.abs(yBot - yTop));
                     ctx.fillStyle = fv.fill;
-                    ctx.strokeStyle = fv.fill;
-                    ctx.lineWidth = 0.5;
                     ctx.fillRect(left, top, width, height);
-                    ctx.strokeRect(left, top, width, height);
+                    // Setup FVGs are stroke-free; regular FVGs get a hairline.
+                    if (!fv.setup) {
+                      ctx.strokeStyle = fv.fill;
+                      ctx.lineWidth = 0.5;
+                      ctx.strokeRect(left, top, width, height);
+                    }
                   }
                 });
               },
@@ -1366,30 +1401,13 @@ export function CandleChart({
               }
             }
 
-            // Setup overlay — highlight a specific FVG + dashed swing-low
-            // line/tag. All elements stay invisible when setupOverlay is null.
+            // Setup overlay — dashed swing-low line/tag. The setup FVGs
+            // themselves are drawn by the bottom FVG primitive. All
+            // elements stay invisible when setupOverlay is null.
             const setupEls = setupElsRef.current;
             const overlay = setupOverlayRef.current;
             if (setupEls) {
               if (overlay) {
-                const ox1 = safeTimeX(overlay.fvg.ts);
-                const ox2 = safeTimeX(overlay.fvg.end_ts);
-                const oyTop = safePriceY(overlay.fvg.top);
-                const oyBot = safePriceY(overlay.fvg.bottom);
-                if (ox1 != null && ox2 != null && oyTop != null && oyBot != null) {
-                  const left = Math.max(0, Math.min(ox1, ox2));
-                  const right = Math.min(plotRight, Math.max(ox1, ox2));
-                  const width = Math.max(0, right - left);
-                  const top = Math.min(oyTop, oyBot);
-                  const height = Math.max(1, Math.abs(oyBot - oyTop));
-                  setupEls.fvgRect.setAttribute("x", String(left));
-                  setupEls.fvgRect.setAttribute("y", String(top));
-                  setupEls.fvgRect.setAttribute("width", String(width));
-                  setupEls.fvgRect.setAttribute("height", String(height));
-                  setupEls.fvgRect.setAttribute("opacity", width > 0 ? "1" : "0");
-                } else {
-                  setupEls.fvgRect.setAttribute("opacity", "0");
-                }
                 if (overlay.swingLow) {
                   const sy = safePriceY(overlay.swingLow.price);
                   const sxStart =
@@ -1424,7 +1442,6 @@ export function CandleChart({
                   setupEls.swingText.setAttribute("opacity", "0");
                 }
               } else {
-                setupEls.fvgRect.setAttribute("opacity", "0");
                 setupEls.swingLine.setAttribute("opacity", "0");
                 setupEls.swingTag.setAttribute("opacity", "0");
                 setupEls.swingText.setAttribute("opacity", "0");
