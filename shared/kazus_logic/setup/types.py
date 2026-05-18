@@ -13,6 +13,9 @@ class Fvg:
     """A 3-bar fair-value-gap formed inside an OTE session.
 
     `formed_at_idx` indexes into the session-local bar array (0 = entry bar).
+    `formed_at_ts` is bar i — the 3rd, confirming bar — used for all detector
+    timing. `start_ts` is bar i-2, the first of the three bars that form the
+    gap, used only to draw the box from the candles that created it.
     `top`/`bottom` are the gap edges with top >= bottom regardless of kind.
     """
     formed_at_idx: int
@@ -20,6 +23,7 @@ class Fvg:
     top: float
     bottom: float
     kind: FvgKind
+    start_ts: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -28,16 +32,20 @@ class Fvg:
             "top": self.top,
             "bottom": self.bottom,
             "kind": self.kind,
+            "start_ts": self.start_ts,
         }
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Fvg":
+        formed_at_ts = int(d["formed_at_ts"])
         return Fvg(
             formed_at_idx=int(d["formed_at_idx"]),
-            formed_at_ts=int(d["formed_at_ts"]),
+            formed_at_ts=formed_at_ts,
             top=float(d["top"]),
             bottom=float(d["bottom"]),
             kind=d["kind"],
+            # Pre-start_ts states fall back to formed_at_ts.
+            start_ts=int(d.get("start_ts", formed_at_ts)),
         )
 
 

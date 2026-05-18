@@ -95,7 +95,9 @@ async def send_setup_alert(
         return OverlayFvg(
             top=fvg.top,
             bottom=fvg.bottom,
-            ts=fvg.formed_at_ts,
+            # Box starts at the first of the 3 forming bars, not the
+            # confirming bar — falls back for pre-start_ts persisted FVGs.
+            ts=fvg.start_ts or fvg.formed_at_ts,
             end_ts=fvg_end_ts,
             kind=fvg.kind,
         )

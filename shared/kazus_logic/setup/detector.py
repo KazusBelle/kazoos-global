@@ -314,6 +314,13 @@ def detect_setup(
     else:
         state.state = "NO"
 
+    # INV + STB composing in the SAME cycle would otherwise fire two
+    # near-identical alerts. STB supersedes INV — drop the INV event so
+    # only the STB alert goes out. An INV emitted in an earlier cycle was
+    # already sent standalone and is unaffected (events is per-call).
+    if any(e.kind == "STB" for e in events):
+        events = [e for e in events if e.kind != "INV"]
+
     return state, events
 
 
@@ -387,6 +394,15 @@ def _apply_swing_low_events(state: SetupState, session_bars: List[Bar]) -> None:
         elif b.low < state.swing_low:
             state.swing_low = b.low
             state.swing_low_ts = b.ts
+            # The reaction OFF the low restarts at the new (later) low, so
+            # the CRE anchor — the first bull FVG formed AFTER the low —
+            # must be re-selected. Keeping the old lock leaves a CRE that
+            # predates the low (the FVG drawn to the left of the swing).
+            # The bear FVG / INV are intentionally sticky (lookback rule).
+            if not state.stb_fired:
+                state.first_bull_fvg = None
+                state.cre_fired = False
+                state.cre_at_ts = None
             i += 1
         else:
             i += 1
@@ -409,6 +425,7 @@ def _scan_fvgs_in_session(bars: List[Bar]) -> List[Fvg]:
                 top=c.low,
                 bottom=a.high,
                 kind="bullish",
+                start_ts=a.ts,
             ))
         elif c.high < a.low:
             out.append(Fvg(
@@ -417,6 +434,7 @@ def _scan_fvgs_in_session(bars: List[Bar]) -> List[Fvg]:
                 top=a.low,
                 bottom=c.high,
                 kind="bearish",
+                start_ts=a.ts,
             ))
     return out
 

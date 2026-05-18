@@ -320,10 +320,13 @@ def test_only_first_bearish_fvg_is_used_for_inv():
         _bar(8000, 116, 117, 115, 116),    # body=[115, 116] > 114 → INV vs FVG#1
     ]
     state, events = _replay(zone, bars)
-    inv = [e for e in events if e.kind == "INV"]
-    assert len(inv) == 1
-    assert inv[0].fvg.top == 114.0
-    assert inv[0].fvg.bottom == 110.0
+    # b8 also opens a bull FVG, so INV + STB compose in the same cycle and
+    # only STB surfaces — the point here is that the FIRST bear FVG
+    # (114/110) is the one locked, not the later one.
+    assert state.first_bear_fvg is not None
+    assert state.first_bear_fvg.top == 114.0
+    assert state.first_bear_fvg.bottom == 110.0
+    assert state.inv_fired is True
 
 
 # --- 9. Fire on first observation of a closed-bar trigger --------------------
@@ -416,10 +419,10 @@ def test_inv_fires_after_wick_break_using_preserved_bear_fvg():
         _bar(6000, 109, 110, 108, 109.5),  # body 108..109.5 > 107 → INV
     ]
     state, events = _replay(zone, bars)
-    inv = [e for e in events if e.kind == "INV"]
-    assert len(inv) == 1
-    assert inv[0].trigger_ts == 6000
+    # b6 also opens a bull FVG → INV + STB compose together, STB surfaces;
+    # the preserved bear FVG still drives the inversion.
     assert state.inv_fired is True
+    assert state.inv_at_ts == 6000
     assert state.swing_low == 100.0
 
 
@@ -586,13 +589,14 @@ def test_stb_composes_when_cre_precedes_inv_with_no_window():
     assert "CRE" not in kinds          # CRE frozen as a standalone event
     assert state.cre_fired is True
     assert state.cre_at_ts == 7000
-    assert kinds.count("INV") == 1
+    # INV + STB compose in the same cycle → INV is suppressed, only the
+    # STB alert surfaces (no duplicate).
+    assert kinds.count("INV") == 0
     assert kinds.count("STB") == 1
     assert state.state == "STB"
-    inv_e = next(e for e in events if e.kind == "INV")
+    assert state.inv_at_ts == 13000
     stb_e = next(e for e in events if e.kind == "STB")
-    assert inv_e.trigger_ts == 13000
-    assert stb_e.trigger_ts == max(inv_e.trigger_ts, state.cre_at_ts)
+    assert stb_e.trigger_ts == max(state.inv_at_ts, state.cre_at_ts)
 
 
 # --- 13. OTE invalidation (body close below the 0.85 level) ------------------
@@ -632,3 +636,41 @@ def test_ote_not_invalidated_on_wick_below_085():
     state, events = _replay(zone, bars)
     assert state.ote_invalidated is False
     assert state.cre_fired is True
+
+
+# --- CRE re-anchors when a wick break slides swing_low to a later bar --------
+
+def test_cre_reselected_when_wick_break_moves_swing_low():
+    """A bull FVG locked while swing_low sat earlier must be dropped once a
+    wick break slides swing_low to a later bar. CRE is the first bull FVG
+    formed AFTER the low — never one left of it."""
+    zone = _bullish_ote()
+    bars = [
+        _bar(1000, 105, 106, 104, 105),
+        _bar(2000, 105, 107, 104.5, 106),
+        _bar(3000, 107, 108, 106.5, 107.5),  # bull FVG #1 (b1.high 106 < 106.5)
+        _bar(4000, 105, 106, 102, 104.5),    # wick break: low 102 < 104, body holds
+        _bar(5000, 105, 107, 104, 106),
+        _bar(6000, 108, 109, 107.5, 108),    # bull FVG #2 (b4.high 106 < 107.5)
+    ]
+    state, _ = _replay(zone, bars)
+    assert state.swing_low == 102.0
+    assert state.swing_low_ts == 4000
+    assert state.first_bull_fvg is not None
+    # The stale FVG #1 (ts 3000) predates the low — CRE must be FVG #2.
+    assert state.first_bull_fvg.formed_at_ts == 6000
+    assert state.first_bull_fvg.formed_at_ts > state.swing_low_ts
+
+
+def test_fvg_carries_start_ts_of_first_forming_bar():
+    """The FVG box anchor (start_ts) is bar i-2, not the confirming bar."""
+    zone = _bullish_ote()
+    bars = [
+        _bar(1000, 105, 106, 104, 105),
+        _bar(2000, 105, 107, 104.5, 106),
+        _bar(3000, 107, 108, 106.5, 107.5),  # bull FVG: a=b1, c=b3
+    ]
+    state, _ = _replay(zone, bars)
+    assert state.first_bull_fvg is not None
+    assert state.first_bull_fvg.start_ts == 1000          # bar i-2
+    assert state.first_bull_fvg.formed_at_ts == 3000      # bar i
