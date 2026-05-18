@@ -1106,10 +1106,13 @@ export function CandleChart({
                     // limit; setup FVGs are always drawn.
                     if (!fv.setup && (!fvgOn || i < fvgThreshold)) continue;
                     const x1 = safeTimeX(fv.ts);
-                    const x2 = safeTimeX(fv.end_ts);
                     const yTop = safePriceY(fv.top);
                     const yBot = safePriceY(fv.bottom);
-                    if (x1 == null || x2 == null || yTop == null || yBot == null) continue;
+                    if (x1 == null || yTop == null || yBot == null) continue;
+                    // The box extends to its most-recent bar; when end_ts
+                    // sits past the last candle (timeToCoordinate fails)
+                    // fall back to the right edge instead of dropping it.
+                    const x2 = safeTimeX(fv.end_ts) ?? mediaSize.width;
                     const left = Math.max(0, Math.min(x1, x2));
                     const right = Math.min(mediaSize.width, Math.max(x1, x2));
                     const width = right - left;
