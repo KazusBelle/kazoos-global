@@ -2,8 +2,10 @@
 Worker entry-point.
 
 Responsibilities:
-- Periodically (every REFRESH_INTERVAL_SEC) pull the list of active coins
-  from Postgres.
+- Wake on every M5 candle boundary (+close_check_delay_sec) and process the
+  alert timeframes whose candle just closed: H1-M5 every 5m, H1 every 15m,
+  D1 (H1-confirmation) every hour. A full re-check of all timeframes runs
+  on startup and after any missed tick as a safety net.
 - For each coin fetch D1 and H1 klines from Binance Futures and compute
   the KazusGlobal (D1) + KazusLocal (H1) snapshot.
 - Upsert the result into `snapshots`.
@@ -19,8 +21,8 @@ import asyncio
 import json
 import logging
 import signal
-from datetime import datetime, timezone
-from typing import Iterable, List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Iterable, List, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -30,6 +32,7 @@ from kazus_logic.compute import (
     ALERT_TF_H1,
     ALERT_TF_H1_M5,
     ALL_ALERT_TFS,
+    M5_SYMBOLS,
     SymbolSnapshot,
     compute_symbol,
     screener_label_for,
@@ -46,21 +49,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("kazus.worker")
 
 
-async def run_once(client: BinanceFuturesClient, renderer: ChartRenderer, settings) -> None:
+async def run_once(
+    client: BinanceFuturesClient,
+    renderer: ChartRenderer,
+    settings,
+    due_tfs: Set[str],
+) -> None:
+    """Process one wake-up.
+
+    ``due_tfs`` is the set of alert timeframes whose candle just closed —
+    only those are dispatched. When the only due timeframe is H1-M5 the
+    coin list is narrowed to M5_SYMBOLS, since H1-M5 setups exist only for
+    BTC/ETH/SOL and there is nothing else to check on a bare 5m boundary.
+    """
     with SessionLocal() as db:
         coins: list[str] = [
             c.symbol
             for c in db.query(Coin).filter(Coin.is_active.is_(True)).order_by(Coin.symbol.asc()).all()
         ]
 
+    # A bare M5 boundary only concerns the H1-M5 timeframe, which is
+    # BTC/ETH/SOL-only — skip every other coin entirely.
+    if due_tfs == {ALERT_TF_H1_M5}:
+        coins = [c for c in coins if c in M5_SYMBOLS]
+
     if not coins:
-        logger.info("no active coins — skipping cycle")
+        logger.info("no coins due this tick — skipping")
         _touch_status(None)
         return
 
+    # Dispatch is gated to the timeframes that are both enabled and due.
     alert_timeframes = {
         t.strip() for t in settings.alert_timeframes.split(",") if t.strip()
-    }
+    } & due_tfs
 
     last_error: str | None = None
     for symbol in coins:
@@ -297,9 +318,37 @@ def _touch_status(last_error: str | None) -> None:
         db.commit()
 
 
+def _next_m5_boundary(now: datetime) -> datetime:
+    """First M5 candle boundary strictly after ``now`` (UTC, seconds zeroed).
+
+    Anchored to the top of the hour so it stays correct across the hour
+    rollover (top-of-hour + N*5min)."""
+    base = now.replace(minute=0, second=0, microsecond=0)
+    elapsed = now - base
+    slot = elapsed // timedelta(minutes=5) + 1
+    return base + slot * timedelta(minutes=5)
+
+
+def _due_timeframes(boundary: datetime) -> Set[str]:
+    """Alert timeframes whose candle closes at this M5 boundary.
+
+    H1-M5 closes on every 5m boundary, H1 every 15m, D1 (H1-confirmation)
+    on the hour. Simultaneous closes at :00 simply yield all three — they
+    are processed sequentially in one pass, never concurrently."""
+    due: Set[str] = {ALERT_TF_H1_M5}
+    if boundary.minute % 15 == 0:
+        due.add(ALERT_TF_H1)
+    if boundary.minute == 0:
+        due.add(ALERT_TF_D1)
+    return due
+
+
 async def main() -> None:
     settings = get_settings()
-    logger.info("worker starting; refresh every %ss", settings.refresh_interval_sec)
+    logger.info(
+        "worker starting; M5-boundary scheduler, close delay %ss",
+        settings.close_check_delay_sec,
+    )
 
     stop_event = asyncio.Event()
 
@@ -317,18 +366,39 @@ async def main() -> None:
 
     client = BinanceFuturesClient()
     renderer = ChartRenderer(settings)
+    # A tick gap wider than this means a boundary was missed (slow cycle,
+    # restart, API outage) — the next tick then re-checks every timeframe.
+    gap_threshold = timedelta(minutes=7)
+    last_tick: datetime | None = None
+    first_run = True
     try:
         while not stop_event.is_set():
+            now = datetime.now(timezone.utc)
+            boundary = _next_m5_boundary(now)
+            target = boundary + timedelta(seconds=settings.close_check_delay_sec)
+            wait_s = (target - now).total_seconds()
+            if wait_s > 0:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=wait_s)
+                    break  # stop signalled while waiting
+                except asyncio.TimeoutError:
+                    pass
+
+            tick = datetime.now(timezone.utc)
+            due_tfs = _due_timeframes(boundary)
+            # Safety net: on startup or after a missed boundary, fall back
+            # to a full re-check of every timeframe so no setup is lost.
+            if first_run or (last_tick is not None and tick - last_tick > gap_threshold):
+                logger.info("full re-check (startup or missed tick)")
+                due_tfs = set(ALL_ALERT_TFS)
+
             try:
-                await run_once(client, renderer, settings)
+                await run_once(client, renderer, settings, due_tfs)
             except Exception as exc:
                 logger.exception("cycle failed: %s", exc)
-            try:
-                await asyncio.wait_for(
-                    stop_event.wait(), timeout=settings.refresh_interval_sec
-                )
-            except asyncio.TimeoutError:
-                continue
+
+            last_tick = tick
+            first_run = False
     finally:
         await renderer.close()
         await client.close()

@@ -295,3 +295,47 @@ def test_persist_and_load_setup_state_roundtrip(runner_with_sqlite):
     assert r.first_bear_fvg.top == 107.0
     assert r.first_bull_fvg.kind == "bullish"
     assert r.inv_fired and r.cre_fired and r.stb_fired
+
+
+# ── M5-boundary scheduler ───────────────────────────────────────────────
+
+
+def test_next_m5_boundary_rounds_up_and_rolls_over_hour():
+    from datetime import datetime, timezone
+
+    runner_mod = _load_worker_runner()
+    nb = runner_mod._next_m5_boundary
+
+    # Mid-slot → next 5m mark.
+    assert nb(datetime(2026, 5, 18, 19, 17, 30, tzinfo=timezone.utc)) == datetime(
+        2026, 5, 18, 19, 20, 0, tzinfo=timezone.utc
+    )
+    # Exactly on a boundary → the NEXT one (strictly after).
+    assert nb(datetime(2026, 5, 18, 19, 15, 0, tzinfo=timezone.utc)) == datetime(
+        2026, 5, 18, 19, 20, 0, tzinfo=timezone.utc
+    )
+    # Last slot of the hour rolls into the next hour.
+    assert nb(datetime(2026, 5, 18, 19, 58, 0, tzinfo=timezone.utc)) == datetime(
+        2026, 5, 18, 20, 0, 0, tzinfo=timezone.utc
+    )
+
+
+def test_due_timeframes_by_boundary_minute():
+    from datetime import datetime, timezone
+
+    runner_mod = _load_worker_runner()
+    dt = runner_mod._due_timeframes
+
+    def at(minute):
+        return dt(datetime(2026, 5, 18, 19, minute, 0, tzinfo=timezone.utc))
+
+    # Bare 5m boundary → only H1-M5.
+    assert at(5) == {"H1-M5"}
+    assert at(10) == {"H1-M5"}
+    # 15m boundary → H1-M5 + H1.
+    assert at(15) == {"H1-M5", "H1"}
+    assert at(45) == {"H1-M5", "H1"}
+    # Top of hour → all three close simultaneously.
+    assert dt(datetime(2026, 5, 18, 19, 0, 0, tzinfo=timezone.utc)) == {
+        "H1-M5", "H1", "D1",
+    }

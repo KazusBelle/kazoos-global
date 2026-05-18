@@ -9,7 +9,11 @@ class WorkerSettings(BaseSettings):
     )
 
     database_url: str = "postgresql+psycopg://kazus:kazus@db:5432/kazus"
-    refresh_interval_sec: int = 300
+    # The worker wakes on every M5 candle boundary (see runner.main). This
+    # delay is added after the boundary so Binance has finalised the closed
+    # candle before we fetch. Kept small — must stay well under a minute.
+    close_check_delay_sec: int = 10
+    refresh_interval_sec: int = 300  # retained for config compatibility
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     alert_timeframes: str = "D1,H1,H1-M5"  # comma-separated
