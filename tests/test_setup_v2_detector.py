@@ -5,6 +5,14 @@ Unit tests for the new long-only INV/CRE/STB detector
 The detector is designed to be called once per worker cycle on the current
 window of closed LTF bars, with the SetupState from the previous cycle
 threaded through. Tests simulate this by replaying bars one at a time.
+
+Canonical bearish-FVG-at-swing-low fixture used across the file:
+    _bar(1000, 108, 109, 107, 108),  # enter OTE
+    _bar(2000, 108, 109, 107, 108),  # FVG bar A (i-2): low 107
+    _bar(3000, 107, 107, 103, 104),  # bar B = swing low (low 103)
+    _bar(4000, 105, 106, 104, 105),  # FVG bar C: high 106 < A.low 107
+The displacement bearish FVG (middle bar = the swing-low bar) is top=107,
+bottom=106. INV fires on the first later bar whose CLOSE > 107.
 """
 
 from __future__ import annotations
@@ -82,16 +90,16 @@ def test_returns_no_when_no_bars_in_ote():
     assert events == []
 
 
-# --- 2. INV fires when body closes above first bearish FVG -------------------
+# --- 2. INV fires when a candle CLOSES above the displacement bear FVG -------
 
-def test_inv_fires_on_body_close_above_first_bear_fvg():
+def test_inv_fires_on_close_above_bear_fvg():
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),   # enter OTE
-        _bar(2000, 108, 109, 107, 108),   # filler (i-2 for FVG anchor)
-        _bar(3000, 107, 108, 105, 106),   # mid bar of 3-bar pattern
-        _bar(4000, 104, 105, 103, 103.5), # bearish FVG forms: bar[3].high=105 < bar[1].low=107
-        _bar(5000, 109, 110, 108, 109.5), # body=[108, 109.5], top of FVG=107 → body_low=108 > 107 → INV
+        _bar(2000, 108, 109, 107, 108),   # FVG bar A (i-2): low 107
+        _bar(3000, 107, 107, 103, 104),   # swing low (bar B)
+        _bar(4000, 105, 106, 104, 105),   # FVG bar C → bear FVG top=107, bottom=106
+        _bar(5000, 108, 110, 107, 109),   # close 109 > 107 → INV
     ]
     state, events = _replay(zone, bars)
     assert state.state == "INV"
@@ -100,7 +108,7 @@ def test_inv_fires_on_body_close_above_first_bear_fvg():
     assert inv[0].trigger_ts == 5000
     assert inv[0].fvg.kind == "bearish"
     assert inv[0].fvg.top == 107.0
-    assert inv[0].fvg.bottom == 105.0
+    assert inv[0].fvg.bottom == 106.0
     assert inv[0].event_id == "inv:TEST:M15:5000"
 
 
@@ -109,25 +117,25 @@ def test_inv_does_not_fire_twice_in_same_session():
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG
-        _bar(5000, 109, 110, 108, 109.5),  # INV
-        _bar(6000, 109, 110, 108, 109.5),  # body still above FVG, but already fired
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),  # bear FVG top=107
+        _bar(5000, 108, 110, 107, 109),  # INV
+        _bar(6000, 108, 110, 106, 109),  # close still above top, but already fired
     ]
     state, events = _replay(zone, bars)
     inv = [e for e in events if e.kind == "INV"]
     assert len(inv) == 1
 
 
-def test_inv_does_not_fire_when_body_only_touches_fvg_top():
-    """Spec: body must close STRICTLY above the FVG top."""
+def test_inv_does_not_fire_when_close_only_touches_fvg_top():
+    """Spec: the candle must CLOSE strictly above the FVG top."""
     zone = _bullish_ote()
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG: top=107, bottom=105
-        _bar(5000, 107, 108, 106, 107),    # body=[107,107]; body_low=107 NOT > 107
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),  # bear FVG: top=107, bottom=106
+        _bar(5000, 106, 108, 106, 107),  # close=107 NOT strictly > 107
     ]
     state, events = _replay(zone, bars)
     assert state.state == "NO"
@@ -158,17 +166,16 @@ def test_cre_detection_is_internal_only_no_event_no_state():
 # --- 4. STB sequences --------------------------------------------------------
 
 def test_stb_fires_after_inv_then_cre():
-    """All bars stay inside OTE [100, 110]; INV at bar 5000 then bullish
-    FVG at bar 6000 (i-2 anchor=bar4.high=105) → STB on the same bar.
-    CRE is frozen, so the event stream is INV then STB (no CRE event)."""
+    """INV at bar 5000 then a bullish FVG at bar 6000 → STB on the same
+    bar. CRE is frozen, so the event stream is INV then STB (no CRE)."""
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
-        _bar(1000, 108, 109, 107, 108),    # enter
+        _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG (top=107, bottom=105)
-        _bar(5000, 109, 110, 108, 109.5),  # INV (body 108..109.5 > 107)
-        _bar(6000, 108, 109.5, 108, 109),  # bullish FVG: low=108 > bar4.high=105 → STB
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),  # bear FVG (top=107, bottom=106)
+        _bar(5000, 108, 110, 107, 109),  # INV (close 109 > 107)
+        _bar(6000, 108, 109, 107, 108),  # bull FVG: low 107 > bar4.high 106 → STB
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
@@ -183,25 +190,15 @@ def test_stb_logic_is_order_agnostic_state_machine():
     session, regardless of which event fired first. Direct state-level
     check (bar-driven CRE-then-INV sequences are awkward to construct
     without inadvertently breaking swing_low; this validates the rule)."""
-    # Simulate post-CRE state: cre_fired=True, inv_fired=False.
     s = SetupState(
         state="CRE", session_id="sess1", search_start_ts=1000,
         swing_low=100.0, swing_low_ts=1000,
         first_bear_fvg=None,
-        first_bull_fvg=None,  # would have set this when CRE fired
+        first_bull_fvg=None,
         cre_fired=True, cre_at_ts=2000,
     )
-    # Now feed a sequence that also fires INV and stays in OTE without
-    # breaking swing_low. Because crafting this with bars requires a
-    # bear FVG to form AFTER the bull FVG without a deep retrace, we
-    # rely on the inv-first sequence symmetry: the state machine logic
-    # is shared. The test verifying state.stb_fired transitions when
-    # both flags become true is the inv-then-cre test above.
-    # Here we just sanity-check the final-state computation.
     s.inv_fired = True
     s.inv_at_ts = 3000
-    # Replicate the STB-firing block from detect_setup (small enough to
-    # inline for a clean unit-level check):
     if s.inv_fired and s.cre_fired and not s.stb_fired:
         s.stb_fired = True
     if s.stb_fired:
@@ -215,50 +212,37 @@ def test_stb_logic_is_order_agnostic_state_machine():
 def test_swing_low_break_wipes_event_flags():
     zone = _bullish_ote(ote_low=95.0, ote_high=110.0)
     bars = [
-        _bar(1000, 108, 109, 107, 108),    # enter
+        _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG forms; session swing_low=103
-        _bar(5000, 109, 110, 108, 109.5),  # INV fires
-        _bar(6000, 100, 101, 96, 97),      # low=96 < swing_low(103) → RESET
+        _bar(3000, 107, 107, 103, 104),  # swing low = 103
+        _bar(4000, 105, 106, 104, 105),  # bear FVG top=107
+        _bar(5000, 108, 110, 107, 109),  # INV fires
+        _bar(6000, 100, 101, 96, 97),    # body close 97 < swing_low(103) → RESET
     ]
     state, events = _replay(zone, bars)
     inv = [e for e in events if e.kind == "INV"]
     assert len(inv) == 1  # already-fired INV stays in history
-    # After reset, state.state should be NO again.
     assert state.state == "NO"
     assert state.swing_low == 96.0
     assert state.inv_fired is False
-    # search_start_ts advanced to the breaking bar's ts; any pre-reset
-    # FVG must be ineligible. The breaking bar 6000 itself happens to
-    # form a new bearish FVG vs bar 4000 (b4.low=103 > b6.high=101) —
-    # that's the new arc's first bearish FVG, top=103, bottom=101.
+    # search_start_ts advanced to the breaking bar. The bear FVG is only
+    # recorded when INV fires; after the reset no later bar inverts
+    # anything, so first_bear_fvg stays cleared.
     assert state.search_start_ts == 6000
-    assert state.first_bear_fvg is not None
-    assert state.first_bear_fvg.formed_at_ts >= 6000
-    assert state.first_bear_fvg.top == 103.0
-    assert state.first_bear_fvg.bottom == 101.0
+    assert state.first_bear_fvg is None
 
 
-def test_inv_can_fire_again_after_reset():
+def test_inv_flags_clear_after_reset():
     zone = _bullish_ote(ote_low=95.0, ote_high=110.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG #1
-        _bar(5000, 109, 110, 108, 109.5),  # INV #1
-        _bar(6000, 100, 101, 96, 97),      # break swing_low → reset
-        _bar(7000, 99, 100, 98, 99),       # i-2 for new FVG
-        _bar(8000, 98, 99, 97, 97.5),      # mid
-        _bar(9000, 96, 97, 95.5, 96),      # bearish FVG #2: high=97 < bar[6].low=96 (low=96, not 98) — adjust
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),  # bear FVG top=107
+        _bar(5000, 108, 110, 107, 109),  # INV
+        _bar(6000, 100, 101, 96, 97),    # break swing_low → reset
     ]
-    # Note: the reset bar's own low becomes the new swing_low, so subsequent
-    # FVGs and triggers are measured against that. This test just asserts
-    # that after reset, state.inv_fired flips back to False (already covered
-    # in test_swing_low_break_wipes_event_flags). The full INV-fire-after-reset
-    # geometry is exercised in dedicated bar sequences in CLI backtest.
-    state, _ = _replay(zone, bars[:6])
+    state, _ = _replay(zone, bars)
     assert state.inv_fired is False
 
 
@@ -269,9 +253,9 @@ def test_new_ote_zone_starts_fresh_session():
     bars1 = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),
-        _bar(5000, 109, 110, 108, 109.5),
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),
+        _bar(5000, 108, 110, 107, 109),  # INV
     ]
     state1, events1 = _replay(zone1, bars1)
     assert any(e.kind == "INV" for e in events1)
@@ -302,43 +286,60 @@ def test_cre_alone_without_inv_produces_nothing():
     assert state.cre_fired is True
 
 
-# --- 8. First-FVG locking — later same-kind FVGs are ignored -----------------
+# --- 8. Bear FVG = the bearish FVG nearest the swing low ---------------------
+# Counting up from the low, the INV anchor is the first bearish FVG of the
+# last impulse down. When two descent gaps sit around the low the nearer
+# one wins — regardless of whether the low is its middle or its 3rd bar.
 
-def test_only_first_bearish_fvg_is_used_for_inv():
-    """Two bearish FVGs form within one search arc (no swing_low break).
-    The detector must lock onto the FIRST and use it for INV. Bars are
-    chosen so swing_low (108 after b4) stays intact through b7."""
-    zone = _bullish_ote(ote_low=80.0, ote_high=120.0)
+def test_bear_fvg_is_nearest_descent_fvg_to_low():
+    """Two bearish FVGs sit around the low: FVG-X (formed earlier, a bar
+    higher) and FVG-Y (nearer the low). The detector anchors INV to the
+    nearer one, FVG-Y."""
+    zone = _bullish_ote(ote_low=95.0, ote_high=120.0)
     bars = [
-        _bar(1000, 115, 116, 114, 115),    # entry, swing=114
-        _bar(2000, 115, 116, 114, 115),
-        _bar(3000, 114, 115, 110, 112),    # swing=110
-        _bar(4000, 109, 110, 108, 108.5),  # bearish FVG #1: b2.low=114 > b4.high=110 → top=114, bottom=110
-        _bar(5000, 109, 110, 109, 109.5),
-        _bar(6000, 109, 110, 109, 109.5),
-        _bar(7000, 108.5, 108.8, 108, 108.5),  # bearish FVG #2: b5.low=109 > b7.high=108.8 → top=109, bottom=108.8 (IGNORED)
-        _bar(8000, 116, 117, 115, 116),    # body=[115, 116] > 114 → INV vs FVG#1
+        _bar(1000, 110, 111, 109, 110),    # idx0 — FVG-X i-2
+        _bar(2000, 108, 109, 107, 108),    # idx1 — FVG-Y i-2 / FVG-X mid
+        _bar(3000, 105, 105, 100, 101),    # idx2 — swing low
+        _bar(4000, 103, 106, 103, 104),    # idx3 — high 106 < bar2.low 107 → FVG-Y
+        _bar(5000, 109, 110, 105, 109.5),  # close 109.5 > FVG-Y top 107 → INV
     ]
     state, events = _replay(zone, bars)
-    # b8 also opens a bull FVG, so INV + STB compose in the same cycle and
-    # only STB surfaces — the point here is that the FIRST bear FVG
-    # (114/110) is the one locked, not the later one.
+    # FVG-Y (nearer the low) — top = bar2.low 107, bottom = bar4.high 106.
     assert state.first_bear_fvg is not None
-    assert state.first_bear_fvg.top == 114.0
-    assert state.first_bear_fvg.bottom == 110.0
+    assert state.first_bear_fvg.top == 107.0
+    assert state.first_bear_fvg.bottom == 106.0
     assert state.inv_fired is True
+    assert state.state == "INV"
+
+
+def test_bear_fvg_anchor_works_when_low_is_its_third_bar():
+    """The swing-low candle is the FVG's 3rd (last) bar, not its middle.
+    The detector still anchors INV to it — 'low = middle bar' is not a
+    requirement."""
+    zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
+    bars = [
+        _bar(1000, 110, 111, 109, 110),  # idx0
+        _bar(2000, 108, 109, 107, 108),  # idx1
+        _bar(3000, 105, 105, 100, 101),  # idx2 — swing low = FVG 3rd bar
+        _bar(4000, 103, 108, 102, 107),  # idx3 — high 108 ≥ bar2.low 107 → no nearer FVG
+        _bar(5000, 110, 112, 105, 111),  # close 111 > FVG top 109 → INV
+    ]
+    state, events = _replay(zone, bars)
+    assert state.first_bear_fvg is not None
+    assert state.first_bear_fvg.top == 109.0
+    assert state.first_bear_fvg.bottom == 105.0
+    assert state.inv_fired is True
+    assert state.state == "INV"
 
 
 # --- 9. Fire on first observation of a closed-bar trigger --------------------
 # Worker polls every few minutes while LTF candles close every 15m, and
 # restarts/missed cycles are normal. A still-valid setup whose trigger bar
-# closed before this cycle began must alert on first observation, not be
-# silently dropped because formed_at_ts != last_bar.ts.
+# closed before this cycle began must alert on first observation.
 
 def test_cre_recorded_on_first_observation_when_bull_fvg_was_formed_earlier():
     """Fresh start (prev_state=None) and the bullish FVG already exists in
-    the window — its formation bar is several bars before last_bar. CRE is
-    frozen: cre_fired is set but no event is emitted and state stays NO."""
+    the window. CRE is frozen: cre_fired is set but no event is emitted."""
     zone = _bullish_ote()
     bars = [
         _bar(1000, 105, 106, 104, 105),   # enter OTE
@@ -346,7 +347,7 @@ def test_cre_recorded_on_first_observation_when_bull_fvg_was_formed_earlier():
         _bar(3000, 105, 107, 104, 106),   # i-2 anchor for bullish FVG
         _bar(4000, 106, 108, 105, 107),
         _bar(5000, 108, 110, 108, 109),   # bullish FVG: bar[5].low=108 > bar[3].high=107
-        _bar(6000, 109, 110, 108, 109),   # several bars pass — worker still hasn't observed
+        _bar(6000, 109, 110, 108, 109),
         _bar(7000, 108, 109, 107, 108),
         _bar(8000, 108, 109, 107, 108),
     ]
@@ -357,20 +358,19 @@ def test_cre_recorded_on_first_observation_when_bull_fvg_was_formed_earlier():
     assert state.cre_at_ts == 5000
 
 
-def test_inv_fires_on_first_observation_when_body_close_was_earlier():
-    """Body-close-above-bear-FVG happened on a bar that is no longer the
-    last bar by the time the worker observes the session."""
+def test_inv_fires_on_first_observation_when_close_was_earlier():
+    """The inverting candle is no longer the last bar by the time the
+    worker observes the session."""
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
-        _bar(1000, 108, 109, 107, 108),    # enter OTE
+        _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bearish FVG: top=107, bottom=105
-        _bar(5000, 109, 110, 108, 109.5),  # body=[108, 109.5] > 107 → trigger
-        # subsequent bars must not break swing_low (=103) and must not
-        # accidentally form a bullish FVG (would upgrade INV→STB).
-        _bar(6000, 106, 107, 104, 106),    # low=104 ≤ bar[4].high=105 → no bull FVG
-        _bar(7000, 106, 107, 104, 106),    # low=104 ≤ bar[5].high=110 → no bull FVG
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),  # bear FVG: top=107
+        _bar(5000, 108, 110, 107, 109),  # close 109 > 107 → trigger
+        # trailing bars must not break swing_low (=103) nor form a bull FVG.
+        _bar(6000, 105, 106, 104, 105),
+        _bar(7000, 105, 106, 104, 105),
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
     inv = [e for e in events if e.kind == "INV"]
@@ -382,18 +382,17 @@ def test_inv_fires_on_first_observation_when_body_close_was_earlier():
 
 # --- 10. Wick-vs-body swing-low break ----------------------------------------
 # A bar that pokes below swing_low with a wick but closes its body at or
-# above swing_low is NOT a stop-setup event: swing_low slides down to the
-# new wick low but locked FVGs and fired flags are preserved. Only a body
-# close strictly below swing_low triggers the full reset.
+# above swing_low slides swing_low down without clearing locked anchors or
+# fired flags. Only a body close strictly below swing_low triggers a reset.
 
 def test_wick_only_break_moves_swing_low_without_clearing_setup():
     zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bear FVG locks; swing_low=103
-        _bar(5000, 109, 110, 108, 109.5),  # INV fires
+        _bar(3000, 107, 107, 103, 104),    # swing low = 103
+        _bar(4000, 105, 106, 104, 105),    # bear FVG top=107
+        _bar(5000, 108, 110, 107, 109),    # INV fires
         _bar(6000, 105, 108.5, 100, 108),  # wick to 100, body 105..108 ≥ 103
     ]
     state, events = _replay(zone, bars)
@@ -402,82 +401,47 @@ def test_wick_only_break_moves_swing_low_without_clearing_setup():
     assert state.inv_fired is True
     assert state.first_bear_fvg is not None
     assert state.first_bear_fvg.top == 107.0
-    assert state.search_start_ts == 4000   # body-break anchor unchanged
+    assert state.search_start_ts == 3000   # body-break anchor unchanged
     assert state.swing_low == 100.0         # swing_low slid down to new wick
     assert state.swing_low_ts == 6000
 
 
 def test_inv_fires_after_wick_break_using_preserved_bear_fvg():
-    """Wick break preserves bear FVG; a later body-reclaim still fires INV."""
+    """A wick break before INV preserves the locked bear FVG; a later
+    close-reclaim still fires INV against it."""
     zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),  # bear FVG: top=107, bottom=105
-        _bar(5000, 105, 109, 100, 105),    # wick 100; body close=105 (< bear_top)
-        _bar(6000, 109, 110, 108, 109.5),  # body 108..109.5 > 107 → INV
+        _bar(3000, 107, 107, 103, 104),  # swing low = 103
+        _bar(4000, 105, 106, 104, 105),  # bear FVG top=107 (locked here)
+        _bar(5000, 105, 109, 100, 105),  # wick 100; body close 105 (≤ bear_top)
+        _bar(6000, 108, 110, 107, 109),  # close 109 > 107 → INV
     ]
     state, events = _replay(zone, bars)
-    # b6 also opens a bull FVG → INV + STB compose together, STB surfaces;
-    # the preserved bear FVG still drives the inversion.
     assert state.inv_fired is True
     assert state.inv_at_ts == 6000
     assert state.swing_low == 100.0
 
 
-def test_wick_break_preserves_bear_fvg_outside_new_window():
-    """A chain of wick breaks can drag swing_low more than 5 bars below the
-    bear-FVG bar. Window check is at lock time only; an already-locked FVG
-    stays valid even if a fresh window would no longer include it."""
-    zone = _bullish_ote(ote_low=80.0, ote_high=115.0)
+# --- 11. No bearish FVG in the descent → INV stays unarmed -------------------
+# If the impulse down into the low left no bearish FVG at all, there is no
+# INV anchor and INV does not fire.
+
+def test_no_inv_when_descent_left_no_bear_fvg():
+    zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
-        _bar(1000, 108, 109, 107, 108),
-        _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),   # bear FVG locks at idx=3
-        _bar(5000, 105, 108, 100, 105),     # wick 100
-        _bar(6000, 105, 108, 99, 105),      # wick 99
-        _bar(7000, 105, 108, 98, 105),      # wick 98
-        _bar(8000, 105, 108, 97, 105),      # wick 97
-        _bar(9000, 105, 108, 96, 105),      # wick 96
-        _bar(10000, 105, 108, 95.5, 105),   # wick 95.5 — swing_low idx=9 > FVG idx+5
-    ]
-    state, _ = _replay(zone, bars)
-    assert state.first_bear_fvg is not None
-    assert state.first_bear_fvg.top == 107.0
-    assert state.first_bear_fvg.formed_at_idx == 3
-    assert state.swing_low == 95.5
-    assert state.search_start_ts == 4000
-
-
-# --- 11. Bear-FVG lookback window --------------------------------------------
-# A bear FVG that lies more than BEAR_FVG_LOOKBACK_BARS strictly before the
-# session swing_low must not be selected — INV stays unarmed until either
-# a fresh bear FVG appears in the window or a body-break creates a new
-# swing_low closer to an existing bear FVG.
-
-def test_inv_does_not_arm_when_bear_fvg_outside_lookback_window():
-    """Single-shot observation: bear FVG forms at idx=2 but a long chain of
-    wick breaks drags swing_low to idx=8 (distance 6 > 5). FVG must not
-    lock and INV must not fire even though body close later exceeds top."""
-    zone = _bullish_ote(ote_low=80.0, ote_high=115.0)
-    bars = [
-        _bar(1000, 110, 111, 109, 110.5),    # enter
-        _bar(2000, 109, 110, 107, 108),      # body break: body_low=108 < 109
-        _bar(3000, 108, 108.5, 107, 108),    # bear FVG at idx=2: top=109, bottom=108.5
-        _bar(4000, 108, 108.5, 106, 108),    # wick to 106
-        _bar(5000, 108, 108.5, 105, 108),    # wick 105
-        _bar(6000, 108, 108.5, 104, 108),    # wick 104
-        _bar(7000, 108, 108.5, 103, 108),    # wick 103
-        _bar(8000, 108, 108.5, 102, 108),    # wick 102
-        _bar(9000, 108, 108.5, 101, 108),    # wick 101 — swing_low idx=8, FVG idx=2
-        _bar(10000, 116, 117, 115, 116),     # body 116 > FVG top 109 (would-be INV)
+        _bar(1000, 108, 109, 107, 108),  # idx0 — gentle, overlapping descent
+        _bar(2000, 107, 108, 106, 107),  # idx1
+        _bar(3000, 106, 107, 105, 106),  # idx2
+        _bar(4000, 105, 106, 104, 105),  # idx3 — swing low, no 3-bar gap
+        _bar(5000, 107, 109, 106, 108),  # idx4 — bounce
+        _bar(6000, 109, 111, 108, 110),  # idx5 — close 110, but no anchor
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
     assert state.first_bear_fvg is None
-    inv = [e for e in events if e.kind == "INV"]
-    assert inv == []
+    assert state.inv_fired is False
+    assert [e.kind for e in events if e.kind == "INV"] == []
 
 
 # --- 12. STB composition (INV→CRE window + same-arc rule) --------------------
@@ -494,11 +458,11 @@ def test_stb_fires_when_cre_within_3bar_window_after_inv():
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
-        _bar(5000, 109, 110, 108, 109.5),     # INV at idx=4
-        _bar(6000, 106, 108, 104, 107),       # filler: no bull FVG (low=104 ≤ bar3.high=105)
-        _bar(7000, 111, 112, 110.5, 111.5),   # bull FVG at idx=6 (low=110.5 > bar4.high=110)
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),      # bear FVG: top=107
+        _bar(5000, 107.5, 108, 107, 108),    # INV at idx=4 (close 108 > 107)
+        _bar(6000, 107, 108, 106, 107),      # filler: no bull FVG
+        _bar(7000, 109, 110, 108.5, 109),    # bull FVG at idx=6 (inv+2)
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
@@ -518,15 +482,15 @@ def test_stb_does_not_compose_when_cre_forms_after_3bar_window():
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),   # bear FVG: top=107, bottom=105
-        _bar(5000, 109, 110, 108, 109.5),   # INV at idx=4
-        _bar(6000, 106, 108, 104, 107),     # filler: no bull FVG (low=104 ≤ bar3.high=105)
-        _bar(7000, 106, 108, 104, 107),     # filler
-        _bar(8000, 106, 108, 104, 107),     # filler
-        _bar(9000, 106, 108, 104, 107),     # filler
-        _bar(10000, 106, 108, 104, 107),    # filler
-        _bar(11000, 109.5, 111, 109, 110),  # bull FVG at idx=10 (low=109 > bar8.high=108)
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),      # bear FVG: top=107
+        _bar(5000, 107.5, 108, 107, 108),    # INV at idx=4
+        _bar(6000, 107, 108, 106, 107),      # filler
+        _bar(7000, 107, 108, 106, 107),      # filler
+        _bar(8000, 107, 108, 106, 107),      # filler
+        _bar(9000, 107, 108, 106, 107),      # filler
+        _bar(10000, 107, 108, 106, 107),     # filler
+        _bar(11000, 109, 110, 108.5, 109),   # bull FVG at idx=10 (inv+6)
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
@@ -546,13 +510,13 @@ def test_stb_no_catch_up_when_window_already_elapsed_on_first_observation():
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
-        _bar(5000, 109, 110, 108, 109.5),     # INV at idx=4
-        _bar(6000, 106, 108, 104, 107),       # filler: no bull FVG
-        _bar(7000, 111, 112, 110.5, 111.5),   # bull FVG at idx=6 (inv+2, inside window)
-        _bar(8000, 111, 112, 110, 111),       # filler past the window
-        _bar(9000, 111, 112, 110, 111),       # last bar idx=8 → window elapsed
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),      # bear FVG: top=107
+        _bar(5000, 107.5, 108, 107, 108),    # INV at idx=4
+        _bar(6000, 107, 108, 106, 107),      # filler
+        _bar(7000, 109, 110, 108.5, 109),    # bull FVG at idx=6 (inv+2, inside window)
+        _bar(8000, 109, 110, 108, 109),      # filler past the window
+        _bar(9000, 109, 110, 108, 109),      # last bar idx=8 → window elapsed
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
     kinds = [e.kind for e in events]
@@ -572,25 +536,24 @@ def test_stb_composes_when_cre_precedes_inv_with_no_window():
     bars = [
         _bar(1000, 108, 109, 107, 108),
         _bar(2000, 108, 109, 107, 108),
-        _bar(3000, 107, 108, 105, 106),
-        _bar(4000, 104, 105, 103, 103.5),     # bear FVG: top=107, bottom=105
-        _bar(5000, 104, 105, 104, 104),
-        _bar(6000, 105, 106, 104, 105.5),
-        _bar(7000, 106, 107, 105.5, 106.5),   # bull FVG at idx=6 (low=105.5 > bar4.high=105)
-        _bar(8000, 106, 107, 105, 106),       # filler: body < 107, low > swing_low
-        _bar(9000, 106, 107, 105, 106),       # filler
-        _bar(10000, 106, 107, 105, 106),      # filler
-        _bar(11000, 106, 107, 105, 106),      # filler
-        _bar(12000, 106, 107, 105, 106),      # filler
-        _bar(13000, 109, 110, 108, 109.5),    # body 108..109.5 > 107 → INV at idx=12
+        _bar(3000, 107, 107, 103, 104),
+        _bar(4000, 105, 106, 104, 105),     # bear FVG: top=107
+        _bar(5000, 105, 106, 104, 105),     # idx=4
+        _bar(6000, 106, 107, 105, 106),     # idx=5
+        _bar(7000, 107, 107, 106.5, 107),   # bull FVG at idx=6 (low 106.5 > bar5000.high 106)
+        _bar(8000, 106, 107, 105, 106),     # filler
+        _bar(9000, 106, 107, 105, 106),     # filler
+        _bar(10000, 106, 107, 105, 106),    # filler
+        _bar(11000, 106, 107, 105, 106),    # filler
+        _bar(12000, 106, 107, 105, 106),    # filler
+        _bar(13000, 108, 110, 107, 109),    # close 109 > 107 → INV at idx=12
     ]
     state, events = _replay(zone, bars)
     kinds = [e.kind for e in events]
     assert "CRE" not in kinds          # CRE frozen as a standalone event
     assert state.cre_fired is True
     assert state.cre_at_ts == 7000
-    # INV + STB compose in the same cycle → INV is suppressed, only the
-    # STB alert surfaces (no duplicate).
+    # INV + STB compose in the same cycle → INV is suppressed, only STB.
     assert kinds.count("INV") == 0
     assert kinds.count("STB") == 1
     assert state.state == "STB"
@@ -605,9 +568,6 @@ def test_stb_composes_when_cre_precedes_inv_with_no_window():
 # ~96.51 (per _invalidation_price). Recovery needs a fresh OTE level.
 
 def test_ote_invalidated_when_body_closes_below_085_level():
-    """A body close below the 0.85 level kills the OTE level: the detector
-    returns NO and stays there even though later bars climb back into the
-    band and would otherwise form a setup."""
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
         _bar(1000, 105, 106, 104, 105),   # enter OTE
@@ -623,8 +583,6 @@ def test_ote_invalidated_when_body_closes_below_085_level():
 
 
 def test_ote_not_invalidated_on_wick_below_085():
-    """A wick below the 0.85 level with the body closing above it does not
-    kill the level — only a body close below does."""
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
         _bar(1000, 105, 106, 104, 105),

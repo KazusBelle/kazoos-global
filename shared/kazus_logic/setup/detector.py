@@ -6,11 +6,13 @@ previous SetupState; returns the new state plus any events that fired
 this cycle.
 
 Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
-  INV — bearish FVG formed within BEAR_FVG_LOOKBACK_BARS strictly before
-        the session swing_low (inclusive of the swing_low bar); fires when
-        an LTF candle later closes its body above that FVG's top. If no
-        bear FVG sits inside that window the setup is unarmed until a new
-        swing_low appears.
+  INV — anchored to the bearish FVG nearest the swing low in the last
+        impulse down: counting up from the low, the first bearish FVG of
+        that descent (its gaps complete no later than one bar after the
+        low). The swing-low candle need not be that FVG's middle bar.
+        Fires when a later LTF candle CLOSES strictly above that FVG's
+        top — the close confirms the inversion; the candle may open
+        inside the FVG.
   CRE — first bullish FVG of the reaction off the swing_low, i.e. the
         first bullish FVG whose formation bar lies strictly AFTER the
         current swing_low bar; fires on the formation bar itself (no
@@ -88,11 +90,6 @@ from typing import List, Optional, Tuple
 from ..engine import Bar, OTE_HIGH, OTE_LOW, ZoneResult
 from .types import Fvg, SetupEvent, SetupState
 
-
-# A bearish FVG qualifies as an INV anchor only if its formation bar lies
-# within this many bars strictly BEFORE the current swing_low bar (the
-# swing_low bar itself is the right edge and is inclusive).
-BEAR_FVG_LOOKBACK_BARS = 5
 
 # Once INV has fired, a CRE that forms AFTER the inversion bar has at
 # most this many LTF-candle closes to fully form: the bull FVG's closing
@@ -176,20 +173,34 @@ def detect_setup(
 
     swing_low_idx = _idx_of_ts(session_bars, state.swing_low_ts)
 
-    # Bear FVG selection — must lie inside the lookback window ending at
-    # the current swing_low bar. Once locked, the bear FVG is kept across
-    # wick-only swing_low updates (which can shift the window away from
-    # the FVG). Only a body-break clears it via the full state reset.
-    if state.first_bear_fvg is None and swing_low_idx is not None:
-        lo_idx = max(0, swing_low_idx - BEAR_FVG_LOOKBACK_BARS)
-        state.first_bear_fvg = next(
-            (
-                f
-                for f in eligible_fvgs
-                if f.kind == "bearish"
-                and lo_idx <= f.formed_at_idx <= swing_low_idx
-            ),
-            None,
+    # Bear FVG (INV anchor) selection — counting up from the swing low,
+    # the nearest bearish FVG of the last impulse down into that low. The
+    # descent's bearish gaps complete no later than one bar after the low
+    # (the gap straddling the low closes there); among those the one
+    # nearest the low — largest formed_at_idx — is the anchor. The
+    # swing-low candle need NOT be that FVG's middle bar: it may be the
+    # FVG's 3rd bar instead (anchor sitting a bar higher) — that case is
+    # covered by the same rule, no special branch. Once locked the anchor
+    # is kept across wick-only swing_low updates; a body-break clears it
+    # via the full state reset. Selection waits until the bar after the
+    # low has closed (last_idx >= swing_low_idx + 1) so the whole descent
+    # — including the gap that straddles the low — is visible before the
+    # nearest one is locked; locking earlier would pin a higher gap just
+    # because it formed first.
+    if (
+        state.first_bear_fvg is None
+        and swing_low_idx is not None
+        and len(session_bars) - 1 >= swing_low_idx + 1
+    ):
+        descent_bear_fvgs = [
+            f
+            for f in eligible_fvgs
+            if f.kind == "bearish" and f.formed_at_idx <= swing_low_idx + 1
+        ]
+        state.first_bear_fvg = max(
+            descent_bear_fvgs,
+            key=lambda f: f.formed_at_idx,
+            default=None,
         )
 
     # Bull FVG (CRE) selection — must be the FIRST bullish FVG of the
@@ -212,18 +223,19 @@ def detect_setup(
     events: List[SetupEvent] = []
     swing_low_for_event = state.swing_low if state.swing_low is not None else last_bar.low
 
-    # INV trigger: first session bar (after the bear FVG formed) whose body
-    # closes strictly above the FVG's top. Scanning the whole arc (not only
-    # last_bar) means a still-valid trigger that closed before the worker
-    # observed the session is not silently dropped.
+    # INV trigger: first session bar (after the bear FVG formed) whose
+    # CLOSE is strictly above the FVG's top. The inversion is confirmed by
+    # the close — the candle may open inside the FVG; what matters is that
+    # it closes its body above the top. Scanning the whole arc (not only
+    # last_bar) keeps a still-valid trigger that closed before the worker
+    # observed the session from being silently dropped.
     if state.first_bear_fvg is not None and not state.inv_fired:
         bear_top = state.first_bear_fvg.top
         bear_formed_ts = state.first_bear_fvg.formed_at_ts
         for b in session_bars:
             if b.ts < state.search_start_ts or b.ts <= bear_formed_ts:
                 continue
-            body_low = min(b.open, b.close)
-            if body_low > bear_top:
+            if b.close > bear_top:
                 state.inv_fired = True
                 state.inv_at_ts = b.ts
                 events.append(SetupEvent(
