@@ -316,23 +316,6 @@ export function Liquidity() {
     return arr;
   }, [filteredRows, sort, snapshot]);
 
-  // Per-metric distributions for color normalization. Sorted ascending,
-  // nulls stripped.
-  const distributions = useMemo(() => {
-    const out: Record<string, number[]> = {};
-    if (!filteredRows || !snapshot) return out;
-    for (const col of METRIC_COLS) {
-      const values: number[] = [];
-      for (const r of filteredRows) {
-        const v = snapshot.symbols?.[r.binance_symbol]?.[col.key]?.value;
-        if (v != null && Number.isFinite(v)) values.push(v);
-      }
-      values.sort((a, b) => a - b);
-      out[col.key] = values;
-    }
-    return out;
-  }, [filteredRows, snapshot]);
-
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -441,13 +424,8 @@ export function Liquidity() {
                   <td className="px-3 py-2 text-right text-zinc-200">{formatBig(row.volume_24h ?? NaN)}</td>
                   {METRIC_COLS.map((c) => {
                     const v = metrics[c.key]?.value ?? null;
-                    const bg = cellBackground(v, distributions[c.key] ?? [], c.colorMode);
                     return (
-                      <td
-                        key={c.key}
-                        className="px-3 py-2 text-right text-zinc-200"
-                        style={bg ? { backgroundColor: bg } : undefined}
-                      >
+                      <td key={c.key} className="px-3 py-2 text-right text-zinc-200">
                         {c.format(v)}
                       </td>
                     );
