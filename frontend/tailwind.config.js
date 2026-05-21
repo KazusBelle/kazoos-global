@@ -15,8 +15,12 @@ export default {
         ote: "#529e79",
       },
       fontFamily: {
-        mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "monospace"],
-        sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
+        // Single-family override: Comfortaa everywhere. font-mono still
+        // resolves so existing class usages don't break, but it now points
+        // at the same display sans — tables lose tabular column alignment,
+        // which is the deliberate global-look trade.
+        mono: ["Comfortaa", "ui-sans-serif", "system-ui", "sans-serif"],
+        sans: ["Comfortaa", "ui-sans-serif", "system-ui", "sans-serif"],
       },
     },
   },
