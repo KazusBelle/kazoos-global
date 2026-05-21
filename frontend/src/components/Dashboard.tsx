@@ -25,6 +25,7 @@ import {
   type ChartInterval,
   type ChartTheme,
 } from "./CandleChart";
+import { Liquidity } from "./Liquidity";
 import { ScreenerTable } from "./ScreenerTable";
 import { normalizeSymbol, SymbolSuggestInput } from "./SymbolSuggestInput";
 import { TDA } from "./TDA";
@@ -53,7 +54,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda";
+type Page = "ote" | "tda" | "liq";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -83,6 +84,15 @@ function TDAIcon({ size = 20 }: { size?: number }) {
       <circle cx="4" cy="20" r="2.5" />
       <rect x="9" y="13" width="4.5" height="9" rx="1.5" />
       <rect x="15.5" y="7" width="4.5" height="15" rx="1.5" />
+    </svg>
+  );
+}
+
+function LiqIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3 C8 9 5.5 12.5 5.5 15.5 C5.5 19 8.5 21.5 12 21.5 C15.5 21.5 18.5 19 18.5 15.5 C18.5 12.5 16 9 12 3 Z" />
+      <path d="M9 15.5 C9 17 10.3 18 12 18" />
     </svg>
   );
 }
@@ -1313,6 +1323,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("tda")}
             title="Trade Data Analysis"
           />
+          <NavBtn
+            active={page === "liq"}
+            open={sidebarOpen}
+            icon={<LiqIcon size={20} />}
+            label="LIQ"
+            onClick={() => setPage("liq")}
+            title="Liquidity Screener"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1500,6 +1518,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         )}
 
         {page === "tda" && <TDA />}
+
+        {page === "liq" && <Liquidity />}
       </main>
 
       {/* ── Chart Modal ── */}

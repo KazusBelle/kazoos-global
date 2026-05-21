@@ -276,3 +276,25 @@ export async function patchTdaState(state: Partial<TDAState>) {
     }
   }
 }
+
+export type LiqRow = {
+  rank: number;
+  coingecko_symbol: string;
+  binance_symbol: string;
+  name: string;
+  market_cap: number | null;
+  volume_24h: number | null;
+  price: number | null;
+  change_24h_pct: number | null;
+  image: string | null;
+};
+
+export type LiqResponse = {
+  limit: number;
+  rows: LiqRow[];
+  fetched_at: number;
+};
+
+export async function getLiquidityTop(limit: 100 | 250 | 500) {
+  return request<LiqResponse>(`/liquidity/top?limit=${limit}`);
+}
