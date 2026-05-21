@@ -56,10 +56,13 @@ def _tf_label(tf: str) -> str:
     return _TF_DISPLAY.get(tf, tf)
 
 
-def _format_price(price: Optional[float]) -> str:
-    if price is None:
-        return "—"
-    return f"{price:g}"
+def _strip_pair_suffix(symbol: str) -> str:
+    # Binance USDT-M Futures symbols arrive as e.g. SOLUSDT; alerts show
+    # just the base ticker (SOL). Falls back to the raw symbol for any
+    # future pair quoted in something other than USDT.
+    if symbol.endswith("USDT") and len(symbol) > 4:
+        return symbol[:-4]
+    return symbol
 
 
 def _build_caption(
@@ -67,14 +70,10 @@ def _build_caption(
     htf_tf: str,
     ltf_tf: str,
     event: SetupEvent,
-    price: Optional[float],
 ) -> str:
     htf = _tf_label(htf_tf)
     ltf = _tf_label(ltf_tf)
-    return (
-        f"🎯 #{symbol} {htf} — {ltf} <b>{event.kind}</b>\n"
-        f"Price: {_format_price(price)}"
-    )
+    return f"{_strip_pair_suffix(symbol)} {htf} — {ltf} {event.kind}"
 
 
 async def send_setup_alert(
@@ -97,7 +96,7 @@ async def send_setup_alert(
     """
     htf_tf, ltf_tf = _TF_CHART_PAIR[timeframe]
     symbol = snap.symbol
-    caption = _build_caption(symbol, htf_tf, ltf_tf, event, snap.price)
+    caption = _build_caption(symbol, htf_tf, ltf_tf, event)
 
     # Pull swing_low_ts off the persisted state — SetupEvent only carries
     # the price. Missing ts is fine: CandleChart spans the dashed line
