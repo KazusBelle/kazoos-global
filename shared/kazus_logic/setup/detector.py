@@ -41,15 +41,18 @@ Spec recap (bullish OTE, HTF retraced down, expecting reversal up):
         latched and STB can never form on this arc; a swing-low
         body-break clears it together with the rest of the flags.
 
-We fire on first observation of a closed-bar trigger, not only when the
-trigger bar happens to be the latest one in the window: the worker polls
-every few minutes while LTF candles close every 15m, so a setup can
-already be hours old by the time it is first observed (fresh start,
-restart, missed cycle). Once a closed-bar trigger has fired and not been
-invalidated, it stays valid and the runner-level sent_event_ids dedup
-keeps the same trigger from re-alerting on later cycles. The one
-exception is the INV→CRE window for STB (above): it is gated on
-LTF-close cadence and never emits a catch-up STB.
+State updates vs event emission are two separate concerns. State is
+allowed (and required) to learn about triggers that fired on any bar in
+the LTF window — restarts and missed polls would otherwise leave the
+detector blind to anchors that locked in while it was away. Events,
+however, are emitted ONLY when the trigger bar IS the latest closed bar
+of the current cycle. A setup observed for the first time on a bar that
+already aged into the lookback (post-restart backfill, fresh symbol
+intake, missed poll) updates inv_fired / stb_fired in state but does
+NOT push a SetupEvent — that structure is history, not a new signal.
+The consequence: a worker that missed the cycle when INV/STB closed
+loses that alert for good. This is the deliberate trade we make to
+guarantee that Telegram only ever carries setups formed RIGHT NOW.
 
 Swing-low replay (within a live session):
   Each cycle replays arc bars forward from the bar where the prior
@@ -279,11 +282,12 @@ def detect_setup(
     swing_low_for_event = state.swing_low if state.swing_low is not None else last_bar.low
 
     # INV trigger: first session bar (after the bear FVG formed) whose
-    # CLOSE is strictly above the FVG's top. The inversion is confirmed by
-    # the close — the candle may open inside the FVG; what matters is that
-    # it closes its body above the top. Scanning the whole arc (not only
-    # last_bar) keeps a still-valid trigger that closed before the worker
-    # observed the session from being silently dropped.
+    # CLOSE is strictly above the FVG's top. State always records the
+    # trigger (so future cycles know INV already fired and don't refire),
+    # but a SetupEvent is appended ONLY when the trigger bar IS the latest
+    # closed bar of this cycle. A historical INV found on a bar deeper in
+    # the lookback updates state and stays silent — that signal is past,
+    # not new.
     if state.first_bear_fvg is not None and not state.inv_fired:
         bear_top = state.first_bear_fvg.top
         bear_formed_ts = state.first_bear_fvg.formed_at_ts
@@ -293,13 +297,14 @@ def detect_setup(
             if b.close > bear_top:
                 state.inv_fired = True
                 state.inv_at_ts = b.ts
-                events.append(SetupEvent(
-                    kind="INV",
-                    event_id=_event_id("inv", symbol, timeframe, b.ts),
-                    trigger_ts=b.ts,
-                    fvg=state.first_bear_fvg,
-                    swing_low=swing_low_for_event,
-                ))
+                if b.ts == last_bar.ts:
+                    events.append(SetupEvent(
+                        kind="INV",
+                        event_id=_event_id("inv", symbol, timeframe, b.ts),
+                        trigger_ts=b.ts,
+                        fvg=state.first_bear_fvg,
+                        swing_low=swing_low_for_event,
+                    ))
                 break
 
     # CRE detection: formation of the first bullish FVG. Once first_bull_fvg
@@ -349,13 +354,19 @@ def detect_setup(
             stb_ts = max(state.inv_at_ts or 0, state.cre_at_ts or 0)
             stb_fvg = state.first_bull_fvg or state.first_bear_fvg
             assert stb_fvg is not None
-            events.append(SetupEvent(
-                kind="STB",
-                event_id=_event_id("stb", symbol, timeframe, stb_ts),
-                trigger_ts=stb_ts,
-                fvg=stb_fvg,
-                swing_low=swing_low_for_event,
-            ))
+            # Same emission rule as INV: state records the composition,
+            # but Telegram only sees STBs that compose ON the latest
+            # closed bar of this cycle. A composition whose trigger ts
+            # is older (post-restart backfill, etc.) updates state and
+            # stays silent.
+            if stb_ts == last_bar.ts:
+                events.append(SetupEvent(
+                    kind="STB",
+                    event_id=_event_id("stb", symbol, timeframe, stb_ts),
+                    trigger_ts=stb_ts,
+                    fvg=stb_fvg,
+                    swing_low=swing_low_for_event,
+                ))
 
     # Window expiry. INV has fired but no STB composed and the LTF has
     # closed past inv+STB_CRE_WINDOW_BARS — the INV→CRE window is over for

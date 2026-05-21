@@ -368,9 +368,13 @@ def test_cre_recorded_on_first_observation_when_bull_fvg_was_formed_earlier():
     assert state.cre_at_ts == 5000
 
 
-def test_inv_fires_on_first_observation_when_close_was_earlier():
+def test_inv_state_updates_but_no_event_when_trigger_is_not_latest_bar():
     """The inverting candle is no longer the last bar by the time the
-    worker observes the session."""
+    worker observes the session. State must still record inv_fired (so the
+    detector never refires this trigger), but NO SetupEvent is emitted —
+    Telegram only sees triggers that fired on the latest closed bar of the
+    current cycle. This is the deliberate post-restart / missed-poll trade.
+    """
     zone = _bullish_ote(ote_low=100.0, ote_high=110.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
@@ -383,11 +387,11 @@ def test_inv_fires_on_first_observation_when_close_was_earlier():
         _bar(7000, 105, 106, 104, 105),
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
-    inv = [e for e in events if e.kind == "INV"]
     assert state.state == "INV"
-    assert len(inv) == 1
-    assert inv[0].trigger_ts == 5000
-    assert inv[0].event_id == "inv:TEST:M15:5000"
+    assert state.inv_fired is True
+    assert state.inv_at_ts == 5000
+    # Trigger bar (5000) is not the latest bar (7000) → no event for TG.
+    assert [e for e in events if e.kind == "INV"] == []
 
 
 # --- 10. Wick-vs-body swing-low break ----------------------------------------
@@ -515,7 +519,11 @@ def test_stb_does_not_compose_when_cre_forms_after_3bar_window():
 def test_stb_no_catch_up_when_window_already_elapsed_on_first_observation():
     """The bull FVG completed inside the window (idx=6, inv+2) but the
     detector first sees the session only after the window has elapsed
-    (last bar idx=8 > inv+3). No catch-up STB is emitted."""
+    (last bar idx=8 > inv+3). State records INV but no STB composes
+    (window already elapsed by first observation), and no events fire —
+    INV's trigger bar (idx=4) is not the latest bar (idx=8) either, so
+    Telegram stays silent on both counts.
+    """
     zone = _bullish_ote(ote_low=95.0, ote_high=115.0)
     bars = [
         _bar(1000, 108, 109, 107, 108),
@@ -529,9 +537,8 @@ def test_stb_no_catch_up_when_window_already_elapsed_on_first_observation():
         _bar(9000, 109, 110, 108, 109),      # last bar idx=8 → window elapsed
     ]
     state, events = detect_setup(zone, bars, None, symbol="TEST", timeframe="M15")
-    kinds = [e.kind for e in events]
-    assert "INV" in kinds
-    assert kinds.count("STB") == 0
+    assert events == []
+    assert state.inv_fired is True
     assert state.cre_fired is True
     assert state.stb_fired is False
     assert state.stb_window_expired is True
