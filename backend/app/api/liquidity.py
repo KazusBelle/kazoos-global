@@ -267,6 +267,58 @@ async def get_metric_series(
     )
 
 
+# ── Latest-per-metric snapshot (table columns) ─────────────────────────────
+
+
+class MetricLatest(BaseModel):
+    value: Optional[float]
+    ts: int
+
+
+class MetricsSnapshotResponse(BaseModel):
+    symbols: dict[str, dict[str, MetricLatest]]
+
+
+@router.get("/metrics/snapshot", response_model=MetricsSnapshotResponse)
+async def get_metrics_snapshot(
+    symbols: str = Query(..., description="Comma-separated Binance symbols"),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MetricsSnapshotResponse:
+    """Latest sample per (symbol, metric) for a batch of symbols.
+
+    Powers the LIQ scanner table — one row per symbol, one cell per
+    metric, no history. Polled by the frontend every few seconds so
+    metric columns reflect the worker's most recent write without
+    re-fetching the entire CoinGecko universe.
+    """
+    parsed = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not parsed:
+        return MetricsSnapshotResponse(symbols={})
+    if len(parsed) > 500:
+        raise HTTPException(status_code=400, detail="too many symbols (max 500)")
+
+    from sqlalchemy import text
+    rows = db.execute(
+        text(
+            """
+            SELECT DISTINCT ON (symbol, metric)
+                symbol, metric, value, ts
+            FROM liquidity_samples
+            WHERE symbol = ANY(:symbols)
+            ORDER BY symbol, metric, ts DESC
+            """
+        ),
+        {"symbols": parsed},
+    ).fetchall()
+
+    out: dict[str, dict[str, MetricLatest]] = {}
+    for r in rows:
+        out.setdefault(r.symbol, {})[r.metric] = MetricLatest(value=r.value, ts=r.ts)
+
+    return MetricsSnapshotResponse(symbols=out)
+
+
 # ── Realtime subscription heartbeat ────────────────────────────────────────
 
 

@@ -341,3 +341,18 @@ export async function heartbeatLiquidityActive(symbol: string, ttlSeconds = 120)
     body: JSON.stringify({ symbol, ttl_seconds: ttlSeconds }),
   });
 }
+
+export type LiqMetricLatest = {
+  value: number | null;
+  ts: number;
+};
+
+export type LiqMetricsSnapshot = {
+  symbols: Record<string, Record<string, LiqMetricLatest>>;
+};
+
+export async function getLiquidityMetricsSnapshot(symbols: string[]) {
+  if (symbols.length === 0) return { symbols: {} } as LiqMetricsSnapshot;
+  const params = new URLSearchParams({ symbols: symbols.join(",") });
+  return request<LiqMetricsSnapshot>(`/liquidity/metrics/snapshot?${params.toString()}`);
+}
