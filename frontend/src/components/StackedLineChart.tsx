@@ -50,16 +50,56 @@ function buildPath(
     const x = PAD_X + ((p.ts - xMin) / xRange) * (width - 2 * PAD_X);
     const y =
       PAD_TOP + (1 - ((p.value as number) - yMin) / yRange) * (height - PAD_TOP - PAD_BOTTOM);
-    return [x, y] as const;
+    return [x, y, p.ts] as const;
   });
 
-  let d = `M${xy[0][0].toFixed(2)},${xy[0][1].toFixed(2)}`;
-  for (let i = 1; i < xy.length; i++) {
-    d += ` L${xy[i][0].toFixed(2)},${xy[i][1].toFixed(2)}`;
+  // Gap-break: split the path whenever the time gap between consecutive
+  // samples is much larger than the typical sampling cadence. Without
+  // this a WS-metric that's only collected while the symbol is active
+  // would draw long horizontal "fake bridges" across the dead windows
+  // between sessions.
+  let gapThreshold = Number.POSITIVE_INFINITY;
+  if (inner.length >= 4) {
+    const gaps: number[] = [];
+    for (let i = 1; i < inner.length; i++) {
+      gaps.push(inner[i].ts - inner[i - 1].ts);
+    }
+    gaps.sort((a, b) => a - b);
+    const median = gaps[Math.floor(gaps.length / 2)] || 0;
+    // 4× median is a reasonable line-break threshold — small jitter passes,
+    // genuine multi-cycle absence breaks.
+    gapThreshold = Math.max(median * 4, 30_000);
   }
-  if (fill) {
-    const baseY = height - PAD_BOTTOM;
-    d += ` L${xy[xy.length - 1][0].toFixed(2)},${baseY} L${xy[0][0].toFixed(2)},${baseY} Z`;
+
+  const baseY = height - PAD_BOTTOM;
+  let d = "";
+
+  if (!fill) {
+    // Stroke mode — break the line on big gaps with a new M command.
+    d = `M${xy[0][0].toFixed(2)},${xy[0][1].toFixed(2)}`;
+    for (let i = 1; i < xy.length; i++) {
+      const cmd = xy[i][2] - xy[i - 1][2] > gapThreshold ? "M" : "L";
+      d += ` ${cmd}${xy[i][0].toFixed(2)},${xy[i][1].toFixed(2)}`;
+    }
+    return d;
+  }
+
+  // Fill mode — emit one closed polygon per contiguous segment so each
+  // gap shows as a true blank, not as a connected polygon.
+  let segStart = 0;
+  for (let i = 1; i <= xy.length; i++) {
+    const isBreak = i === xy.length || xy[i][2] - xy[i - 1][2] > gapThreshold;
+    if (!isBreak) continue;
+    const segEnd = i - 1;
+    if (segEnd > segStart) {
+      d += `M${xy[segStart][0].toFixed(2)},${baseY.toFixed(2)} `;
+      d += `L${xy[segStart][0].toFixed(2)},${xy[segStart][1].toFixed(2)}`;
+      for (let j = segStart + 1; j <= segEnd; j++) {
+        d += ` L${xy[j][0].toFixed(2)},${xy[j][1].toFixed(2)}`;
+      }
+      d += ` L${xy[segEnd][0].toFixed(2)},${baseY.toFixed(2)} Z `;
+    }
+    segStart = i;
   }
   return d;
 }
@@ -102,7 +142,10 @@ export function StackedLineChart({
           return [lo - eps, hi + eps];
         }
         const span = hi - lo;
-        return [lo - span * 0.08, hi + span * 0.08];
+        // 4% breathing room above/below — small enough that signed
+        // metrics like OBI (natural [-1, +1]) don't get axis labels
+        // visibly outside their actual bounds.
+        return [lo - span * 0.04, hi + span * 0.04];
       };
       const [pLo, pHi] =
         priceVals.length > 0 ? padBand(Math.min(...priceVals), Math.max(...priceVals)) : [0, 1];
