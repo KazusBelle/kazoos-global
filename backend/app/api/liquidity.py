@@ -279,7 +279,7 @@ class MetricsSnapshotResponse(BaseModel):
     symbols: dict[str, dict[str, MetricLatest]]
 
 
-@router.get("/metrics/snapshot", response_model=MetricsSnapshotResponse)
+@router.get("/snapshot", response_model=MetricsSnapshotResponse)
 async def get_metrics_snapshot(
     symbols: str = Query(..., description="Comma-separated Binance symbols"),
     db: Session = Depends(get_db),

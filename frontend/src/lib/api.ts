@@ -354,5 +354,5 @@ export type LiqMetricsSnapshot = {
 export async function getLiquidityMetricsSnapshot(symbols: string[]) {
   if (symbols.length === 0) return { symbols: {} } as LiqMetricsSnapshot;
   const params = new URLSearchParams({ symbols: symbols.join(",") });
-  return request<LiqMetricsSnapshot>(`/liquidity/metrics/snapshot?${params.toString()}`);
+  return request<LiqMetricsSnapshot>(`/liquidity/snapshot?${params.toString()}`);
 }
