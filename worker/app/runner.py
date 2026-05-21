@@ -216,12 +216,12 @@ def _collect_new_events(
 
         now_in_ote = bool(result.in_ote)
 
-        if not now_in_ote:
-            row.in_ote = False
-            row.sent_event_ids = "[]"
-            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            continue
-
+        # OTE exit no longer wipes sent_event_ids. A brief tick out of
+        # the band followed by a return must not let already-sent INV/STB
+        # re-alert on the same visual base; the detector now carries the
+        # SetupState across that gap, and the dedup set must match.
+        # AlertState row is updated either way so the in_ote flag stays
+        # in sync — the events list is just empty when no triggers fired.
         sent_ids = _load_sent_ids(row.sent_event_ids)
         new_for_tf: List[SetupEvent] = []
         for event in events:
@@ -229,7 +229,7 @@ def _collect_new_events(
                 continue
             new_for_tf.append(event)
 
-        row.in_ote = True
+        row.in_ote = now_in_ote
         if row.sent_event_ids is None:
             row.sent_event_ids = "[]"
         row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)

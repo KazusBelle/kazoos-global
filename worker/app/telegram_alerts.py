@@ -41,15 +41,38 @@ _TF_CHART_PAIR: dict[str, Tuple[str, str]] = {
 }
 
 
+# Display labels for chart-interval strings used in captions ("H1 — M5"
+# style). Falls back to the raw value if a new interval is added without
+# an entry here.
+_TF_DISPLAY: dict[str, str] = {
+    "1d": "D1",
+    "1h": "H1",
+    "15m": "M15",
+    "5m": "M5",
+}
+
+
+def _tf_label(tf: str) -> str:
+    return _TF_DISPLAY.get(tf, tf)
+
+
 def _format_price(price: Optional[float]) -> str:
     if price is None:
         return "—"
     return f"{price:g}"
 
 
-def _build_caption(symbol: str, timeframe: str, event: SetupEvent, price: Optional[float]) -> str:
+def _build_caption(
+    symbol: str,
+    htf_tf: str,
+    ltf_tf: str,
+    event: SetupEvent,
+    price: Optional[float],
+) -> str:
+    htf = _tf_label(htf_tf)
+    ltf = _tf_label(ltf_tf)
     return (
-        f"🎯 <b>{event.kind}</b> #{symbol} [{timeframe}]\n"
+        f"🎯 #{symbol} {htf} — {ltf} <b>{event.kind}</b>\n"
         f"Price: {_format_price(price)}"
     )
 
@@ -74,7 +97,7 @@ async def send_setup_alert(
     """
     htf_tf, ltf_tf = _TF_CHART_PAIR[timeframe]
     symbol = snap.symbol
-    caption = _build_caption(symbol, timeframe, event, snap.price)
+    caption = _build_caption(symbol, htf_tf, ltf_tf, event, snap.price)
 
     # Pull swing_low_ts off the persisted state — SetupEvent only carries
     # the price. Missing ts is fine: CandleChart spans the dashed line

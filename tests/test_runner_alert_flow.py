@@ -188,7 +188,11 @@ def test_collect_new_events_ignores_h1_m5_when_not_in_snapshot(runner_with_sqlit
     assert [(tf, e.event_id) for tf, e in pending] == [("H1", "INV:TESTUSDT:H1:3000")]
 
 
-def test_ote_exit_clears_sent_event_ids(runner_with_sqlite):
+def test_ote_exit_preserves_sent_event_ids(runner_with_sqlite):
+    # A brief tick out of the OTE band must NOT clear sent_event_ids — if
+    # price returns to the band the same INV/STB would otherwise re-alert
+    # on the same physical bars. The in_ote flag flips so subsequent code
+    # paths can read current state, but the dedup set stays.
     import json
     from kazus_db.models import AlertState
 
@@ -210,7 +214,7 @@ def test_ote_exit_clears_sent_event_ids(runner_with_sqlite):
     with SessionLocal() as db:
         row = db.query(AlertState).filter_by(symbol="TESTUSDT", timeframe="H1").one()
         assert row.in_ote is False
-        assert row.sent_event_ids == "[]"
+        assert "INV:TESTUSDT:H1:3000" in (row.sent_event_ids or "")
 
 
 def test_dispatch_setup_alert_persists_event_id_after_send(runner_with_sqlite, monkeypatch):

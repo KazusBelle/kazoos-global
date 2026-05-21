@@ -60,15 +60,25 @@ def _replay(
 
 # --- 1. No-setup gates --------------------------------------------------------
 
-def test_returns_no_when_not_in_ote():
+def test_not_in_ote_does_not_wipe_prev_state():
+    # When the engine reports in_ote=False (price ticked out of the band)
+    # but the LTF bars still include the prior in-band session, we no
+    # longer hard-return NO with an empty state — the prior session must
+    # be carried forward so already-fired INV/STB can't re-emit on the
+    # same base when price returns to the band. Direction stays bullish.
     zone = ZoneResult(
         zone="discount", in_ote=False, setup="no", retracement=0.55,
         direction="bullish", fib_low=90.0, fib_high=120.0,
         ote_low_price=100.0, ote_high_price=110.0,
     )
-    state, events = detect_setup(zone, [_bar(1, 105, 106, 104, 105)], None)
-    assert state.state == "NO"
+    prev = SetupState(
+        state="STB", session_id="abc", inv_fired=True, cre_fired=True,
+        stb_fired=True, swing_low=104.0, swing_low_ts=1,
+    )
+    state, events = detect_setup(zone, [_bar(1, 105, 106, 104, 105)], prev)
     assert events == []
+    # stb_fired must survive the out-of-band tick.
+    assert state.stb_fired is True
 
 
 def test_returns_no_when_bearish_direction_long_only():

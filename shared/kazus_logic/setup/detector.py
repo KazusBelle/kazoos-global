@@ -63,12 +63,26 @@ Swing-low replay (within a live session):
         Locked FVGs, event flags, and search_start_ts are preserved.
 
 Session boundary:
-  A session is tied to one OTE level for its whole lifetime. It begins at
-  the first bar that entered the OTE band and lives until the HTF OTE
-  bounds themselves change. Price dipping below OTE — even to print the
-  swing low — stays in-session and does NOT re-anchor it; price leaving
-  and re-entering OTE does not start a new session either. session_id
-  encodes the OTE bounds only.
+  A session is tied to the LOW/OTE context, not to the exact OTE-bound
+  numbers. It begins at the first bar that entered the OTE band. Price
+  dipping below OTE — even to print the swing low — stays in-session and
+  does NOT re-anchor it; price leaving and re-entering OTE does not start
+  a new session either. session_id is keyed on the current OTE bounds for
+  identity, but a bounds shift alone does NOT end the session: if the
+  previous swing_low is still visible in the LTF window and still sits
+  within (or above) the new ote_low, the prior arc is carried over under
+  the new session_id and the already-fired INV/STB flags survive — a
+  small HTF recompute of the same zone must not re-emit setups on the
+  same visual base.
+  A genuinely new session is required only when:
+    * a new lower LOW prints (handled inside the arc by the body-break
+      reset in _apply_swing_low_events — same session, fresh arc),
+    * the OTE level dies by the 0.85 invalidation rule (ote_invalidated
+      latches; session is dead), OR
+    * the bounds shifted enough that the prior swing_low anchor no longer
+      falls inside the LTF session window picked by _find_session_start
+      under the new bounds — i.e. the engine really moved to a different
+      zone, not a small recompute of the same one.
 
 OTE invalidation:
   A body close below the 0.85-retracement level (OTE_INVALIDATION_
@@ -114,7 +128,16 @@ def detect_setup(
     symbol: str = "",
     timeframe: str = "",
 ) -> Tuple[SetupState, List[SetupEvent]]:
-    if not zone.in_ote or zone.direction != "bullish":
+    # Direction guard only — in_ote is NOT gated here on purpose. When
+    # price ticks out of OTE for a few LTF bars and comes back, we want
+    # to carry the prior arc (with all fired flags) forward, not wipe
+    # it. Out-of-OTE bars are still inside session_bars below — the
+    # 0.85 invalidation re-derivation can still kill the setup over
+    # that stretch. INV/STB triggers naturally can't refire on already
+    # set flags, so emitting events from this call while out of OTE is
+    # safe in practice (e.g. an INV close that exits the band upward
+    # is a legitimate setup completion, not a spurious one).
+    if zone.direction != "bullish":
         return SetupState(state="NO"), []
 
     if not ltf_bars:
@@ -156,13 +179,45 @@ def detect_setup(
             state="NO", session_id=session_id, ote_invalidated=True
         ), []
 
-    if prev_state is None or prev_state.session_id != session_id:
+    # Session continuity. Same session_id (bounds unchanged) → carry over
+    # prev_state. Different session_id (bounds shifted) → carry over ONLY
+    # if the LOW/OTE context is still the same: prev swing_low is anchored
+    # to a bar still present in the current LTF session window. A bounds
+    # shift large enough that _find_session_start picks a different entry
+    # bar (and the prior anchor falls out of the window) really is a new
+    # zone, and we restart. A new lower LOW is handled inside the arc by
+    # _apply_swing_low_events' body-break reset, in-session. The 0.85
+    # invalidation is re-derived above against the NEW bounds and returns
+    # NO early if the prior dip looks invalidating under the new band;
+    # prev_state.ote_invalidated guards against resurrecting an already
+    # killed setup when only the id-hash changed.
+    # Note: swing_low being below the new ote_low_price (the 0.79 band
+    # edge) is normal — bullish dips routinely print the LTF low below
+    # the band before reversing — and must NOT force a fresh session.
+    if prev_state is None:
+        fresh = True
+    elif prev_state.session_id == session_id:
+        fresh = False
+    else:
+        anchor_ts = prev_state.swing_low_ts
+        anchor_in_window = (
+            anchor_ts is not None
+            and any(b.ts == anchor_ts for b in session_bars)
+        )
+        fresh = (
+            prev_state.swing_low is None
+            or not anchor_in_window
+            or prev_state.ote_invalidated
+        )
+
+    if fresh:
         state = SetupState(
             session_id=session_id,
             search_start_ts=session_bars[0].ts,
         )
     else:
         state = _clone_state(prev_state)
+        state.session_id = session_id
 
     _apply_swing_low_events(state, session_bars)
 
@@ -480,9 +535,12 @@ def _invalidation_price(
 
 
 def _make_session_id(ote_low: float, ote_high: float) -> str:
-    # Keyed on the OTE bounds only — the session lives as long as the OTE
-    # level does. Entry ts is deliberately excluded so price leaving and
-    # re-entering OTE cannot spawn a fresh session (and reseed swing_low).
+    # Keyed on the OTE bounds — identifies the current bounds, not the
+    # session lifetime. A small bounds recompute changes this hash, but
+    # detect_setup carries the prior arc forward when the LOW/OTE context
+    # is still the same (see "Session continuity" above). Entry ts is
+    # excluded so price leaving and re-entering OTE cannot spawn a fresh
+    # session (and reseed swing_low).
     raw = f"{ote_low:.10g}|{ote_high:.10g}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
