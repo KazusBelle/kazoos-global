@@ -298,3 +298,37 @@ export type LiqResponse = {
 export async function getLiquidityTop(limit: 100 | 250 | 500) {
   return request<LiqResponse>(`/liquidity/top?limit=${limit}`);
 }
+
+export type LiqMetricMeta = {
+  name: string;
+  label: string;
+};
+
+export type LiqMetricSample = {
+  ts: number;
+  value: number | null;
+  price: number | null;
+};
+
+export type LiqMetricSeries = {
+  symbol: string;
+  metric: string;
+  label: string;
+  window: string;
+  samples: LiqMetricSample[];
+};
+
+export async function listLiquidityMetrics() {
+  return request<LiqMetricMeta[]>("/liquidity/metrics");
+}
+
+export async function getLiquidityMetricSeries(
+  symbol: string,
+  metric: string,
+  window: "1h" | "24h" | "7d" | "30d",
+) {
+  const params = new URLSearchParams({ metric, window });
+  return request<LiqMetricSeries>(
+    `/liquidity/metrics/${encodeURIComponent(symbol)}?${params.toString()}`,
+  );
+}

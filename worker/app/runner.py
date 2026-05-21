@@ -366,6 +366,14 @@ async def main() -> None:
 
     client = BinanceFuturesClient()
     renderer = ChartRenderer(settings)
+
+    # Liquidity polling runs as an independent background task on its own
+    # 60s cadence — it doesn't share the M5-boundary scheduler because
+    # liquidity sampling needs to be smooth, not tied to candle closes.
+    from kazus_logic.liquidity.poller import loop as _liquidity_loop
+    liquidity_task = asyncio.create_task(
+        _liquidity_loop(SessionLocal, stop_event), name="liquidity-poller"
+    )
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -400,6 +408,11 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
+        liquidity_task.cancel()
+        try:
+            await liquidity_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await renderer.close()
         await client.close()
 

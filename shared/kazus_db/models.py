@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -108,6 +108,34 @@ class SystemStatus(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     last_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_error: Mapped[Optional[str]] = mapped_column(String(512))
+
+
+class LiquiditySample(Base):
+    """Time-series sample for a single liquidity metric on a single symbol.
+
+    Worker writes one row per (symbol, metric) per polling cycle. `ts` is
+    epoch-ms of the sample. `price` is the mark / close price at sample
+    time so charts can plot price alongside the metric without a second
+    join. Each metric is its own row — never merged into a wide table —
+    so adding new metrics doesn't require a migration.
+    """
+
+    __tablename__ = "liquidity_samples"
+    __table_args__ = (
+        Index(
+            "ix_liq_samples_symbol_metric_ts",
+            "symbol",
+            "metric",
+            "ts",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    metric: Mapped[str] = mapped_column(String(32), nullable=False)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    value: Mapped[Optional[float]] = mapped_column(Float)
+    price: Mapped[Optional[float]] = mapped_column(Float)
 
 
 class UserTDAState(Base):

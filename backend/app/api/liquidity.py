@@ -19,7 +19,13 @@ from typing import List, Optional, Tuple
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from kazus_db.models import LiquiditySample
+from kazus_logic.liquidity import REGISTRY
+
+from ..db.base import get_db
 from ..models.models import User
 from .deps import get_current_user
 
@@ -173,3 +179,82 @@ async def get_top(
         )
 
     return LiqResponse(limit=limit, rows=rows, fetched_at=time.time())
+
+
+# ── Metric time series ─────────────────────────────────────────────────────
+
+
+class MetricMeta(BaseModel):
+    name: str
+    label: str
+
+
+class MetricSampleOut(BaseModel):
+    ts: int
+    value: Optional[float]
+    price: Optional[float]
+
+
+class MetricSeriesResponse(BaseModel):
+    symbol: str
+    metric: str
+    label: str
+    window: str
+    samples: List[MetricSampleOut]
+
+
+_WINDOW_MS = {
+    "1h": 3600 * 1000,
+    "24h": 24 * 3600 * 1000,
+    "7d": 7 * 24 * 3600 * 1000,
+    "30d": 30 * 24 * 3600 * 1000,
+}
+
+
+@router.get("/metrics", response_model=List[MetricMeta])
+async def list_metrics(_user: User = Depends(get_current_user)) -> List[MetricMeta]:
+    """List every metric the worker is currently sampling — frontend uses
+    this to decide which charts to render in the detail modal."""
+    return [MetricMeta(name=m.name, label=m.label) for m in REGISTRY.values()]
+
+
+@router.get("/metrics/{symbol}", response_model=MetricSeriesResponse)
+async def get_metric_series(
+    symbol: str,
+    metric: str = Query(...),
+    window: str = Query("24h"),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MetricSeriesResponse:
+    if metric not in REGISTRY:
+        raise HTTPException(status_code=404, detail=f"unknown metric: {metric}")
+    if window not in _WINDOW_MS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"window must be one of {sorted(_WINDOW_MS.keys())}",
+        )
+    symbol = symbol.upper()
+
+    since_ms = int(time.time() * 1000) - _WINDOW_MS[window]
+    rows = (
+        db.query(LiquiditySample)
+        .filter(
+            LiquiditySample.symbol == symbol,
+            LiquiditySample.metric == metric,
+            LiquiditySample.ts >= since_ms,
+        )
+        .order_by(LiquiditySample.ts.asc())
+        .all()
+    )
+
+    samples = [
+        MetricSampleOut(ts=row.ts, value=row.value, price=row.price)
+        for row in rows
+    ]
+    return MetricSeriesResponse(
+        symbol=symbol,
+        metric=metric,
+        label=REGISTRY[metric].label,
+        window=window,
+        samples=samples,
+    )

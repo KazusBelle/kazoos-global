@@ -3,6 +3,7 @@ from kazus_db.models import (
     AlertState,
     Base,
     Coin,
+    LiquiditySample,
     Snapshot,
     SystemStatus,
     User,
@@ -18,4 +19,5 @@ __all__ = [
     "AlertEvent",
     "SystemStatus",
     "UserTDAState",
+    "LiquiditySample",
 ]

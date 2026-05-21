@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getLiquidityTop, type LiqRow } from "../lib/api";
+import { LiquidityChartModal } from "./LiquidityChartModal";
 
 // Non-overlapping slices of CoinGecko's top-500 by market cap. The label
 // shows the upper bound; the slice is (prev_upper, upper]. Tier 1 is
@@ -89,6 +90,12 @@ export function Liquidity() {
     ? allRows.filter((r) => r.rank >= currentSlice.min && r.rank <= currentSlice.max)
     : null;
 
+  const [chartSymbol, setChartSymbol] = useState<string | null>(null);
+  const visibleSymbols = useMemo(
+    () => (rows ?? []).map((r) => r.binance_symbol),
+    [rows],
+  );
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -163,7 +170,8 @@ export function Liquidity() {
               return (
                 <tr
                   key={row.binance_symbol}
-                  className="border-t border-border/60 hover:bg-white/[0.02] transition-colors"
+                  onClick={() => setChartSymbol(row.binance_symbol)}
+                  className="border-t border-border/60 hover:bg-white/[0.02] transition-colors cursor-pointer"
                 >
                   <td className="px-3 py-2 text-right text-muted">{row.rank}</td>
                   <td className="px-4 py-2">
@@ -200,6 +208,15 @@ export function Liquidity() {
           </tbody>
         </table>
       </div>
+
+      {chartSymbol && (
+        <LiquidityChartModal
+          symbol={chartSymbol}
+          orderedSymbols={visibleSymbols}
+          onSwitchSymbol={(sym) => setChartSymbol(sym)}
+          onClose={() => setChartSymbol(null)}
+        />
+      )}
     </div>
   );
 }
