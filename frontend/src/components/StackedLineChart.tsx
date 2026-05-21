@@ -3,7 +3,7 @@ import { useMemo } from "react";
 type Point = { ts: number; value: number | null };
 
 type Props = {
-  price: Point[];
+  price?: Point[];           // optional — when omitted the chart shows the metric only
   metric: Point[];
   metricLabel: string;
   height?: number;
@@ -14,7 +14,7 @@ const PAD_TOP = 22;
 const PAD_BOTTOM = 22;
 const PRICE_COLOR = "#E3D02D";       // yellow
 const METRIC_COLOR = "#4ea3ff";      // blue
-const METRIC_FILL = "rgba(78, 163, 255, 0.12)";
+const METRIC_FILL = "rgba(78, 163, 255, 0.10)";
 const GRID = "#1a1c22";
 const AXIS_TEXT = "#5a5f6b";
 
@@ -68,13 +68,20 @@ export function StackedLineChart({
   price,
   metric,
   metricLabel,
-  height = 280,
+  height = 240,
 }: Props) {
   const width = 880;
+  const priceSeries = price ?? [];
+  const hasPrice = priceSeries.length > 0;
+  // Unique filter id per instance so multiple charts don't share glow defs.
+  const glowId = useMemo(
+    () => `kz-glow-${Math.random().toString(36).slice(2, 9)}`,
+    [],
+  );
 
   const { xMin, xMax, priceMin, priceMax, metricMin, metricMax, empty } =
     useMemo(() => {
-      const all = [...price, ...metric];
+      const all = [...priceSeries, ...metric];
       if (all.length === 0) {
         return {
           xMin: 0,
@@ -87,7 +94,7 @@ export function StackedLineChart({
         };
       }
       const xs = all.map((p) => p.ts);
-      const priceVals = price.map((p) => p.value).filter((v): v is number => v != null);
+      const priceVals = priceSeries.map((p) => p.value).filter((v): v is number => v != null);
       const metricVals = metric.map((p) => p.value).filter((v): v is number => v != null);
       const padBand = (lo: number, hi: number) => {
         if (lo === hi) {
@@ -112,7 +119,7 @@ export function StackedLineChart({
         metricMax: mHi,
         empty: priceVals.length === 0 && metricVals.length === 0,
       };
-    }, [price, metric]);
+    }, [priceSeries, metric]);
 
   if (empty) {
     return (
@@ -125,11 +132,12 @@ export function StackedLineChart({
     );
   }
 
-  const priceFill = buildPath(price, width, height, xMin, xMax, priceMin, priceMax, false);
+  const priceFill = hasPrice
+    ? buildPath(priceSeries, width, height, xMin, xMax, priceMin, priceMax, false)
+    : "";
   const metricFill = buildPath(metric, width, height, xMin, xMax, metricMin, metricMax, true);
   const metricLine = buildPath(metric, width, height, xMin, xMax, metricMin, metricMax, false);
 
-  // Y-axis labels: left = price (yellow), right = metric (blue)
   const yTicks = [0, 0.5, 1].map((t) => ({
     y: PAD_TOP + t * (height - PAD_TOP - PAD_BOTTOM),
     price: priceMax - t * (priceMax - priceMin),
@@ -139,7 +147,20 @@ export function StackedLineChart({
   return (
     <div className="rounded-xl border border-border bg-bg/40 overflow-hidden">
       <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto block">
-        {/* Horizontal gridlines */}
+        <defs>
+          {/* Soft glow — Gaussian blur fed back over the original stroke
+              so the line looks like it's emitting light. */}
+          <filter id={glowId} x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="2.4" result="b1" />
+            <feGaussianBlur in="SourceGraphic" stdDeviation="0.8" result="b2" />
+            <feMerge>
+              <feMergeNode in="b1" />
+              <feMergeNode in="b2" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+        </defs>
+
         {yTicks.map((t, i) => (
           <line
             key={i}
@@ -151,9 +172,8 @@ export function StackedLineChart({
             strokeWidth={1}
           />
         ))}
-        {/* Metric fill (background highlight) */}
+
         {metricFill && <path d={metricFill} fill={METRIC_FILL} stroke="none" />}
-        {/* Metric line */}
         {metricLine && (
           <path
             d={metricLine}
@@ -162,32 +182,35 @@ export function StackedLineChart({
             strokeWidth={1.6}
             strokeLinejoin="round"
             strokeLinecap="round"
+            filter={`url(#${glowId})`}
           />
         )}
-        {/* Price line */}
-        {priceFill && (
+        {hasPrice && priceFill && (
           <path
             d={priceFill}
             fill="none"
             stroke={PRICE_COLOR}
-            strokeWidth={1.4}
+            strokeWidth={1.6}
             strokeLinejoin="round"
             strokeLinecap="round"
+            filter={`url(#${glowId})`}
           />
         )}
-        {/* Y-axis ticks */}
+
         {yTicks.map((t, i) => (
           <g key={`tx${i}`}>
-            <text
-              x={PAD_X - 6}
-              y={t.y + 3}
-              textAnchor="end"
-              fontSize="9"
-              fill={PRICE_COLOR}
-              opacity={0.8}
-            >
-              {niceNum(t.price)}
-            </text>
+            {hasPrice && (
+              <text
+                x={PAD_X - 6}
+                y={t.y + 3}
+                textAnchor="end"
+                fontSize="9"
+                fill={PRICE_COLOR}
+                opacity={0.8}
+              >
+                {niceNum(t.price)}
+              </text>
+            )}
             <text
               x={width - PAD_X + 6}
               y={t.y + 3}
@@ -200,14 +223,29 @@ export function StackedLineChart({
             </text>
           </g>
         ))}
-        {/* Legend */}
+
         <g>
-          <rect x={PAD_X} y={4} width={10} height={2} fill={PRICE_COLOR} />
-          <text x={PAD_X + 14} y={9} fontSize="9" fill={AXIS_TEXT}>
-            Price
-          </text>
-          <rect x={PAD_X + 70} y={4} width={10} height={2} fill={METRIC_COLOR} />
-          <text x={PAD_X + 84} y={9} fontSize="9" fill={AXIS_TEXT}>
+          {hasPrice && (
+            <>
+              <rect x={PAD_X} y={4} width={10} height={2} fill={PRICE_COLOR} />
+              <text x={PAD_X + 14} y={9} fontSize="9" fill={AXIS_TEXT}>
+                Price
+              </text>
+            </>
+          )}
+          <rect
+            x={hasPrice ? PAD_X + 70 : PAD_X}
+            y={4}
+            width={10}
+            height={2}
+            fill={METRIC_COLOR}
+          />
+          <text
+            x={(hasPrice ? PAD_X + 70 : PAD_X) + 14}
+            y={9}
+            fontSize="9"
+            fill={AXIS_TEXT}
+          >
             {metricLabel}
           </text>
         </g>
