@@ -1,11 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getLiquidityMetricSeries,
+  heartbeatLiquidityActive,
   listLiquidityMetrics,
   type LiqMetricMeta,
+  type LiqMetricSample,
   type LiqMetricSeries,
 } from "../lib/api";
 import { StackedLineChart } from "./StackedLineChart";
+
+const HEARTBEAT_MS = 30_000;
+const LIVE_POLL_MS = 1500;
+// Metrics that come from the live WS engine — they need a heartbeat to
+// keep the worker subscribed and they benefit from short-cadence
+// incremental polling. REST metrics update once a minute, so polling
+// faster than that is wasted bandwidth.
+const REALTIME_METRICS = new Set(["obi_rt", "credible_depth", "liq_stress"]);
 
 type Props = {
   symbol: string;
@@ -69,6 +79,9 @@ export function LiquidityChartModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Initial load — fetch the full window. Subsequent live polls extend
+  // the series incrementally via `since`, so the chart never re-renders
+  // from scratch.
   useEffect(() => {
     if (!activeMetric) return;
     let cancelled = false;
@@ -91,6 +104,62 @@ export function LiquidityChartModal({
       cancelled = true;
     };
   }, [symbol, activeMetric, windowChoice]);
+
+  // Live update — only for WS-sourced metrics. Polls every LIVE_POLL_MS
+  // with `since=last_ts`, appending new samples to the existing series.
+  // Keeping `series` out of the dep array — the interval uses a ref to
+  // read the current latest ts, so it doesn't tear down on every poll.
+  const seriesRef = useRef<LiqMetricSeries | null>(null);
+  useEffect(() => {
+    seriesRef.current = series;
+  }, [series]);
+
+  useEffect(() => {
+    if (!activeMetric) return;
+    if (!REALTIME_METRICS.has(activeMetric)) return;
+    const id = window.setInterval(async () => {
+      const cur = seriesRef.current;
+      const latest = cur?.samples?.length ? cur.samples[cur.samples.length - 1].ts : undefined;
+      try {
+        const incoming = await getLiquidityMetricSeries(
+          symbol,
+          activeMetric,
+          windowChoice,
+          latest,
+        );
+        if (!incoming.samples?.length) return;
+        setSeries((prev) =>
+          prev && prev.metric === incoming.metric
+            ? { ...prev, samples: [...prev.samples, ...incoming.samples] }
+            : incoming,
+        );
+      } catch {
+        // transient — next tick retries
+      }
+    }, LIVE_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [symbol, activeMetric, windowChoice]);
+
+  // Heartbeat — tell the worker to keep WS subscribed to `symbol`. The
+  // first call also registers the subscription. The worker drops it
+  // within TTL after the modal closes (or the tab dies).
+  useEffect(() => {
+    let cancelled = false;
+    const beat = () => {
+      heartbeatLiquidityActive(symbol).catch(() => {
+        // best-effort — subscription has 2 min TTL on the server so a
+        // single missed heartbeat is recoverable
+      });
+    };
+    beat();
+    const id = window.setInterval(() => {
+      if (!cancelled) beat();
+    }, HEARTBEAT_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [symbol]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

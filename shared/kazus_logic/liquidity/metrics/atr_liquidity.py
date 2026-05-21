@@ -40,6 +40,7 @@ class _AtrLiquidity:
     name: str = "atr_liquidity"
     label: str = "ATR Liquidity"
     requires: tuple[str, ...] = ("klines",)
+    source: str = "rest"
 
     async def compute(self, ctx: MetricContext) -> Optional[float]:
         klines = ctx.h1_klines

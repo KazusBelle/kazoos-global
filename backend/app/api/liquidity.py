@@ -14,15 +14,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from kazus_db.models import LiquiditySample
+from kazus_db.models import LiquidityActiveSub, LiquiditySample
 from kazus_logic.liquidity import REGISTRY
 
 from ..db.base import get_db
@@ -223,6 +225,7 @@ async def get_metric_series(
     symbol: str,
     metric: str = Query(...),
     window: str = Query("24h"),
+    since: Optional[int] = Query(None, description="If set, return only samples with ts > since (epoch ms)"),
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> MetricSeriesResponse:
@@ -235,13 +238,17 @@ async def get_metric_series(
         )
     symbol = symbol.upper()
 
-    since_ms = int(time.time() * 1000) - _WINDOW_MS[window]
+    floor_ms = int(time.time() * 1000) - _WINDOW_MS[window]
+    # `since` lets the frontend do incremental polling (live mode) — only
+    # samples newer than the last seen ts are returned. When omitted, the
+    # full window is returned for initial load.
+    cutoff_ms = max(floor_ms, since) if since is not None else floor_ms
     rows = (
         db.query(LiquiditySample)
         .filter(
             LiquiditySample.symbol == symbol,
             LiquiditySample.metric == metric,
-            LiquiditySample.ts >= since_ms,
+            LiquiditySample.ts > cutoff_ms,
         )
         .order_by(LiquiditySample.ts.asc())
         .all()
@@ -258,3 +265,47 @@ async def get_metric_series(
         window=window,
         samples=samples,
     )
+
+
+# ── Realtime subscription heartbeat ────────────────────────────────────────
+
+
+class ActiveSubIn(BaseModel):
+    symbol: str
+    ttl_seconds: int = 120  # bumped forward on each heartbeat
+
+
+class ActiveSubOut(BaseModel):
+    symbol: str
+    expires_at: float
+
+
+@router.post("/active", response_model=ActiveSubOut)
+async def heartbeat_active_sub(
+    payload: ActiveSubIn = Body(...),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ActiveSubOut:
+    """Tell the worker to keep a WS subscription alive for `symbol`.
+
+    UPSERT on `symbol`: first call inserts a row, subsequent calls (the
+    frontend's 30s heartbeat) just bump `expires_at` forward. When the
+    modal closes (or the user navigates away), heartbeats stop and the
+    worker drops the subscription within ttl_seconds.
+    """
+    symbol = payload.symbol.upper()
+    ttl = max(10, min(int(payload.ttl_seconds), 600))
+    expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl)
+
+    stmt = (
+        pg_insert(LiquidityActiveSub)
+        .values(symbol=symbol, expires_at=expires_at)
+        .on_conflict_do_update(
+            index_elements=["symbol"],
+            set_={"expires_at": expires_at, "updated_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+        )
+    )
+    db.execute(stmt)
+    db.commit()
+
+    return ActiveSubOut(symbol=symbol, expires_at=expires_at.timestamp())

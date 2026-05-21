@@ -17,6 +17,7 @@ class _Spread:
     name: str = "spread"
     label: str = "Spread"
     requires: tuple[str, ...] = ("depth",)
+    source: str = "rest"
 
     async def compute(self, ctx: MetricContext) -> Optional[float]:
         depth = ctx.depth

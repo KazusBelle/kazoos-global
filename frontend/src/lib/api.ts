@@ -326,9 +326,18 @@ export async function getLiquidityMetricSeries(
   symbol: string,
   metric: string,
   window: "1h" | "24h" | "7d" | "30d",
+  since?: number,
 ) {
   const params = new URLSearchParams({ metric, window });
+  if (since != null) params.set("since", String(since));
   return request<LiqMetricSeries>(
     `/liquidity/metrics/${encodeURIComponent(symbol)}?${params.toString()}`,
   );
+}
+
+export async function heartbeatLiquidityActive(symbol: string, ttlSeconds = 120) {
+  return request<{ symbol: string; expires_at: number }>("/liquidity/active", {
+    method: "POST",
+    body: JSON.stringify({ symbol, ttl_seconds: ttlSeconds }),
+  });
 }

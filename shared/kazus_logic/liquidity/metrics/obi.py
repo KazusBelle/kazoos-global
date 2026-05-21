@@ -20,6 +20,7 @@ class _Obi:
     name: str = "obi"
     label: str = "OBI"
     requires: tuple[str, ...] = ("depth",)
+    source: str = "rest"
 
     async def compute(self, ctx: MetricContext) -> Optional[float]:
         depth = ctx.depth

@@ -61,6 +61,7 @@ class Metric(Protocol):
     name: str                       # stable key, e.g. "atr_liquidity"
     label: str                      # display name, e.g. "ATR Liquidity"
     requires: tuple[str, ...]       # {"klines", "depth", "price"}
+    source: str                     # "rest" or "ws"
 
     async def compute(self, ctx: MetricContext) -> Optional[float]:
         ...

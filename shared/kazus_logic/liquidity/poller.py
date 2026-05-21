@@ -31,15 +31,23 @@ CONCURRENCY = 8       # parallel symbol fetches; 8×(klines+depth) ≈ 16 req/s 
 RETENTION_DAYS = 35   # keep ~1 month of samples
 
 
+def _rest_metrics():
+    """Only REST-source metrics participate in the 60s polling cycle.
+    WS metrics are owned by the realtime sampler and would just write
+    NULLs if dispatched here."""
+    return [m for m in REGISTRY.values() if getattr(m, "source", "rest") == "rest"]
+
+
 async def _process_symbol(
     client: httpx.AsyncClient,
     symbol: str,
     now_ts: int,
 ) -> List[dict]:
-    """Fetch upstream for one symbol, run every metric in the registry,
-    return rows ready for batch insert."""
-    needs_klines = any("klines" in m.requires for m in REGISTRY.values())
-    needs_depth = any("depth" in m.requires for m in REGISTRY.values())
+    """Fetch upstream for one symbol, run every REST metric in the
+    registry, return rows ready for batch insert."""
+    rest_metrics = _rest_metrics()
+    needs_klines = any("klines" in m.requires for m in rest_metrics)
+    needs_depth = any("depth" in m.requires for m in rest_metrics)
 
     klines_task = fetch_h1_klines(client, symbol) if needs_klines else None
     depth_task = fetch_depth(client, symbol) if needs_depth else None
@@ -64,7 +72,7 @@ async def _process_symbol(
     )
 
     rows: list[dict] = []
-    for metric in REGISTRY.values():
+    for metric in rest_metrics:
         try:
             value = await metric.compute(ctx)
         except Exception as exc:  # noqa: BLE001

@@ -138,6 +138,31 @@ class LiquiditySample(Base):
     price: Mapped[Optional[float]] = mapped_column(Float)
 
 
+class LiquidityActiveSub(Base):
+    """A request that a symbol be live-tracked via WS for liquidity
+    microstructure metrics. Written by the backend when a modal opens
+    (and refreshed every ~30s via heartbeat). The worker reconciles the
+    subscription set against this table every few seconds; rows where
+    `expires_at < now()` are treated as no longer active and the worker
+    unsubscribes from the corresponding Binance streams.
+
+    One row per symbol — uniqueness is on the symbol so the heartbeat is
+    an UPSERT that just bumps `expires_at` forward.
+    """
+
+    __tablename__ = "liquidity_active_subs"
+    __table_args__ = (
+        UniqueConstraint("symbol", name="uq_liquidity_active_subs_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class UserTDAState(Base):
     __tablename__ = "user_tda_states"
     __table_args__ = (
