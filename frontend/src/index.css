@@ -2,6 +2,17 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Spectrum Sans variable font. Single file covers the whole weight axis
+   (100-900), so font-weight: 300/500/600/700/… all resolve from this. */
+@font-face {
+  font-family: "Spectrum Sans";
+  src: url("/fonts/spectrum/SpectrumSans-VF.ttf") format("truetype-variations"),
+       url("/fonts/spectrum/SpectrumSans-VF.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 html,
 body,
 #root {

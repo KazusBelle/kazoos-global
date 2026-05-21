@@ -15,12 +15,13 @@ export default {
         ote: "#529e79",
       },
       fontFamily: {
-        // Single-family override: Comfortaa everywhere. font-mono still
-        // resolves so existing class usages don't break, but it now points
-        // at the same display sans — tables lose tabular column alignment,
-        // which is the deliberate global-look trade.
-        mono: ["Comfortaa", "ui-sans-serif", "system-ui", "sans-serif"],
-        sans: ["Comfortaa", "ui-sans-serif", "system-ui", "sans-serif"],
+        // Single-family override: Spectrum Sans (self-hosted variable
+        // font, see index.css @font-face) for the whole UI. font-mono
+        // still resolves so existing utility-class usages don't break;
+        // it just points at the same sans, so table number columns lose
+        // tabular alignment — deliberate global-look trade.
+        mono: ["Spectrum Sans", "ui-sans-serif", "system-ui", "sans-serif"],
+        sans: ["Spectrum Sans", "ui-sans-serif", "system-ui", "sans-serif"],
       },
     },
   },
