@@ -1,13 +1,21 @@
 import { useEffect, useState } from "react";
 import { getLiquidityTop, type LiqRow } from "../lib/api";
 
-const LIMIT_KEY = "kazus_liq_limit";
-const ALLOWED_LIMITS = [100, 250, 500] as const;
-type LiqLimit = (typeof ALLOWED_LIMITS)[number];
+// Non-overlapping slices of CoinGecko's top-500 by market cap. The label
+// shows the upper bound; the slice is (prev_upper, upper]. Tier 1 is
+// ranks 1-100, Tier 2 101-250, Tier 3 251-500.
+const SLICES = [
+  { label: 100, min: 1, max: 100 },
+  { label: 250, min: 101, max: 250 },
+  { label: 500, min: 251, max: 500 },
+] as const;
+type SliceLabel = (typeof SLICES)[number]["label"];
 
-function loadLimit(): LiqLimit {
-  const raw = Number(localStorage.getItem(LIMIT_KEY));
-  if (ALLOWED_LIMITS.includes(raw as LiqLimit)) return raw as LiqLimit;
+const SLICE_KEY = "kazus_liq_slice";
+
+function loadSlice(): SliceLabel {
+  const raw = Number(localStorage.getItem(SLICE_KEY));
+  if (SLICES.some((s) => s.label === raw)) return raw as SliceLabel;
   return 100;
 }
 
@@ -41,24 +49,27 @@ function displayName(symbol: string): string {
 }
 
 export function Liquidity() {
-  const [limit, setLimitState] = useState<LiqLimit>(loadLimit);
-  const [rows, setRows] = useState<LiqRow[] | null>(null);
+  const [sliceLabel, setSliceLabelState] = useState<SliceLabel>(loadSlice);
+  const [allRows, setAllRows] = useState<LiqRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  function setLimit(next: LiqLimit) {
-    setLimitState(next);
-    localStorage.setItem(LIMIT_KEY, String(next));
+  function setSlice(next: SliceLabel) {
+    setSliceLabelState(next);
+    localStorage.setItem(SLICE_KEY, String(next));
   }
 
+  // Always fetch the full 500-wide universe once. Slicing into the three
+  // tiers is a pure client-side filter on rank, so switching tiers is
+  // instant and there's no need to re-hit CoinGecko per click.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    getLiquidityTop(limit)
+    getLiquidityTop(500)
       .then((res) => {
         if (cancelled) return;
-        setRows(res.rows);
+        setAllRows(res.rows);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -71,7 +82,12 @@ export function Liquidity() {
     return () => {
       cancelled = true;
     };
-  }, [limit]);
+  }, []);
+
+  const currentSlice = SLICES.find((s) => s.label === sliceLabel)!;
+  const rows = allRows
+    ? allRows.filter((r) => r.rank >= currentSlice.min && r.rank <= currentSlice.max)
+    : null;
 
   return (
     <div className="space-y-4">
@@ -83,18 +99,18 @@ export function Liquidity() {
           </div>
         </div>
         <div className="flex items-center gap-1">
-          {ALLOWED_LIMITS.map((n) => (
+          {SLICES.map((s) => (
             <button
-              key={n}
-              onClick={() => setLimit(n)}
+              key={s.label}
+              onClick={() => setSlice(s.label)}
               className={`h-8 px-3 rounded-md border text-[11px] uppercase tracking-[0.22em] transition-colors ${
-                limit === n
+                sliceLabel === s.label
                   ? "border-accent text-accent bg-accent/10"
                   : "border-border text-muted hover:text-zinc-200 hover:border-accent/50"
               }`}
-              title={`Top ${n} by market cap`}
+              title={`Ranks ${s.min}-${s.max} by market cap`}
             >
-              TOP {n}
+              TOP {s.label}
             </button>
           ))}
         </div>
@@ -162,8 +178,16 @@ export function Liquidity() {
                           }}
                         />
                       )}
-                      <span className="font-semibold text-zinc-100">{displayName(row.binance_symbol)}</span>
-                      <span className="text-[10px] uppercase tracking-[0.14em] text-muted">{row.name}</span>
+                      {/* Fixed 6ch slot reserves a uniform gap between
+                          ticker and name regardless of ticker length — TRX,
+                          BTC, 1INCH all leave the name column landing at
+                          the same x-offset. */}
+                      <span className="font-semibold text-zinc-100 inline-block min-w-[6ch]">
+                        {displayName(row.binance_symbol)}
+                      </span>
+                      <span className="text-[10px] lowercase tracking-[0.14em] text-muted">
+                        {row.name}
+                      </span>
                     </div>
                   </td>
                   <td className="px-3 py-2 text-right text-zinc-200">{formatPrice(row.price)}</td>
