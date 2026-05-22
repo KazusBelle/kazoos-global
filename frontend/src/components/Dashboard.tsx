@@ -26,6 +26,7 @@ import {
   type ChartTheme,
 } from "./CandleChart";
 import { Coordination } from "./Coordination";
+import { Discovery } from "./Discovery";
 import { Liquidity } from "./Liquidity";
 import { MemoryPage } from "./Memory";
 import { Meta } from "./Meta";
@@ -61,7 +62,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "server";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "disc" | "server";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -81,6 +82,23 @@ function FibIcon({ size = 20 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
       <circle cx="12" cy="12" r="9.5" />
       <path d="M12 12 C16 9 17.5 5.5 14.5 3 C11 0 7 3 7 7 C7 11 10 13.5 13 14.5 C16.5 15.5 19 14 18.5 10.5" />
+    </svg>
+  );
+}
+
+function DiscoveryIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <circle cx="10" cy="10" r="6" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M10 4v2M10 14v2M4 10h2M14 10h2M5.8 5.8l1.4 1.4M12.8 12.8l1.4 1.4M5.8 14.2l1.4-1.4M12.8 7.2l1.4-1.4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+      <circle cx="10" cy="10" r="1.6" fill="currentColor" />
     </svg>
   );
 }
@@ -1512,6 +1530,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("mem")}
             title="Memory · Genealogy · Evolution · Cycles"
           />
+          <NavBtn
+            active={page === "disc"}
+            open={sidebarOpen}
+            icon={<DiscoveryIcon size={20} />}
+            label="DISC"
+            onClick={() => setPage("disc")}
+            title="Discovery · Patterns · Archetypes · Hidden Regimes"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1724,6 +1750,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         {page === "coord" && <Coordination />}
 
         {page === "mem" && <MemoryPage />}
+
+        {page === "disc" && <Discovery />}
       </main>
 
       {/* ── Chart Modal ── */}

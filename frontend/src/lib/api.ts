@@ -1425,3 +1425,180 @@ export type NarrativeChronicle = {
 export async function getNarrativeChronicle(lookback_days = 21) {
   return request<NarrativeChronicle>(`/liquidity/research/narrative-chronicle?lookback_days=${lookback_days}`);
 }
+
+// ── Phase-14 discovery ────────────────────────────────────────────────────
+
+export type DiscoveredPattern = {
+  discovered_pattern_id: string;
+  signature: Record<string, "low" | "mid" | "high">;
+  support: number;
+  outcome_rate: number;
+  lift: number | null;
+  dominant_alert_kind: string | null;
+  dominant_alert_count: number;
+  novelty_score: number;
+};
+
+export type PatternDiscovery = {
+  since_ms: number;
+  min_support: number;
+  bucket_minutes: number;
+  metrics: string[];
+  base_rate: number;
+  total_buckets: number;
+  patterns: DiscoveredPattern[];
+};
+
+export async function getPatternDiscovery(opts: { since_ms?: number; min_support?: number; bucket_minutes?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.min_support != null) usp.set("min_support", String(opts.min_support));
+  if (opts.bucket_minutes != null) usp.set("bucket_minutes", String(opts.bucket_minutes));
+  return request<PatternDiscovery>(`/liquidity/research/pattern-discovery${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type Archetype = {
+  archetype_id: string;
+  archetype_label: string;
+  cluster_id: number;
+  size: number;
+  dominant_kind: string;
+  kinds: Record<string, number>;
+  frequency_per_day: number;
+  avg_novelty: number;
+  escalation_profile: string;
+  recovery_probability: number;
+  structural_severity: number;
+  centroid: Record<string, number>;
+};
+
+export type CrisisArchetypes = { archetypes: Archetype[]; anomaly_count: number; vocabulary: string[] };
+
+export async function getCrisisArchetypes(max_archetypes = 8) {
+  return request<CrisisArchetypes>(`/liquidity/research/crisis-archetypes?max_archetypes=${max_archetypes}`);
+}
+
+export type HiddenRegimeCluster = {
+  cluster_id: number;
+  label_hint: string;
+  size: number;
+  dominant_coordinated_state: string | null;
+  earliest_ts: number;
+  latest_ts: number;
+  centroid: Record<string, number>;
+  emergent_regime_score: number;
+  regime_stability: number;
+  is_emergent: boolean;
+};
+
+export type HiddenRegimes = { since_ms: number; snapshot_count: number; clusters: HiddenRegimeCluster[] };
+
+export async function getHiddenRegimes(opts: { lookback_days?: number; max_clusters?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.max_clusters != null) usp.set("max_clusters", String(opts.max_clusters));
+  return request<HiddenRegimes>(`/liquidity/research/hidden-regimes${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type PropagationEdge = {
+  from_symbol: string;
+  to_symbol: string;
+  count: number;
+  avg_lead_ms: number;
+  avg_lead_s: number;
+};
+
+export type PropagationNode = { symbol: string; out_count: number; in_count: number; net_lead: number };
+
+export type Propagation = {
+  since_ms: number;
+  lead_window_ms: number;
+  edges: PropagationEdge[];
+  nodes: PropagationNode[];
+  systemic_contagion_score: number;
+  average_propagation_velocity_s: number | null;
+  total_alerts: number;
+};
+
+export async function getPropagation(opts: { lookback_days?: number; lead_window_minutes?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.lead_window_minutes != null) usp.set("lead_window_minutes", String(opts.lead_window_minutes));
+  return request<Propagation>(`/liquidity/research/propagation${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type EvolutionaryBehavior = {
+  lookback_days: number;
+  bucket_days: number;
+  behavioral_shift_rate: number;
+  instability_acceleration: number;
+  structural_maturity_score: number;
+  evolutionary_state: "DETERIORATION" | "INSTABILITY_GROWTH" | "SLOW_MUTATION" | "STABLE_MATURATION";
+  bad_directions: number;
+  metric_trends: EvolutionMetric[];
+  regime_entropy_series: EntropyPoint[];
+};
+
+export async function getEvolutionaryBehavior(opts: { lookback_days?: number; bucket_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.bucket_days != null) usp.set("bucket_days", String(opts.bucket_days));
+  return request<EvolutionaryBehavior>(`/liquidity/research/evolutionary-behavior${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type AbstractionRow = {
+  archetype_id: string;
+  label: string;
+  share_of_memory: number;
+  members: number;
+  frequency_per_day: number;
+  structural_severity: number;
+};
+
+export type MemoryAbstraction = {
+  total_anomalies: number;
+  abstractions: AbstractionRow[];
+  memory_density_score: number;
+};
+
+export async function getMemoryAbstraction() {
+  return request<MemoryAbstraction>("/liquidity/research/memory-abstraction");
+}
+
+export type ForecastEntry = {
+  metric: string;
+  current: number;
+  slope_per_day: number;
+  forecast_in_days: number;
+  forecast_value: number;
+  rmse: number;
+  confidence: number;
+};
+
+export type IntelligenceForecast = {
+  horizon_days: number;
+  forecasts: ForecastEntry[];
+  trajectory: "ESCALATING" | "DEESCALATING" | "STEADY" | "DRIFTING" | "UNKNOWN" | null;
+  snapshot_count: number;
+};
+
+export async function getIntelligenceForecast(horizon_days = 7) {
+  return request<IntelligenceForecast>(`/liquidity/research/intelligence-forecast?horizon_days=${horizon_days}`);
+}
+
+export type AdaptationRec = {
+  action: "STRENGTHEN" | "WEAKEN" | "TIGHTEN_THRESHOLD" | "LOOSEN_THRESHOLD" | "REWEIGHT_UNSTABLE" | "STRENGTHEN_EDGE";
+  target: string;
+  rationale: string;
+  importance_shift: number;
+};
+
+export type AdaptationOut = {
+  fetched_at_ms: number;
+  recommendations: AdaptationRec[];
+  adaptation_score: number;
+};
+
+export async function getAdaptationRecommendations() {
+  return request<AdaptationOut>("/liquidity/research/adaptation-recommendations");
+}

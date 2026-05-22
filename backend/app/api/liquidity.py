@@ -2688,3 +2688,234 @@ async def narrative_chronicle_endpoint(
     _user: User = Depends(get_current_user),
 ) -> NarrativeChronicleOut:
     return NarrativeChronicleOut(**_research.narrative_chronicle(db, lookback_days=lookback_days))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-14 — Discovery endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class DiscoveredPattern(BaseModel):
+    discovered_pattern_id: str
+    signature: dict
+    support: int
+    outcome_rate: float
+    lift: Optional[float]
+    dominant_alert_kind: Optional[str]
+    dominant_alert_count: int
+    novelty_score: float
+
+
+class PatternDiscoveryOut(BaseModel):
+    since_ms: int
+    min_support: int
+    bucket_minutes: int
+    metrics: List[str]
+    base_rate: float
+    total_buckets: int
+    patterns: List[DiscoveredPattern]
+
+
+@router.get("/research/pattern-discovery", response_model=PatternDiscoveryOut)
+async def pattern_discovery_endpoint(
+    since_ms: Optional[int] = Query(None),
+    min_support: int = Query(12, ge=3, le=200),
+    bucket_minutes: int = Query(30, ge=5, le=120),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> PatternDiscoveryOut:
+    if since_ms is None:
+        since_ms = int(time.time() * 1000) - 14 * 24 * 3600 * 1000
+    return PatternDiscoveryOut(**_research.discover_patterns(
+        db, since_ms=since_ms, min_support=min_support, bucket_minutes=bucket_minutes,
+    ))
+
+
+class Archetype(BaseModel):
+    archetype_id: str
+    archetype_label: str
+    cluster_id: int
+    size: int
+    dominant_kind: str
+    kinds: dict
+    frequency_per_day: float
+    avg_novelty: float
+    escalation_profile: str
+    recovery_probability: float
+    structural_severity: float
+    centroid: dict
+
+
+class CrisisArchetypesOut(BaseModel):
+    archetypes: List[Archetype]
+    anomaly_count: int
+    vocabulary: List[str]
+
+
+@router.get("/research/crisis-archetypes", response_model=CrisisArchetypesOut)
+async def crisis_archetypes_endpoint(
+    max_archetypes: int = Query(8, ge=1, le=20),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> CrisisArchetypesOut:
+    return CrisisArchetypesOut(**_research.crisis_archetypes(db, max_archetypes=max_archetypes))
+
+
+class HiddenRegimeCluster(BaseModel):
+    cluster_id: int
+    label_hint: str
+    size: int
+    dominant_coordinated_state: Optional[str]
+    earliest_ts: int
+    latest_ts: int
+    centroid: dict
+    emergent_regime_score: float
+    regime_stability: float
+    is_emergent: bool
+
+
+class HiddenRegimesOut(BaseModel):
+    since_ms: int
+    snapshot_count: int
+    clusters: List[HiddenRegimeCluster]
+
+
+@router.get("/research/hidden-regimes", response_model=HiddenRegimesOut)
+async def hidden_regimes_endpoint(
+    lookback_days: int = Query(30, ge=7, le=180),
+    max_clusters: int = Query(6, ge=1, le=12),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> HiddenRegimesOut:
+    return HiddenRegimesOut(**_research.hidden_regimes(db, lookback_days=lookback_days, max_clusters=max_clusters))
+
+
+class PropagationEdge(BaseModel):
+    from_symbol: str
+    to_symbol: str
+    count: int
+    avg_lead_ms: float
+    avg_lead_s: float
+
+
+class PropagationNode(BaseModel):
+    symbol: str
+    out_count: int
+    in_count: int
+    net_lead: int
+
+
+class PropagationOut(BaseModel):
+    since_ms: int
+    lead_window_ms: int
+    edges: List[PropagationEdge]
+    nodes: List[PropagationNode]
+    systemic_contagion_score: float
+    average_propagation_velocity_s: Optional[float]
+    total_alerts: int
+
+
+@router.get("/research/propagation", response_model=PropagationOut)
+async def propagation_endpoint(
+    lookback_days: int = Query(14, ge=3, le=60),
+    lead_window_minutes: int = Query(30, ge=5, le=180),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> PropagationOut:
+    return PropagationOut(**_research.propagation_graph(
+        db, lookback_days=lookback_days, lead_window_ms=lead_window_minutes * 60_000,
+    ))
+
+
+class EvolutionaryOut(BaseModel):
+    lookback_days: int
+    bucket_days: int
+    behavioral_shift_rate: float
+    instability_acceleration: float
+    structural_maturity_score: float
+    evolutionary_state: str   # DETERIORATION | INSTABILITY_GROWTH | SLOW_MUTATION | STABLE_MATURATION
+    bad_directions: int
+    metric_trends: List[EvolutionMetric]
+    regime_entropy_series: List[EntropyPoint]
+
+
+@router.get("/research/evolutionary-behavior", response_model=EvolutionaryOut)
+async def evolutionary_behavior_endpoint(
+    lookback_days: int = Query(60, ge=14, le=180),
+    bucket_days: int = Query(7, ge=1, le=14),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> EvolutionaryOut:
+    return EvolutionaryOut(**_research.evolutionary_behavior(
+        db, lookback_days=lookback_days, bucket_days=bucket_days,
+    ))
+
+
+class AbstractionRow(BaseModel):
+    archetype_id: str
+    label: str
+    share_of_memory: float
+    members: int
+    frequency_per_day: float
+    structural_severity: float
+
+
+class MemoryAbstractionOut(BaseModel):
+    total_anomalies: int
+    abstractions: List[AbstractionRow]
+    memory_density_score: float
+
+
+@router.get("/research/memory-abstraction", response_model=MemoryAbstractionOut)
+async def memory_abstraction_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MemoryAbstractionOut:
+    return MemoryAbstractionOut(**_research.memory_abstraction(db))
+
+
+class ForecastEntry(BaseModel):
+    metric: str
+    current: float
+    slope_per_day: float
+    forecast_in_days: int
+    forecast_value: float
+    rmse: float
+    confidence: float
+
+
+class IntelligenceForecastOut(BaseModel):
+    horizon_days: int
+    forecasts: List[ForecastEntry]
+    trajectory: Optional[str] = None
+    snapshot_count: int
+
+
+@router.get("/research/intelligence-forecast", response_model=IntelligenceForecastOut)
+async def intelligence_forecast_endpoint(
+    horizon_days: int = Query(7, ge=1, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> IntelligenceForecastOut:
+    return IntelligenceForecastOut(**_research.intelligence_evolution_forecast(db, horizon_days=horizon_days))
+
+
+class AdaptationRec(BaseModel):
+    action: str    # STRENGTHEN | WEAKEN | TIGHTEN_THRESHOLD | LOOSEN_THRESHOLD | REWEIGHT_UNSTABLE | STRENGTHEN_EDGE
+    target: str
+    rationale: str
+    importance_shift: float
+
+
+class AdaptationOut(BaseModel):
+    fetched_at_ms: int
+    recommendations: List[AdaptationRec]
+    adaptation_score: float
+
+
+@router.get("/research/adaptation-recommendations", response_model=AdaptationOut)
+async def adaptation_recommendations_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AdaptationOut:
+    return AdaptationOut(**_research.adaptation_recommendations(db))

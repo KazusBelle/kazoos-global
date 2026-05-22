@@ -3939,3 +3939,710 @@ def narrative_chronicle(db: Session, lookback_days: int = 21) -> dict:
         "first_state": state_first,
         "last_state": state_last,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-14 — Autonomous Pattern Discovery & Evolutionary Intelligence
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Read-only analytics that look at the data the previous phases produced
+# (samples, alert history, anomaly memory, intelligence history) and
+# extract recurring structures, propagation graphs, evolutionary trends
+# and adaptation recommendations.
+#
+# Deliberately no ML / no black-box. Everything here is statistical:
+# tertile co-occurrence, agglomerative clustering, lag-correlation,
+# OLS regression on weekly buckets.
+
+
+# ── Emergent pattern discovery ────────────────────────────────────────────
+
+
+PATTERN_METRICS: Tuple[str, ...] = (
+    "fragility_score", "resiliency_score", "credible_depth",
+    "spread", "liq_stress", "funding_z", "oi_delta_1h",
+)
+
+
+def discover_patterns(
+    db: Session,
+    since_ms: int,
+    min_support: int = 12,
+    bucket_minutes: int = 30,
+) -> dict:
+    """Discover recurring (metric -> tertile) combinations + their
+    downstream alert rates.
+
+    Pulls a long bucketed pivot, tertile-codes each metric per-symbol
+    cohort percentiles over the same window, hashes each row to a
+    pattern signature, and reports the highest-frequency patterns
+    along with: how often any alert followed within 60m, dominant
+    alert kind, novelty (1 − recurrence_share).
+
+    `min_support` filters out one-off shapes; bucket_minutes controls
+    temporal granularity.
+    """
+    bucket_ms = bucket_minutes * 60_000
+    rows = db.execute(
+        text(
+            """
+            SELECT
+              symbol, metric,
+              (ts / :bucket_ms) * :bucket_ms AS bucket_ts,
+              AVG(value) AS v
+            FROM liquidity_samples
+            WHERE metric = ANY(:metrics) AND ts >= :since AND value IS NOT NULL
+            GROUP BY symbol, metric, bucket_ts
+            """
+        ),
+        {"bucket_ms": bucket_ms, "metrics": list(PATTERN_METRICS), "since": since_ms},
+    ).fetchall()
+
+    pivot: Dict[Tuple[str, int], Dict[str, float]] = {}
+    for r in rows:
+        pivot.setdefault((r.symbol, int(r.bucket_ts)), {})[r.metric] = float(r.v)
+
+    by_metric: Dict[str, List[float]] = {m: [] for m in PATTERN_METRICS}
+    for mv in pivot.values():
+        for m, v in mv.items():
+            by_metric[m].append(v)
+    for m in by_metric:
+        by_metric[m].sort()
+    cuts: Dict[str, Tuple[float, float]] = {}
+    for m, xs in by_metric.items():
+        cuts[m] = (_quantile(xs, 1 / 3), _quantile(xs, 2 / 3))
+
+    # Pre-load downstream alerts.
+    alert_rows = db.execute(
+        text(
+            """
+            SELECT symbol, started_at_ms, kind
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+    alerts_by_sym: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+    for a in alert_rows:
+        alerts_by_sym[a.symbol].append((int(a.started_at_ms), a.kind))
+    for s in alerts_by_sym:
+        alerts_by_sym[s].sort()
+
+    window_ms = 60 * 60_000
+
+    def _outcome(sym: str, ts: int) -> Optional[str]:
+        arr = alerts_by_sym.get(sym, [])
+        if not arr:
+            return None
+        lo, hi = 0, len(arr) - 1
+        pos = len(arr)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if arr[mid][0] >= ts:
+                pos = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        if pos < len(arr) and arr[pos][0] <= ts + window_ms:
+            return arr[pos][1]
+        return None
+
+    patterns: Dict[Tuple[str, ...], dict] = {}
+    total_buckets = 0
+    for (sym, bts), mv in pivot.items():
+        if not all(m in mv for m in PATTERN_METRICS):
+            continue
+        sig = tuple(_tertile(mv[m], *cuts[m]) for m in PATTERN_METRICS)
+        outcome = _outcome(sym, bts)
+        rec = patterns.setdefault(sig, {"count": 0, "outcomes": 0, "kinds": defaultdict(int)})
+        rec["count"] += 1
+        if outcome:
+            rec["outcomes"] += 1
+            rec["kinds"][outcome] += 1
+        total_buckets += 1
+
+    out: List[dict] = []
+    base_rate = sum(p["outcomes"] for p in patterns.values()) / max(1, total_buckets)
+    for i, (sig, agg) in enumerate(patterns.items(), start=1):
+        if agg["count"] < min_support:
+            continue
+        rate = agg["outcomes"] / agg["count"] if agg["count"] > 0 else 0.0
+        lift = rate / base_rate if base_rate > 0 else None
+        dom_kind, dom_n = max(agg["kinds"].items(), key=lambda kv: kv[1]) if agg["kinds"] else (None, 0)
+        novelty = max(0.0, 100.0 * (1.0 - agg["count"] / total_buckets))
+        out.append({
+            "discovered_pattern_id": f"P{abs(hash(sig)) % 10**8:08d}",
+            "signature": dict(zip(PATTERN_METRICS, sig)),
+            "support": agg["count"],
+            "outcome_rate": rate,
+            "lift": lift,
+            "dominant_alert_kind": dom_kind,
+            "dominant_alert_count": dom_n,
+            "novelty_score": novelty,
+        })
+    out.sort(key=lambda r: -(r["lift"] or 0))
+    return {
+        "since_ms": since_ms,
+        "min_support": min_support,
+        "bucket_minutes": bucket_minutes,
+        "metrics": list(PATTERN_METRICS),
+        "base_rate": base_rate,
+        "total_buckets": total_buckets,
+        "patterns": out[:40],
+    }
+
+
+# ── Crisis archetype discovery ────────────────────────────────────────────
+
+
+# Each archetype is named by a heuristic over the cluster's dominant
+# kind + average drift signature. We deliberately keep the label list
+# fixed so the UI gets a stable vocabulary; what's "discovered" is
+# which clusters MAP to which archetype, not the archetype names
+# themselves.
+ARCHETYPE_HINTS = (
+    "slow_deterioration",
+    "liquidity_evaporation",
+    "instability_propagation",
+    "explosive_cascade",
+    "venue_fragmentation",
+    "speculative_overheating",
+    "recovery_exhaustion",
+    "isolated_outlier",
+)
+
+
+def crisis_archetypes(db: Session, max_archetypes: int = 8) -> dict:
+    """Group anomaly_memory rows into archetype clusters and label each
+    by heuristic on the centroid + dominant kind. Reuses
+    crisis_clusters' agglomerative grouping then assigns archetype
+    labels."""
+    base = crisis_clusters(db, max_clusters=max_archetypes)
+    archetypes: List[dict] = []
+    for cl in base["clusters"]:
+        c = cl["centroid"]
+        # Heuristic labeller.
+        dom = cl["dominant_kind"]
+        size = cl["size"]
+        avg_novelty = cl["avg_novelty"]
+        label = "isolated_outlier"
+        if size >= 5 and "structural_break_score" in c and c.get("structural_break_score", 0) >= 55:
+            label = "slow_deterioration"
+        if dom == "venue_divergence":
+            label = "venue_fragmentation"
+        if dom == "pre_cascade":
+            label = "explosive_cascade"
+        if c.get("credible_depth", 1e9) < (c.get("credible_depth_p10", 1e9) or 1e9) and c.get("spread", 0) > 0.001:
+            label = "liquidity_evaporation"
+        if c.get("funding_z", 0) and abs(c["funding_z"]) > 2 and c.get("oi_delta_1h", 0) and c["oi_delta_1h"] > 0:
+            label = "speculative_overheating"
+        if dom == "edge_inversion":
+            label = "recovery_exhaustion"
+        if cl["frequency_per_day"] >= 1.0 and dom == "structural_break":
+            label = "instability_propagation"
+
+        # Escalation profile (just a stub for now: severity ratio).
+        escalation = "elevated" if avg_novelty >= 60 else "stable"
+        # Recovery probability — heuristic on how often this cluster
+        # was followed by a sample of the engine returning to QUIET in
+        # intelligence_history. Approximate via novelty inversely.
+        recovery_prob = max(0.0, min(1.0, 1.0 - (avg_novelty / 100.0)))
+        # Structural severity: size + dominant kind severity proxy.
+        severity_weight = {"pre_cascade": 0.9, "regime_collapse": 0.8, "structural_break": 0.6,
+                           "edge_inversion": 0.5, "venue_divergence": 0.4, "regime_emergence": 0.3}
+        severity = severity_weight.get(dom, 0.3) * min(1.0, size / 10.0)
+
+        archetypes.append({
+            "archetype_id": f"A{cl['cluster_id']:02d}",
+            "archetype_label": label,
+            "cluster_id": cl["cluster_id"],
+            "size": size,
+            "dominant_kind": dom,
+            "kinds": cl["kinds"],
+            "frequency_per_day": cl["frequency_per_day"],
+            "avg_novelty": avg_novelty,
+            "escalation_profile": escalation,
+            "recovery_probability": recovery_prob,
+            "structural_severity": severity,
+            "centroid": cl["centroid"],
+        })
+    return {"archetypes": archetypes, "anomaly_count": base["anomaly_count"], "vocabulary": list(ARCHETYPE_HINTS)}
+
+
+# ── Hidden regime discovery ──────────────────────────────────────────────
+
+
+def hidden_regimes(db: Session, lookback_days: int = 30, max_clusters: int = 6) -> dict:
+    """Cluster intelligence_history fingerprints into recurring states
+    that aren't 1:1 with a single coordinated_state. Each cluster gets
+    a descriptive label hint derived from its centroid; the UI shows
+    cluster size + dominant existing coordinated_state."""
+    import json as _json
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = (
+        db.query(LiquidityIntelligenceHistory)
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+    if len(rows) < 5:
+        return {"since_ms": since_ms, "clusters": [], "snapshot_count": len(rows)}
+
+    points: List[Tuple[Dict[str, float], LiquidityIntelligenceHistory]] = []
+    for r in rows:
+        try:
+            fp = _json.loads(r.fingerprint_json) if r.fingerprint_json else {}
+        except (TypeError, ValueError):
+            fp = {}
+        # Augment fingerprint with engine-level scalars so the cluster
+        # captures both microstructure and the coordinated assessment.
+        fp = dict(fp)
+        if r.synthesized_stress is not None:
+            fp["_stress"] = r.synthesized_stress
+        if r.structural_break_score is not None:
+            fp["_break"] = r.structural_break_score
+        if r.meta_intelligence_health is not None:
+            fp["_health"] = r.meta_intelligence_health
+        if r.regime_shift_probability is not None:
+            fp["_shift"] = r.regime_shift_probability
+        points.append((fp, r))
+
+    clusters: List[Dict[str, object]] = []
+    for fp, row in points:
+        best = None
+        best_d = None
+        for c in clusters:
+            d = _fingerprint_distance(fp, c["centroid"])  # type: ignore[arg-type]
+            if d is None:
+                continue
+            if best_d is None or d < best_d:
+                best_d = d
+                best = c
+        if best is not None and best_d is not None and best_d < 0.6:
+            best["members"].append(row)  # type: ignore[union-attr]
+            # Rolling centroid update.
+            old = best["centroid"]  # type: ignore[assignment]
+            merged = {k: (old.get(k, 0.0) + fp.get(k, old.get(k, 0.0))) / 2 for k in set(list(old.keys()) + list(fp.keys()))}
+            best["centroid"] = merged
+        else:
+            clusters.append({"centroid": dict(fp), "members": [row]})
+
+    clusters.sort(key=lambda c: -len(c["members"]))   # type: ignore[arg-type]
+    out_clusters: List[dict] = []
+    for idx, c in enumerate(clusters[:max_clusters], start=1):
+        members = c["members"]
+        states = [m.coordinated_state for m in members if m.coordinated_state]
+        dominant_state = max(set(states), key=states.count) if states else None
+        # Label hint: derive from centroid scalars.
+        cen = c["centroid"]
+        label = "hidden_state"
+        if cen.get("_stress", 0) >= 55 and cen.get("_break", 0) >= 50:
+            label = "structural_stress_basin"
+        elif cen.get("_break", 0) >= 50 and cen.get("_stress", 0) < 35:
+            label = "silent_structural_drift"
+        elif cen.get("_stress", 0) >= 45 and cen.get("_shift", 0) < 20:
+            label = "stress_without_shift_warning"
+        elif cen.get("_health", 100) < 50:
+            label = "engine_degradation_state"
+        elif cen.get("_stress", 0) < 25 and cen.get("_break", 0) < 25:
+            label = "deep_calm"
+        # Stability = inverse of std of stress within cluster.
+        stresses = [m.synthesized_stress for m in members if m.synthesized_stress is not None]
+        if len(stresses) >= 2:
+            mean = sum(stresses) / len(stresses)
+            var = sum((x - mean) ** 2 for x in stresses) / len(stresses)
+            stability = max(0.0, 100.0 - math.sqrt(var) * 2.0)
+        else:
+            stability = 50.0
+        out_clusters.append({
+            "cluster_id": idx,
+            "label_hint": label,
+            "size": len(members),
+            "dominant_coordinated_state": dominant_state,
+            "earliest_ts": min(m.ts_ms for m in members),
+            "latest_ts": max(m.ts_ms for m in members),
+            "centroid": cen,
+            # Emergent if dominant_state doesn't account for most of the
+            # cluster (or no dominant state at all). Higher = more novel.
+            "emergent_regime_score": (
+                100.0 if not states else
+                max(0.0, 100.0 - (states.count(dominant_state) / len(states)) * 100.0) if dominant_state else 100.0
+            ),
+            "regime_stability": stability,
+            "is_emergent": dominant_state is None or (states.count(dominant_state) / len(states) < 0.7 if states else True),
+        })
+    return {"since_ms": since_ms, "snapshot_count": len(rows), "clusters": out_clusters}
+
+
+# ── Structural propagation ───────────────────────────────────────────────
+
+
+def propagation_graph(db: Session, lookback_days: int = 14, lead_window_ms: int = 30 * 60_000) -> dict:
+    """Build a propagation graph of symbols: A → B with weight = number
+    of times an alert on A was followed within `lead_window_ms` by an
+    alert on B for the same kind family. Filters to pairs with ≥3
+    co-occurrences. Sectors not modeled — symbol-level only.
+    """
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = db.execute(
+        text(
+            """
+            SELECT symbol, kind, started_at_ms
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            ORDER BY started_at_ms
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+
+    by_kind: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+    for r in rows:
+        by_kind[r.kind].append((int(r.started_at_ms), r.symbol))
+
+    edges: Dict[Tuple[str, str], int] = defaultdict(int)
+    lead_sums: Dict[Tuple[str, str], int] = defaultdict(int)
+    lead_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+
+    for kind, lst in by_kind.items():
+        lst.sort()
+        # For each event, find any followers in next lead_window_ms.
+        for i, (ts_a, sym_a) in enumerate(lst):
+            for j in range(i + 1, len(lst)):
+                ts_b, sym_b = lst[j]
+                if ts_b - ts_a > lead_window_ms:
+                    break
+                if sym_a == sym_b:
+                    continue
+                edges[(sym_a, sym_b)] += 1
+                lead_sums[(sym_a, sym_b)] += ts_b - ts_a
+                lead_counts[(sym_a, sym_b)] += 1
+
+    edges_out: List[dict] = []
+    for (a, b), c in edges.items():
+        if c < 3:
+            continue
+        avg_lead_ms = lead_sums[(a, b)] / lead_counts[(a, b)]
+        edges_out.append({
+            "from_symbol": a,
+            "to_symbol": b,
+            "count": c,
+            "avg_lead_ms": avg_lead_ms,
+            "avg_lead_s": avg_lead_ms / 1000.0,
+        })
+    edges_out.sort(key=lambda e: -e["count"])
+    edges_out = edges_out[:50]
+
+    # Node centrality = sum of out-edges (how often A precedes others).
+    out_deg: Dict[str, int] = defaultdict(int)
+    in_deg: Dict[str, int] = defaultdict(int)
+    for e in edges_out:
+        out_deg[e["from_symbol"]] += e["count"]
+        in_deg[e["to_symbol"]] += e["count"]
+
+    nodes = sorted(
+        set(out_deg) | set(in_deg),
+        key=lambda s: -(out_deg.get(s, 0)),
+    )
+    node_rows = [
+        {"symbol": s, "out_count": out_deg.get(s, 0), "in_count": in_deg.get(s, 0),
+         "net_lead": out_deg.get(s, 0) - in_deg.get(s, 0)}
+        for s in nodes
+    ]
+
+    # Systemic contagion score: average pair count / max possible.
+    total_alerts = sum(len(v) for v in by_kind.values())
+    contagion_score = (sum(e["count"] for e in edges_out) / max(1, total_alerts)) * 100.0
+    avg_velocity_s = (sum(e["avg_lead_s"] for e in edges_out) / len(edges_out)) if edges_out else None
+
+    return {
+        "since_ms": since_ms,
+        "lead_window_ms": lead_window_ms,
+        "edges": edges_out,
+        "nodes": node_rows[:50],
+        "systemic_contagion_score": contagion_score,
+        "average_propagation_velocity_s": avg_velocity_s,
+        "total_alerts": total_alerts,
+    }
+
+
+# ── Evolutionary market behavior ─────────────────────────────────────────
+
+
+def evolutionary_behavior(db: Session, lookback_days: int = 60, bucket_days: int = 7) -> dict:
+    """Long-horizon trend slopes for structural metrics + the engine's
+    own state. Phase-10 had a basic version; here we add 'behavioral
+    shift rate', 'maturity score' and the inferred 'evolutionary
+    state' label."""
+    me = market_evolution(db, lookback_days=lookback_days, bucket_days=bucket_days)
+
+    # Behavioral shift rate: average |slope_per_day| across metrics in
+    # ANALYTICS_METRICS, scaled by their reference magnitudes.
+    shifts: List[float] = []
+    bad_directions = 0
+    for t in me["metric_trends"]:
+        slope = t.get("slope_per_day")
+        series = t.get("series") or []
+        if slope is None or not series:
+            continue
+        latest = series[-1]["v"] if series else 0.0
+        denom = max(abs(latest), 1e-6)
+        shifts.append(abs(slope) / denom)
+        # "bad" = falling resiliency/credible_depth or rising
+        # fragility/spread/liq_stress.
+        m = t["metric"]
+        if m in ("resiliency_score", "credible_depth", "atr_liquidity") and slope < 0:
+            bad_directions += 1
+        if m in ("fragility_score", "spread", "liq_stress", "impact_score") and slope > 0:
+            bad_directions += 1
+    behavioral_shift_rate = (sum(shifts) / len(shifts) * 100.0) if shifts else 0.0
+
+    # Maturity score: lower fragility + higher resiliency long-term =
+    # mature; we use the latest values from the 60d series.
+    def latest_of(metric: str) -> Optional[float]:
+        for t in me["metric_trends"]:
+            if t["metric"] == metric and t["series"]:
+                return t["series"][-1]["v"]
+        return None
+    frag = latest_of("fragility_score") or 50
+    res = latest_of("resiliency_score") or 50
+    maturity = max(0.0, min(100.0, (res - frag) / 2 + 50))
+
+    # Instability acceleration: positive if "bad_directions" outweigh
+    # the others, weighted by recent shift rate.
+    accel = bad_directions * 10.0 + behavioral_shift_rate * 0.5
+
+    if accel >= 60 or bad_directions >= 4:
+        state = "DETERIORATION"
+    elif accel >= 30:
+        state = "INSTABILITY_GROWTH"
+    elif accel >= 15:
+        state = "SLOW_MUTATION"
+    else:
+        state = "STABLE_MATURATION"
+
+    return {
+        "lookback_days": lookback_days,
+        "bucket_days": bucket_days,
+        "behavioral_shift_rate": behavioral_shift_rate,
+        "instability_acceleration": accel,
+        "structural_maturity_score": maturity,
+        "evolutionary_state": state,
+        "bad_directions": bad_directions,
+        "metric_trends": me["metric_trends"],
+        "regime_entropy_series": me["regime_entropy_series"],
+    }
+
+
+# ── Memory compression / abstraction ─────────────────────────────────────
+
+
+def memory_abstraction(db: Session) -> dict:
+    """Compress anomaly memory into higher-level abstractions: per-
+    archetype size + frequency + age range. Output is the
+    "compressed view" of long-term market behavior."""
+    arche = crisis_archetypes(db, max_archetypes=8)
+    total = sum(a["size"] for a in arche["archetypes"])
+    abstractions: List[dict] = []
+    for a in arche["archetypes"]:
+        abstractions.append({
+            "archetype_id": a["archetype_id"],
+            "label": a["archetype_label"],
+            "share_of_memory": (a["size"] / total) if total > 0 else 0.0,
+            "members": a["size"],
+            "frequency_per_day": a["frequency_per_day"],
+            "structural_severity": a["structural_severity"],
+        })
+    # Density score: how concentrated is memory in top-3 archetypes?
+    sizes = sorted([a["size"] for a in arche["archetypes"]], reverse=True)
+    top3 = sum(sizes[:3])
+    density_score = (top3 / total * 100.0) if total > 0 else 0.0
+    return {
+        "total_anomalies": total,
+        "abstractions": abstractions,
+        "memory_density_score": density_score,
+    }
+
+
+# ── Intelligence evolution forecasting ───────────────────────────────────
+
+
+def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
+    """Linear extrapolation of recent intelligence_history trends, with
+    confidence based on the residual variance. NOT a price forecast —
+    only "where is the engine itself drifting toward?".
+    """
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    since_ms = int(time.time() * 1000) - 21 * 24 * 3600 * 1000
+    rows = (
+        db.query(LiquidityIntelligenceHistory.ts_ms,
+                 LiquidityIntelligenceHistory.synthesized_stress,
+                 LiquidityIntelligenceHistory.structural_break_score,
+                 LiquidityIntelligenceHistory.meta_intelligence_health,
+                 LiquidityIntelligenceHistory.regime_shift_probability)
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+    if len(rows) < 5:
+        return {"horizon_days": horizon_days, "forecasts": [], "snapshot_count": len(rows)}
+
+    def _fit(key: str) -> Optional[dict]:
+        pts = [(r.ts_ms, getattr(r, key)) for r in rows if getattr(r, key) is not None]
+        if len(pts) < 5:
+            return None
+        # Normalize x to days from first point.
+        t0 = pts[0][0]
+        xs = [(t - t0) / (24 * 3600_000) for t, _ in pts]
+        ys = [v for _, v in pts]
+        n = len(xs)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs)
+        if den <= 0:
+            return None
+        slope = num / den
+        intercept = my - slope * mx
+        residuals = [(y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys)]
+        rmse = math.sqrt(sum(residuals) / n)
+        latest_x = xs[-1]
+        forecast_x = latest_x + horizon_days
+        forecast_y = slope * forecast_x + intercept
+        return {
+            "metric": key,
+            "current": ys[-1],
+            "slope_per_day": slope,
+            "forecast_in_days": horizon_days,
+            "forecast_value": forecast_y,
+            "rmse": rmse,
+            "confidence": max(0.0, min(100.0, 100.0 - rmse * 2.0)),
+        }
+
+    forecasts: List[dict] = []
+    for key in ("synthesized_stress", "structural_break_score", "meta_intelligence_health", "regime_shift_probability"):
+        f = _fit(key)
+        if f is not None:
+            forecasts.append(f)
+
+    # Inferred trajectory label.
+    stress_f = next((f for f in forecasts if f["metric"] == "synthesized_stress"), None)
+    if stress_f is None:
+        trajectory = "UNKNOWN"
+    elif stress_f["slope_per_day"] > 1.5:
+        trajectory = "ESCALATING"
+    elif stress_f["slope_per_day"] < -1.5:
+        trajectory = "DEESCALATING"
+    elif abs(stress_f["slope_per_day"]) < 0.3:
+        trajectory = "STEADY"
+    else:
+        trajectory = "DRIFTING"
+
+    return {
+        "horizon_days": horizon_days,
+        "forecasts": forecasts,
+        "trajectory": trajectory,
+        "snapshot_count": len(rows),
+    }
+
+
+# ── Adaptive structural recommendations ──────────────────────────────────
+
+
+def adaptation_recommendations(db: Session) -> dict:
+    """Reads several Phase-9/10/11 outputs and produces concrete
+    recommendations for what to up-weight, down-weight, or tighten.
+    Recommendations are descriptive — nothing here writes config; the
+    user reads and decides whether to apply.
+    """
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - 30 * 24 * 3600 * 1000
+
+    weights = adaptive_metric_weights(db, since_ms=now_ms - 7 * 24 * 3600 * 1000)
+    persistence = edge_persistence(db, since_ms=since_ms, window_days=7)
+    mutation = edge_mutation(db, since_ms=since_ms, window_days=7)
+    cal = threshold_calibration(db, since_ms=since_ms)
+
+    recs: List[dict] = []
+    # Strengthen useful patterns: top-3 highest-weight metrics.
+    top_weights = sorted(weights["weights"], key=lambda w: -w["weight"])[:3]
+    for w in top_weights:
+        if w["weight"] > 1.10 and w["samples"] >= 5:
+            recs.append({
+                "action": "STRENGTHEN",
+                "target": w["metric"],
+                "rationale": f"metric in cohort top decile during {w['extreme_hits']}/{w['samples']} follow-through alerts (×{w['weight']:.2f})",
+                "importance_shift": w["weight"] - 1.0,
+            })
+    # Weaken noisy patterns: bottom weights.
+    weakest = sorted(weights["weights"], key=lambda w: w["weight"])[:3]
+    for w in weakest:
+        if w["weight"] < 0.9 and w["samples"] >= 5:
+            recs.append({
+                "action": "WEAKEN",
+                "target": w["metric"],
+                "rationale": f"rarely extreme during follow-through alerts (extreme {w['extreme_share']*100:.0f}% vs 20% baseline)",
+                "importance_shift": w["weight"] - 1.0,
+            })
+
+    # Threshold tightening for kinds where calibration recommends it.
+    for k in cal["kinds"]:
+        if k["action"] == "TIGHTEN" and k["calibration_confidence"] >= 50:
+            recs.append({
+                "action": "TIGHTEN_THRESHOLD",
+                "target": k["kind"],
+                "rationale": f"{k['rationale'][0]} → suggest ×{k['adjustment_multiplier']:.2f}",
+                "importance_shift": -(k["adjustment_multiplier"] - 1.0),
+            })
+        elif k["action"] == "LOOSEN" and k["calibration_confidence"] >= 50:
+            recs.append({
+                "action": "LOOSEN_THRESHOLD",
+                "target": k["kind"],
+                "rationale": f"{k['rationale'][0]} → suggest ×{k['adjustment_multiplier']:.2f}",
+                "importance_shift": k["adjustment_multiplier"] - 1.0,
+            })
+
+    # Reweight unstable signals: kinds whose edge_mutation flagged WEAKENING/INVERTED.
+    for m in mutation["kinds"]:
+        if m["mutation_direction"] in ("INVERTED", "WEAKENING") and m["recent_resolved"] >= 5:
+            recs.append({
+                "action": "REWEIGHT_UNSTABLE",
+                "target": m["kind"],
+                "rationale": f"{m['mutation_direction']} edge — precision Δ {(m['delta'] or 0) * 100:.1f}pp recent vs prior",
+                "importance_shift": (m["delta"] or 0.0),
+            })
+
+    # Strengthen edges where persistence shows positive slope.
+    for p in persistence["kinds"]:
+        if p["slope_per_day"] is not None and p["slope_per_day"] > 0.01 and p["latest_precision"] is not None:
+            recs.append({
+                "action": "STRENGTHEN_EDGE",
+                "target": p["kind"],
+                "rationale": f"precision rising +{p['slope_per_day']*100:.2f}pp/day (current {p['latest_precision']*100:.0f}%)",
+                "importance_shift": min(0.5, p["slope_per_day"] * 10),
+            })
+
+    # Dedup by (action, target).
+    seen: set = set()
+    deduped: List[dict] = []
+    for r in recs:
+        key = (r["action"], r["target"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    # Overall adaptation score: balance of positive shifts.
+    total_pos = sum(max(0.0, r["importance_shift"]) for r in deduped)
+    total_neg = sum(max(0.0, -r["importance_shift"]) for r in deduped)
+    adaptation_score = max(0.0, min(100.0, 50.0 + (total_pos - total_neg) * 10.0))
+
+    return {
+        "fetched_at_ms": now_ms,
+        "recommendations": deduped,
+        "adaptation_score": adaptation_score,
+    }
