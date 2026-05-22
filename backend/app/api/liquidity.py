@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import httpx
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import case, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -647,21 +647,21 @@ async def add_pin(
     return LiquidityPinOut(symbol=row.symbol, pinned_order=row.pinned_order)
 
 
-@router.delete("/pins/{symbol}", status_code=204)
+@router.delete("/pins/{symbol}", status_code=204, response_class=Response)
 async def remove_pin(
     symbol: str,
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
-) -> None:
+):
     sym = symbol.strip().upper()
     row = db.query(LiquidityPin).filter(LiquidityPin.symbol == sym).first()
     if row is None:
-        return None
+        return Response(status_code=204)
     db.delete(row)
     db.flush()
     _normalize_pin_orders(db)
     db.commit()
-    return None
+    return Response(status_code=204)
 
 
 class MovePinIn(BaseModel):
@@ -1240,18 +1240,18 @@ async def add_annotation(
     )
 
 
-@router.delete("/annotations/{annotation_id}", status_code=204)
+@router.delete("/annotations/{annotation_id}", status_code=204, response_class=Response)
 async def delete_annotation(
     annotation_id: int,
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
-) -> None:
+):
     row = db.query(LiquidityAnnotation).filter(LiquidityAnnotation.id == annotation_id).first()
     if row is None:
-        return None
+        return Response(status_code=204)
     db.delete(row)
     db.commit()
-    return None
+    return Response(status_code=204)
 
 
 @router.get("/annotations", response_model=List[AnnotationOut])
