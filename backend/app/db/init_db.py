@@ -47,6 +47,77 @@ _ADDITIVE_MIGRATIONS = [
     """,
     "ALTER TABLE user_tda_states ADD COLUMN IF NOT EXISTS photos_json TEXT",
     "CREATE INDEX IF NOT EXISTS ix_user_tda_states_user_id ON user_tda_states (user_id)",
+    # liquidity_pins: persistent LIQ-scanner pins; worker reads this set
+    # to drive WS subscriptions in addition to liquidity_active_subs.
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_pins (
+        id SERIAL PRIMARY KEY,
+        symbol VARCHAR(32) NOT NULL,
+        pinned_order INTEGER NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_liquidity_pins_symbol UNIQUE (symbol)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liquidity_pins_symbol ON liquidity_pins (symbol)",
+    # liquidity_ws_status: single-row health table written by the worker.
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_ws_status (
+        id INTEGER PRIMARY KEY,
+        conn_id INTEGER NOT NULL DEFAULT 0,
+        connected BOOLEAN NOT NULL DEFAULT FALSE,
+        subscribed_json TEXT,
+        last_message_at TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # Phase-7 research persistence: alert log + annotations + crossex history.
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_alert_history (
+        id SERIAL PRIMARY KEY,
+        alert_id VARCHAR(96) NOT NULL,
+        symbol VARCHAR(32) NOT NULL,
+        kind VARCHAR(32) NOT NULL,
+        severity VARCHAR(16) NOT NULL,
+        regime VARCHAR(32) NOT NULL,
+        confidence DOUBLE PRECISION NOT NULL,
+        priority DOUBLE PRECISION NOT NULL,
+        trigger TEXT NOT NULL DEFAULT '',
+        started_at_ms BIGINT NOT NULL,
+        last_seen_at_ms BIGINT NOT NULL,
+        validated_outcome VARCHAR(24),
+        validated_at_ms BIGINT,
+        validation_notes TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_liq_alert_history_alert_id UNIQUE (alert_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_alert_history_symbol_ts ON liquidity_alert_history (symbol, started_at_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_liq_alert_history_kind_ts ON liquidity_alert_history (kind, started_at_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_annotations (
+        id SERIAL PRIMARY KEY,
+        symbol VARCHAR(32) NOT NULL,
+        ts_ms BIGINT NOT NULL,
+        kind VARCHAR(32) NOT NULL,
+        note TEXT,
+        user_id INTEGER,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_annotations_symbol_ts ON liquidity_annotations (symbol, ts_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_crossex_history (
+        id SERIAL PRIMARY KEY,
+        symbol VARCHAR(32) NOT NULL,
+        exchange VARCHAR(16) NOT NULL,
+        ts_ms BIGINT NOT NULL,
+        funding_rate DOUBLE PRECISION,
+        open_interest_usd DOUBLE PRECISION,
+        spread_fraction DOUBLE PRECISION,
+        mid_price DOUBLE PRECISION
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_crossex_history_sym_ts ON liquidity_crossex_history (symbol, ts_ms)",
 ]
 
 

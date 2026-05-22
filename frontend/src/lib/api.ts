@@ -356,3 +356,607 @@ export async function getLiquidityMetricsSnapshot(symbols: string[]) {
   const params = new URLSearchParams({ symbols: symbols.join(",") });
   return request<LiqMetricsSnapshot>(`/liquidity/snapshot?${params.toString()}`);
 }
+
+export type LiqPin = { symbol: string; pinned_order: number };
+
+export async function listLiquidityPins() {
+  return request<LiqPin[]>("/liquidity/pins");
+}
+
+export async function addLiquidityPin(symbol: string) {
+  return request<LiqPin>("/liquidity/pins", {
+    method: "POST",
+    body: JSON.stringify({ symbol }),
+  });
+}
+
+export async function removeLiquidityPin(symbol: string) {
+  return request<void>(`/liquidity/pins/${encodeURIComponent(symbol)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function moveLiquidityPin(symbol: string, direction: "up" | "down") {
+  return request<LiqPin[]>(`/liquidity/pins/${encodeURIComponent(symbol)}/move`, {
+    method: "POST",
+    body: JSON.stringify({ direction }),
+  });
+}
+
+export type LiqWsStatus = {
+  conn_id: number;
+  connected: boolean;
+  subscribed: string[];
+  last_message_at: number | null;
+  updated_at: number | null;
+};
+
+export async function getLiquidityWsStatus() {
+  return request<LiqWsStatus>("/liquidity/ws/status");
+}
+
+// ── Replay ────────────────────────────────────────────────────────────────
+
+export type LiqReplayRange = {
+  earliest_ts: number | null;
+  latest_ts: number | null;
+};
+
+export async function getLiquidityReplayRange() {
+  return request<LiqReplayRange>("/liquidity/replay/range");
+}
+
+export async function getLiquidityReplaySnapshot(symbols: string[], asOfMs: number) {
+  if (symbols.length === 0) return { symbols: {} } as LiqMetricsSnapshot;
+  const params = new URLSearchParams({
+    symbols: symbols.join(","),
+    as_of: String(asOfMs),
+  });
+  return request<LiqMetricsSnapshot>(`/liquidity/snapshot/replay?${params.toString()}`);
+}
+
+// ── Cross-exchange ────────────────────────────────────────────────────────
+
+export type CrossExSnapshot = {
+  exchange: string;
+  symbol: string;
+  funding_rate: number | null;
+  open_interest_usd: number | null;
+  spread_fraction: number | null;
+  mid_price: number | null;
+  ts_ms: number;
+};
+
+export type CrossExDivergence = {
+  exchange: string;
+  funding_diff: number | null;
+  oi_diff_pct: number | null;
+  spread_diff_pct: number | null;
+  mid_price_diff_pct: number | null;
+};
+
+export type CrossExResponse = {
+  symbol: string;
+  snapshots: CrossExSnapshot[];
+  divergences: CrossExDivergence[];
+  reference: string;
+  fetched_at_ms: number;
+};
+
+export async function getCrossExchange(symbol: string) {
+  return request<CrossExResponse>(`/liquidity/crossex/${encodeURIComponent(symbol)}`);
+}
+
+// ── Phase-7 research ──────────────────────────────────────────────────────
+
+export type AlertLogIn = {
+  alert_id: string;
+  symbol: string;
+  kind: string;
+  severity: string;
+  regime: string;
+  confidence: number;
+  priority: number;
+  trigger: string;
+  started_at_ms: number;
+  last_seen_at_ms: number;
+};
+
+export type AlertLogOut = AlertLogIn & {
+  validated_outcome: string | null;
+  validated_at_ms: number | null;
+  validation_notes: string | null;
+};
+
+export async function postLiquidityAlert(payload: AlertLogIn) {
+  return request<AlertLogOut>("/liquidity/alerts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function patchLiquidityAlertValidation(
+  alert_id: string,
+  outcome: "followed_through" | "noise" | "pending",
+  notes?: string,
+) {
+  return request<AlertLogOut>(
+    `/liquidity/alerts/${encodeURIComponent(alert_id)}/validate`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ validated_outcome: outcome, notes: notes ?? null }),
+    },
+  );
+}
+
+export type SignalKindStats = {
+  kind: string;
+  total: number;
+  resolved: number;
+  followed_through: number;
+  noise: number;
+  pending: number;
+  precision: number | null;
+  false_positive_rate: number | null;
+  avg_priority: number | null;
+  avg_confidence: number | null;
+};
+
+export type SignalStatsResponse = {
+  since_ms: number | null;
+  until_ms: number | null;
+  kinds: SignalKindStats[];
+};
+
+export async function getSignalStats(params: { since_ms?: number; until_ms?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (params.since_ms != null) usp.set("since_ms", String(params.since_ms));
+  if (params.until_ms != null) usp.set("until_ms", String(params.until_ms));
+  const q = usp.toString();
+  return request<SignalStatsResponse>(`/liquidity/research/signal-stats${q ? `?${q}` : ""}`);
+}
+
+export type DriftPoint = { bucket_ts: number; p10: number | null; p50: number | null; p90: number | null };
+export type DriftSeries = { metric: string; bucket_minutes: number; points: DriftPoint[] };
+
+export async function getDriftSeries(metric: string, bucket_minutes = 60, since_ms?: number) {
+  const usp = new URLSearchParams({ metric, bucket_minutes: String(bucket_minutes) });
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<DriftSeries>(`/liquidity/research/drift?${usp.toString()}`);
+}
+
+export type SimilarityMatch = {
+  symbol: string;
+  ts: number;
+  distance: number;
+  metrics: Record<string, number>;
+};
+
+export type SimilarityResponse = {
+  symbol: string;
+  reference_ts: number;
+  matches: SimilarityMatch[];
+};
+
+export async function getSimilarity(symbol: string, opts: { top_k?: number; sample_minutes?: number; lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.top_k) usp.set("top_k", String(opts.top_k));
+  if (opts.sample_minutes) usp.set("sample_minutes", String(opts.sample_minutes));
+  if (opts.lookback_days) usp.set("lookback_days", String(opts.lookback_days));
+  return request<SimilarityResponse>(
+    `/liquidity/research/similarity/${encodeURIComponent(symbol)}${usp.toString() ? `?${usp}` : ""}`,
+  );
+}
+
+export type AnnotationKind =
+  | "useful_signal" | "false_signal" | "manipulation"
+  | "interesting_setup" | "liquidation_event" | "spoof_behavior" | "other";
+
+export type Annotation = {
+  id: number;
+  symbol: string;
+  ts_ms: number;
+  kind: AnnotationKind;
+  note: string | null;
+  user_id: number | null;
+  created_at: number;
+};
+
+export async function addAnnotation(payload: { symbol: string; ts_ms: number; kind: AnnotationKind; note?: string }) {
+  return request<Annotation>("/liquidity/annotations", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteAnnotation(id: number) {
+  return request<void>(`/liquidity/annotations/${id}`, { method: "DELETE" });
+}
+
+export async function listAnnotations(opts: { symbol?: string; since_ms?: number; limit?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.symbol) usp.set("symbol", opts.symbol);
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.limit != null) usp.set("limit", String(opts.limit));
+  return request<Annotation[]>(`/liquidity/annotations${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type VenueStats = {
+  exchange: string;
+  samples: number;
+  avg_spread_bps: number | null;
+  avg_oi_usd: number | null;
+  median_funding_bps: number | null;
+  avg_mid_divergence_pct: number | null;
+  avg_funding_divergence_bps: number | null;
+};
+
+export type VenueQualityResponse = { since_ms: number; venues: VenueStats[] };
+
+export async function getVenueQuality(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<VenueQualityResponse>(`/liquidity/research/venue-quality${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type RegimeTransition = { from_regime: string; to_regime: string; count: number };
+export type RegimeStatsResponse = {
+  since_ms: number;
+  regime_counts: Record<string, number>;
+  top_transitions: RegimeTransition[];
+};
+
+export async function getRegimeStats(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<RegimeStatsResponse>(`/liquidity/research/regime-stats${usp.toString() ? `?${usp}` : ""}`);
+}
+
+// ── Phase-8 edge discovery ────────────────────────────────────────────────
+
+export type InteractionCell = { a: string; b: string; r: number | null; n: number };
+export type InteractionMatrix = {
+  metrics: string[];
+  cells: InteractionCell[];
+  since_ms: number;
+  bucket_minutes: number;
+};
+
+export async function getInteractionMatrix(since_ms?: number, bucket_minutes = 5) {
+  const usp = new URLSearchParams({ bucket_minutes: String(bucket_minutes) });
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<InteractionMatrix>(`/liquidity/research/interactions?${usp.toString()}`);
+}
+
+export type EdgeComboRow = {
+  resiliency: "low" | "mid" | "high";
+  fragility: "low" | "mid" | "high";
+  funding_z: "low" | "mid" | "high";
+  total: number;
+  outcomes: number;
+  rate: number;
+  lift: number | null;
+};
+
+export type EdgeRanking = {
+  since_ms: number;
+  bucket_minutes: number;
+  alert_kind: string | null;
+  metrics: string[];
+  tertile_cuts: Record<string, { low_high: [number, number] }>;
+  total_buckets: number;
+  base_rate: number;
+  outcome_window_ms: number;
+  combos: EdgeComboRow[];
+};
+
+export async function getEdgeRanking(opts: { since_ms?: number; bucket_minutes?: number; alert_kind?: string } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.bucket_minutes != null) usp.set("bucket_minutes", String(opts.bucket_minutes));
+  if (opts.alert_kind) usp.set("alert_kind", opts.alert_kind);
+  return request<EdgeRanking>(`/liquidity/research/edge-ranking${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type RegimeOutcomeRow = {
+  regime: string;
+  count: number;
+  out_transitions: number;
+  transitions: Record<string, number>;
+  collapse_prob: number;
+  avg_duration_ms: number | null;
+};
+
+export type RegimeOutcomes = {
+  since_ms: number;
+  regimes: RegimeOutcomeRow[];
+  transition_pairs: RegimeTransition[];
+};
+
+export async function getRegimeOutcomes(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<RegimeOutcomes>(`/liquidity/research/regime-outcomes${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type VenueLagRow = {
+  exchange: string;
+  samples: number;
+  mean_lag_s: number;
+  share_led_binance: number;
+  share_lagged_binance: number;
+};
+
+export type VenueLagMetric = { metric: string; venues: VenueLagRow[] };
+
+export type VenueLeadership = {
+  since_ms: number;
+  pair_count: number;
+  max_lag_s: number;
+  metrics: VenueLagMetric[];
+};
+
+export async function getVenueLeadership(since_ms?: number, max_lag_s = 120) {
+  const usp = new URLSearchParams({ max_lag_s: String(max_lag_s) });
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<VenueLeadership>(`/liquidity/research/venue-leadership?${usp.toString()}`);
+}
+
+export type MetaState = {
+  symbol: string;
+  rarity_pct: number | null;
+  n: number;
+  similar_count: number | null;
+  threshold: number | null;
+  reference: Record<string, number> | null;
+};
+
+export async function getMetaState(symbol: string, lookback_days = 30) {
+  const usp = new URLSearchParams({ lookback_days: String(lookback_days) });
+  return request<MetaState>(`/liquidity/research/meta-state/${encodeURIComponent(symbol)}?${usp.toString()}`);
+}
+
+// ── Phase-9 operational intelligence ──────────────────────────────────────
+
+export type EdgePersistenceBucket = {
+  bucket_ts: number;
+  total: number;
+  resolved: number;
+  precision: number | null;
+  avg_priority: number | null;
+  avg_confidence: number | null;
+};
+
+export type EdgePersistenceKind = {
+  kind: string;
+  series: EdgePersistenceBucket[];
+  slope_per_window: number | null;
+  slope_per_day: number | null;
+  intercept: number | null;
+  half_life_days: number | null;
+  latest_precision: number | null;
+};
+
+export type EdgePersistenceOut = {
+  since_ms: number;
+  window_days: number;
+  alert_kind: string | null;
+  kinds: EdgePersistenceKind[];
+};
+
+export async function getEdgePersistence(opts: { since_ms?: number; window_days?: number; alert_kind?: string } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.window_days != null) usp.set("window_days", String(opts.window_days));
+  if (opts.alert_kind) usp.set("alert_kind", opts.alert_kind);
+  return request<EdgePersistenceOut>(`/liquidity/research/edge-persistence${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type ReliabilityState = "STRONG" | "STABLE" | "WEAK" | "DEGRADED";
+
+export type ReliabilityKind = {
+  kind: string;
+  total: number;
+  resolved: number;
+  accuracy: number;
+  weekly_buckets: number;
+  weekly_precision_std: number;
+  regime_buckets: number;
+  regime_precision_std: number;
+  components: {
+    accuracy: number;
+    stability: number;
+    regime_consistency: number;
+    sample_size: number;
+  };
+  reliability_score: number;
+  state: ReliabilityState;
+  rank: number;
+};
+
+export type ReliabilityOut = { since_ms: number; kinds: ReliabilityKind[] };
+
+export async function getSignalReliability(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<ReliabilityOut>(`/liquidity/research/signal-reliability${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type TransitionForecastRegime = {
+  regime: string;
+  count: number;
+  out_transitions: number;
+  next_probs: Record<string, number>;
+  expected_latency_ms: number | null;
+  median_latency_ms: number | null;
+  collapse_prob: number;
+  stabilization_prob: number;
+  volatility_expansion_prob: number;
+};
+
+export type TransitionForecastOut = {
+  since_ms: number;
+  regimes: TransitionForecastRegime[];
+};
+
+export async function getTransitionForecast(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<TransitionForecastOut>(`/liquidity/research/transition-forecast${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type RiskInstabilityRow = { symbol: string; stress: number; components: Record<string, number> };
+
+export type RiskState = {
+  risk_state_score: number;
+  systemic_stress_level: "QUIET" | "WATCH" | "ELEVATED" | "SEVERE";
+  n_symbols: number;
+  drivers: Record<string, number>;
+  instability_rank: RiskInstabilityRow[];
+};
+
+export async function getRiskState() {
+  return request<RiskState>("/liquidity/research/risk-state");
+}
+
+export type MarketNarrative = {
+  headline: string;
+  score: number;
+  level: "QUIET" | "WATCH" | "ELEVATED" | "SEVERE";
+  bullets: string[];
+  alert_summary: string;
+  regime_summary: string;
+  historical_context: string;
+  top_alert_kinds: { kind: string; count: number }[];
+  top_regimes: { regime: string; count: number }[];
+  fetched_at_ms: number;
+};
+
+export async function getMarketNarrative() {
+  return request<MarketNarrative>("/liquidity/research/market-narrative");
+}
+
+// ── Phase-10 strategic intelligence ───────────────────────────────────────
+
+export type CorrDrift = { a: string; b: string; r_prev: number | null; r_cur: number | null; delta: number };
+export type MetricMigration = { metric: string; prev_median: number; cur_median: number; pct_delta: number };
+export type RegimeShareDrift = { regime: string; prev_share: number; cur_share: number; delta: number };
+
+export type StructuralBreakOut = {
+  window_days: number;
+  structural_break_score: number;
+  break_confidence: number;
+  components: { correlation_drift: number; median_migration: number; regime_mix_shift: number };
+  affected_correlations: CorrDrift[];
+  affected_metrics: MetricMigration[];
+  affected_regimes: RegimeShareDrift[];
+  cur_since: number;
+  prev_since: number;
+};
+
+export async function getStructuralBreaks(window_days = 7) {
+  return request<StructuralBreakOut>(`/liquidity/research/structural-breaks?window_days=${window_days}`);
+}
+
+export type RegimeShiftSignal = { name: string; value: number };
+export type RegimeShiftWarning = {
+  fetched_at_ms: number;
+  regime_shift_probability: number;
+  instability_acceleration: number;
+  warning_state: "STABLE" | "WATCH" | "ELEVATED_TRANSITION_RISK" | "PRE_CASCADE" | "INSUFFICIENT_DATA";
+  signals: RegimeShiftSignal[];
+};
+
+export async function getRegimeShiftWarning() {
+  return request<RegimeShiftWarning>("/liquidity/research/regime-shift-warning");
+}
+
+export type AdaptiveReliabilityKind = ReliabilityKind & {
+  regime_multiplier: number;
+  regime_adjusted_reliability: number;
+  adjusted_rank: number;
+};
+
+export type AdaptiveReliabilityOut = {
+  since_ms: number;
+  dominant_regime: string;
+  kinds: AdaptiveReliabilityKind[];
+};
+
+export async function getAdaptiveReliability(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<AdaptiveReliabilityOut>(`/liquidity/research/adaptive-reliability${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type MetaConfidence = {
+  meta_confidence_score: number;
+  confidence_stability: number;
+  trustworthiness_state: "TRUSTWORTHY" | "GUARDED" | "UNRELIABLE" | "UNKNOWN";
+  components: { avg_confidence: number; noise_resistance: number; regime_jitter: number; structural_break_inv: number } | null;
+  n_alerts: number;
+  noise_rate: number | null;
+  avg_distinct_regimes: number | null;
+};
+
+export async function getMetaConfidence(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<MetaConfidence>(`/liquidity/research/meta-confidence${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type EdgeSurvivalKind = {
+  kind: string;
+  deaths: number;
+  expected_remaining_days: number | null;
+  degradation_acceleration: number | null;
+  latest_precision: number | null;
+  threshold: number;
+  survival_curve: { ts: number; s: number }[];
+};
+
+export type EdgeSurvivalOut = { since_ms: number; threshold: number; kinds: EdgeSurvivalKind[] };
+
+export async function getEdgeSurvival(opts: { since_ms?: number; threshold?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.threshold != null) usp.set("threshold", String(opts.threshold));
+  return request<EdgeSurvivalOut>(`/liquidity/research/edge-survival${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type EvolutionMetric = {
+  metric: string;
+  series: { ts: number; v: number }[];
+  slope_per_day: number | null;
+};
+
+export type EntropyPoint = { ts: number; entropy: number; dominant_regime: string };
+
+export type MarketEvolution = {
+  lookback_days: number;
+  bucket_days: number;
+  metric_trends: EvolutionMetric[];
+  regime_entropy_series: EntropyPoint[];
+};
+
+export async function getMarketEvolution(lookback_days = 60, bucket_days = 7) {
+  const usp = new URLSearchParams({ lookback_days: String(lookback_days), bucket_days: String(bucket_days) });
+  return request<MarketEvolution>(`/liquidity/research/market-evolution?${usp.toString()}`);
+}
+
+export type StrategicState = {
+  state: "STABLE_INSTITUTIONAL_FLOW" | "FRAGILE_SPECULATIVE_MARKET" | "TRANSITIONAL_UNSTABLE" | "CASCADE_RISK_ENVIRONMENT" | "LIQUIDITY_DETERIORATION_PHASE";
+  trustworthiness: "TRUSTWORTHY" | "GUARDED" | "UNRELIABLE" | "UNKNOWN";
+  rationale: string[];
+  inputs: {
+    stress_level: string;
+    stress_score: number;
+    shift_warning: string;
+    structural_break_score: number;
+    dominant_regime: string;
+  };
+};
+
+export async function getStrategicState() {
+  return request<StrategicState>("/liquidity/research/strategic-state");
+}

@@ -26,6 +26,9 @@ import {
   type ChartTheme,
 } from "./CandleChart";
 import { Liquidity } from "./Liquidity";
+import { Operations } from "./Operations";
+import { Research } from "./Research";
+import { Strategy } from "./Strategy";
 import { ScreenerTable } from "./ScreenerTable";
 import { normalizeSymbol, SymbolSuggestInput } from "./SymbolSuggestInput";
 import { TDA } from "./TDA";
@@ -54,7 +57,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -74,6 +77,57 @@ function FibIcon({ size = 20 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
       <circle cx="12" cy="12" r="9.5" />
       <path d="M12 12 C16 9 17.5 5.5 14.5 3 C11 0 7 3 7 7 C7 11 10 13.5 13 14.5 C16.5 15.5 19 14 18.5 10.5" />
+    </svg>
+  );
+}
+
+function StratIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path d="M3 17l4-8 3 5 4-10 3 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="14" cy="4" r="2.4" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}
+
+function OpsIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path d="M3 14l3-4 3 2 4-6 4 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="6" cy="10" r="1.2" fill="currentColor" />
+      <circle cx="13" cy="6" r="1.2" fill="currentColor" />
+      <circle cx="17" cy="11" r="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ResearchIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <circle cx="8.5" cy="8.5" r="5" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M13 13l4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M6 8.5h5M8.5 6v5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1331,6 +1385,30 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("liq")}
             title="Liquidity Screener"
           />
+          <NavBtn
+            active={page === "research"}
+            open={sidebarOpen}
+            icon={<ResearchIcon size={20} />}
+            label="RSRCH"
+            onClick={() => setPage("research")}
+            title="Research · Calibration · Validation"
+          />
+          <NavBtn
+            active={page === "ops"}
+            open={sidebarOpen}
+            icon={<OpsIcon size={20} />}
+            label="OPS"
+            onClick={() => setPage("ops")}
+            title="Operational Intelligence · Risk · Reliability"
+          />
+          <NavBtn
+            active={page === "strat"}
+            open={sidebarOpen}
+            icon={<StratIcon size={20} />}
+            label="STRAT"
+            onClick={() => setPage("strat")}
+            title="Strategic Intelligence · Structural Shifts · Adaptation"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1520,6 +1598,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         {page === "tda" && <TDA />}
 
         {page === "liq" && <Liquidity />}
+
+        {page === "research" && <Research />}
+
+        {page === "ops" && <Operations />}
+
+        {page === "strat" && <Strategy />}
       </main>
 
       {/* ── Chart Modal ── */}
