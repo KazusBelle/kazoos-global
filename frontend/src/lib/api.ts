@@ -1430,7 +1430,9 @@ export async function getNarrativeChronicle(lookback_days = 21) {
 
 export type DiscoveredPattern = {
   discovered_pattern_id: string;
-  signature: Record<string, "low" | "mid" | "high">;
+  // tertile per metric; "na" when a metric wasn't populated in the
+  // bucket (e.g. WS-only metric on a non-pinned symbol).
+  signature: Record<string, "low" | "mid" | "high" | "na">;
   support: number;
   outcome_rate: number;
   lift: number | null;

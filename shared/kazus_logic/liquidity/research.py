@@ -4050,10 +4050,19 @@ def discover_patterns(
 
     patterns: Dict[Tuple[str, ...], dict] = {}
     total_buckets = 0
+    # Soft gate: any (symbol, bucket) with at least min_metrics populated
+    # contributes. Missing metrics get a "?" tertile so the signature
+    # still hashes consistently. The strict gate ("all 7 present") starved
+    # the pivot to zero when WS-only metrics weren't populated (e.g. no
+    # symbols pinned, so resiliency_score never appeared).
+    min_metrics_required = max(4, len(PATTERN_METRICS) // 2 + 1)
     for (sym, bts), mv in pivot.items():
-        if not all(m in mv for m in PATTERN_METRICS):
+        if sum(1 for m in PATTERN_METRICS if m in mv) < min_metrics_required:
             continue
-        sig = tuple(_tertile(mv[m], *cuts[m]) for m in PATTERN_METRICS)
+        sig = tuple(
+            _tertile(mv[m], *cuts[m]) if m in mv else "na"
+            for m in PATTERN_METRICS
+        )
         outcome = _outcome(sym, bts)
         rec = patterns.setdefault(sig, {"count": 0, "outcomes": 0, "kinds": defaultdict(int)})
         rec["count"] += 1
@@ -4494,12 +4503,17 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
         .all()
     )
-    if len(rows) < 5:
+    # Require at least 12 snapshots so the OLS slope isn't a curve-fit
+    # over a handful of contiguous observations. With the 5-min cadence
+    # that's about an hour of accumulation — enough for the slope to mean
+    # something rather than amplify intra-hour noise into a 7-day
+    # extrapolation that lands in fantasyland.
+    if len(rows) < 12:
         return {"horizon_days": horizon_days, "forecasts": [], "snapshot_count": len(rows)}
 
     def _fit(key: str) -> Optional[dict]:
         pts = [(r.ts_ms, getattr(r, key)) for r in rows if getattr(r, key) is not None]
-        if len(pts) < 5:
+        if len(pts) < 12:
             return None
         # Normalize x to days from first point.
         t0 = pts[0][0]
@@ -4519,6 +4533,16 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         latest_x = xs[-1]
         forecast_x = latest_x + horizon_days
         forecast_y = slope * forecast_x + intercept
+        # All these metrics are bounded 0..100 by construction, so a
+        # raw extrapolation outside that range is the formula screaming
+        # "this slope can't extend this far". Clip to the band so the UI
+        # stays interpretable.
+        forecast_y = max(0.0, min(100.0, forecast_y))
+        # Confidence: combine RMSE with extrapolation distance — a low-
+        # RMSE fit that nevertheless extrapolates far past the data span
+        # shouldn't read as high confidence.
+        data_span_days = max(1e-6, xs[-1] - xs[0])
+        extrapolation_ratio = horizon_days / data_span_days
         return {
             "metric": key,
             "current": ys[-1],
@@ -4526,7 +4550,13 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
             "forecast_in_days": horizon_days,
             "forecast_value": forecast_y,
             "rmse": rmse,
-            "confidence": max(0.0, min(100.0, 100.0 - rmse * 2.0)),
+            "confidence": max(
+                0.0,
+                min(
+                    100.0,
+                    (100.0 - rmse * 2.0) / max(1.0, extrapolation_ratio),
+                ),
+            ),
         }
 
     forecasts: List[dict] = []

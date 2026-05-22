@@ -74,11 +74,12 @@ function Panel({
   );
 }
 
-function TertileChip({ v }: { v: "low" | "mid" | "high" }) {
-  const colors = {
+function TertileChip({ v }: { v: "low" | "mid" | "high" | "na" }) {
+  const colors: Record<typeof v, string> = {
     low: "rgba(82, 185, 122, 0.95)",
     mid: "rgba(140, 170, 235, 0.95)",
     high: "rgba(214, 105, 105, 0.95)",
+    na: "rgba(90, 95, 107, 0.85)",
   };
   const color = colors[v];
   return (
@@ -167,7 +168,7 @@ function PatternDiscoveryPanel() {
                   <tr key={p.discovered_pattern_id} className="border-t border-border/40">
                     <td className="py-1 text-muted text-[10px]">{p.discovered_pattern_id}</td>
                     {data.metrics.map((m) => (
-                      <td key={m} className="py-1 px-1"><TertileChip v={p.signature[m] as "low" | "mid" | "high"} /></td>
+                      <td key={m} className="py-1 px-1"><TertileChip v={p.signature[m] as "low" | "mid" | "high" | "na"} /></td>
                     ))}
                     <td className="py-1 text-right text-zinc-200">{p.support}</td>
                     <td className="py-1 text-right text-zinc-200">{(p.outcome_rate * 100).toFixed(0)}%</td>
