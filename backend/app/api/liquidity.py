@@ -2714,6 +2714,7 @@ class PatternDiscoveryOut(BaseModel):
     base_rate: float
     total_buckets: int
     patterns: List[DiscoveredPattern]
+    data_quality: str = "INSUFFICIENT"
 
 
 @router.get("/research/pattern-discovery", response_model=PatternDiscoveryOut)
@@ -2796,6 +2797,7 @@ class PropagationEdge(BaseModel):
     count: int
     avg_lead_ms: float
     avg_lead_s: float
+    confidence: str    # HIGH | MEDIUM | LOW
 
 
 class PropagationNode(BaseModel):
@@ -2819,11 +2821,15 @@ class PropagationOut(BaseModel):
 async def propagation_endpoint(
     lookback_days: int = Query(14, ge=3, le=60),
     lead_window_minutes: int = Query(30, ge=5, le=180),
+    min_lead_seconds: int = Query(5, ge=0, le=300),
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> PropagationOut:
     return PropagationOut(**_research.propagation_graph(
-        db, lookback_days=lookback_days, lead_window_ms=lead_window_minutes * 60_000,
+        db,
+        lookback_days=lookback_days,
+        lead_window_ms=lead_window_minutes * 60_000,
+        min_lead_ms=min_lead_seconds * 1000,
     ))
 
 

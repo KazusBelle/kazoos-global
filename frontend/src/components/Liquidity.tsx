@@ -837,7 +837,15 @@ export function Liquidity() {
       if (validatedAlertsRef.current.has(a.id)) continue;
       if (now - a.lastSeenAt < COOLDOWN_MS) continue;     // still active
       if (now - a.lastSeenAt > 6 * 60_000) continue;      // window closed too long ago
-      const persisted = a.lastSeenAt - a.startedAt >= 30_000;
+      // Alert engine uses 30s id buckets (`bucket = floor(now/30_000)`)
+      // so a single alert id can never persist >30s — at second 30 a
+      // new id is minted for the same (symbol, kind). The original
+      // threshold of `>= 30_000ms` was therefore physically
+      // unreachable, which is why the audit found 100% noise / 0%
+      // followed_through across hundreds of resolved alerts. Lower to
+      // 12s — well under the bucket cap, but enough to filter genuine
+      // one-tick blips that snap back the next snapshot poll.
+      const persisted = a.lastSeenAt - a.startedAt >= 12_000;
       const outcome: "followed_through" | "noise" = persisted ? "followed_through" : "noise";
       validatedAlertsRef.current.add(a.id);
       patchLiquidityAlertValidation(a.id, outcome).catch(() => undefined);

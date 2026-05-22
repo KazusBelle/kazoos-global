@@ -4099,6 +4099,10 @@ def discover_patterns(
         "base_rate": base_rate,
         "total_buckets": total_buckets,
         "patterns": out[:40],
+        # Sample adequacy gate: with <50 buckets the base_rate is too
+        # noisy and lifts shouldn't be trusted; HIGH only when there's
+        # really a population to mine.
+        "data_quality": _discovery_quality(total_buckets, low=20, medium=100, high=500),
     }
 
 
@@ -4176,7 +4180,15 @@ def crisis_archetypes(db: Session, max_archetypes: int = 8) -> dict:
             "structural_severity": severity,
             "centroid": cl["centroid"],
         })
-    return {"archetypes": archetypes, "anomaly_count": base["anomaly_count"], "vocabulary": list(ARCHETYPE_HINTS)}
+    return {
+        "archetypes": archetypes,
+        "anomaly_count": base["anomaly_count"],
+        "vocabulary": list(ARCHETYPE_HINTS),
+        # Anomaly clustering is noise below ~10 records — every cluster
+        # will be a one-off. HIGH only when memory has accumulated real
+        # repeating structures.
+        "data_quality": _discovery_quality(base["anomaly_count"], low=5, medium=20, high=80),
+    }
 
 
 # ── Hidden regime discovery ──────────────────────────────────────────────
@@ -4283,17 +4295,45 @@ def hidden_regimes(db: Session, lookback_days: int = 30, max_clusters: int = 6) 
             "regime_stability": stability,
             "is_emergent": dominant_state is None or (states.count(dominant_state) / len(states) < 0.7 if states else True),
         })
-    return {"since_ms": since_ms, "snapshot_count": len(rows), "clusters": out_clusters}
+    return {
+        "since_ms": since_ms,
+        "snapshot_count": len(rows),
+        "clusters": out_clusters,
+        # Cluster stability needs accumulated diverse snapshots — under
+        # 50 the engine state hasn't varied enough to support multi-
+        # cluster discrimination, however many clusters we report.
+        "data_quality": _discovery_quality(len(rows), low=20, medium=80, high=300),
+    }
 
 
 # ── Structural propagation ───────────────────────────────────────────────
 
 
-def propagation_graph(db: Session, lookback_days: int = 14, lead_window_ms: int = 30 * 60_000) -> dict:
+def propagation_graph(
+    db: Session,
+    lookback_days: int = 14,
+    lead_window_ms: int = 30 * 60_000,
+    min_lead_ms: int = 5_000,
+) -> dict:
     """Build a propagation graph of symbols: A → B with weight = number
-    of times an alert on A was followed within `lead_window_ms` by an
-    alert on B for the same kind family. Filters to pairs with ≥3
-    co-occurrences. Sectors not modeled — symbol-level only.
+    of times an alert on A was followed by an alert on B for the same
+    alert kind, with lead time in [`min_lead_ms`, `lead_window_ms`].
+
+    Two integrity guards added in the Phase-14 stabilization pass:
+
+      * `min_lead_ms` (default 5s) rejects "simultaneous" co-occurrences.
+        Without it, market-wide bursts where N symbols fire the same kind
+        in the same minute inflate every (A, B) pair by N², giving us
+        edges with 1000+ count when the real lead-pair count was ~40.
+
+      * source-event dedup: each (source_alert, target_symbol) pair can
+        only contribute +1 to its edge. The original loop counted every
+        target alert in-window, so a single A→B "real" propagation could
+        be charged multiple times when B fired repeatedly.
+
+    The reported `count` is now the number of distinct source events on
+    A that were followed by ANY target event on B within window —
+    proper lead-pair counting.
     """
     since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
     rows = db.execute(
@@ -4318,16 +4358,23 @@ def propagation_graph(db: Session, lookback_days: int = 14, lead_window_ms: int 
 
     for kind, lst in by_kind.items():
         lst.sort()
-        # For each event, find any followers in next lead_window_ms.
         for i, (ts_a, sym_a) in enumerate(lst):
+            charged_targets_for_a = set()
             for j in range(i + 1, len(lst)):
                 ts_b, sym_b = lst[j]
-                if ts_b - ts_a > lead_window_ms:
+                lead = ts_b - ts_a
+                if lead > lead_window_ms:
                     break
+                if lead < min_lead_ms:
+                    # simultaneous-or-near burst → not a propagation
+                    continue
                 if sym_a == sym_b:
                     continue
+                if sym_b in charged_targets_for_a:
+                    continue
+                charged_targets_for_a.add(sym_b)
                 edges[(sym_a, sym_b)] += 1
-                lead_sums[(sym_a, sym_b)] += ts_b - ts_a
+                lead_sums[(sym_a, sym_b)] += lead
                 lead_counts[(sym_a, sym_b)] += 1
 
     edges_out: List[dict] = []
@@ -4335,12 +4382,22 @@ def propagation_graph(db: Session, lookback_days: int = 14, lead_window_ms: int 
         if c < 3:
             continue
         avg_lead_ms = lead_sums[(a, b)] / lead_counts[(a, b)]
+        # Edge confidence: scales with both volume and how clean the lead
+        # is (close to min_lead = ambiguous, deep in the window = real).
+        # Cheap heuristic — count > 10 AND avg lead > 30s = high.
+        if c >= 10 and avg_lead_ms >= 30_000:
+            confidence = "HIGH"
+        elif c >= 5:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
         edges_out.append({
             "from_symbol": a,
             "to_symbol": b,
             "count": c,
             "avg_lead_ms": avg_lead_ms,
             "avg_lead_s": avg_lead_ms / 1000.0,
+            "confidence": confidence,
         })
     edges_out.sort(key=lambda e: -e["count"])
     edges_out = edges_out[:50]
@@ -4509,7 +4566,12 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
     # something rather than amplify intra-hour noise into a 7-day
     # extrapolation that lands in fantasyland.
     if len(rows) < 12:
-        return {"horizon_days": horizon_days, "forecasts": [], "snapshot_count": len(rows)}
+        return {
+            "horizon_days": horizon_days,
+            "forecasts": [],
+            "snapshot_count": len(rows),
+            "data_quality": _discovery_quality(len(rows), low=12, medium=50, high=200),
+        }
 
     def _fit(key: str) -> Optional[dict]:
         pts = [(r.ts_ms, getattr(r, key)) for r in rows if getattr(r, key) is not None]
@@ -4583,6 +4645,9 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         "forecasts": forecasts,
         "trajectory": trajectory,
         "snapshot_count": len(rows),
+        # OLS slope on <50 snapshots is hostage to recent noise — treat
+        # anything below as exploratory at best.
+        "data_quality": _discovery_quality(len(rows), low=12, medium=50, high=200),
     }
 
 
@@ -4681,4 +4746,176 @@ def adaptation_recommendations(db: Session) -> dict:
         "fetched_at_ms": now_ms,
         "recommendations": deduped,
         "adaptation_score": adaptation_score,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Stabilization sprint — sanity audit + discovery_quality helper
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The user explicitly stopped adding new features and ran a validation
+# sprint. These helpers exist so the frontend can decide which discovery
+# outputs to trust and which to label "insufficient evidence".
+
+
+def _discovery_quality(samples: int, *, low: int, medium: int, high: int) -> str:
+    """Three-bucket sample-adequacy classification.
+
+    Caller picks the thresholds per-endpoint — e.g. pattern_discovery
+    cares about distinct buckets, hidden_regimes about snapshot count,
+    archetype clustering about anomaly count. Returns a string the UI
+    renders as a chip ("HIGH" green, "MEDIUM" blue, "LOW" amber,
+    "INSUFFICIENT" muted)."""
+    if samples >= high:
+        return "HIGH"
+    if samples >= medium:
+        return "MEDIUM"
+    if samples >= low:
+        return "LOW"
+    return "INSUFFICIENT"
+
+
+def sanity_audit(db: Session) -> dict:
+    """Internal sanity checks that watch the engine for drift into noise.
+    Each finding has a `kind` (machine-readable) + `severity` + `detail`
+    (human prose); the UI renders them as a yellow/red banner so the
+    operator can intervene before the discovery layer starts hallucinating.
+    """
+    findings: List[dict] = []
+    now_ms = int(time.time() * 1000)
+
+    # 1) Validation collapse — high resolved count with ~0% precision is
+    # almost always a validation-logic bug rather than reality. We saw
+    # this exact failure mode during the stabilization audit: all 371
+    # resolved alerts were marked noise because validateAlert thresholded
+    # at >= 30s persistence while the alert engine bucketed ids at 30s.
+    sigh = db.execute(
+        text(
+            """
+            SELECT kind,
+                   SUM(CASE WHEN validated_outcome = 'followed_through' THEN 1 ELSE 0 END) AS ft,
+                   SUM(CASE WHEN validated_outcome = 'noise' THEN 1 ELSE 0 END) AS noise,
+                   COUNT(*) AS total
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY kind
+            """
+        ),
+        {"since": now_ms - 7 * 24 * 3600 * 1000},
+    ).fetchall()
+    for r in sigh:
+        ft = int(r.ft or 0); ns = int(r.noise or 0); total = int(r.total or 0)
+        resolved = ft + ns
+        if resolved >= 25 and ft == 0:
+            findings.append({
+                "kind": "validation_collapse",
+                "severity": "critical",
+                "detail": f"{r.kind}: {resolved} resolved alerts, all marked noise. Validation logic is probably mis-thresholded.",
+            })
+
+    # 2) Anomaly inflation — too many anomaly_memory writes per hour means
+    # the auto-recorder thresholds drift into noise. >5/hour over 24h is
+    # a strong tell.
+    rate = db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS c
+            FROM liquidity_anomaly_memory
+            WHERE occurred_at_ms >= :since
+            """
+        ),
+        {"since": now_ms - 24 * 3600 * 1000},
+    ).first()
+    if rate and int(rate.c or 0) > 120:
+        findings.append({
+            "kind": "anomaly_inflation",
+            "severity": "warn",
+            "detail": f"{int(rate.c)} anomaly records in last 24h — auto-recorder cooldowns may be too loose.",
+        })
+
+    # 3) Propagation loop check — A→B and B→A both with similar count
+    # suggests a coincidence, not a real lead.
+    prop = propagation_graph(db, lookback_days=7)
+    edges_by_pair = {(e["from_symbol"], e["to_symbol"]): e for e in prop["edges"]}
+    loops_seen: set = set()
+    for (a, b), e in edges_by_pair.items():
+        if a >= b:
+            continue
+        reverse = edges_by_pair.get((b, a))
+        if reverse is None:
+            continue
+        # If both directions agree to within 20%, treat as suspect.
+        if abs(e["count"] - reverse["count"]) / max(e["count"], reverse["count"]) < 0.20:
+            if (a, b) not in loops_seen:
+                loops_seen.add((a, b))
+                findings.append({
+                    "kind": "propagation_loop",
+                    "severity": "warn",
+                    "detail": f"{a}↔{b} bidirectional with similar weights ({e['count']} vs {reverse['count']}) — likely coincidence rather than lead-lag.",
+                })
+
+    # 4) Forecast overshoot — forecast at the boundary (0 or 100) means
+    # the OLS extrapolation hit the clip, so the trajectory label may be
+    # misleading. We surface that even though the value itself is sane.
+    try:
+        forecast = intelligence_evolution_forecast(db, horizon_days=7)
+        for f in forecast.get("forecasts") or []:
+            if f["forecast_value"] in (0.0, 100.0) and f["confidence"] >= 60:
+                findings.append({
+                    "kind": "forecast_overshoot",
+                    "severity": "info",
+                    "detail": f"{f['metric']} forecast hit boundary at +{f['forecast_in_days']}d — slope likely unsustainable.",
+                })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 5) Pattern explosion — too many discovered patterns above
+    # min_support tells us the support threshold is too low for the
+    # data volume. Surfacing as a hint.
+    try:
+        pdisc = discover_patterns(db, since_ms=now_ms - 14 * 24 * 3600 * 1000, min_support=8)
+        if len(pdisc.get("patterns") or []) >= 30:
+            findings.append({
+                "kind": "pattern_explosion",
+                "severity": "info",
+                "detail": f"{len(pdisc['patterns'])} patterns at min_support=8 — consider raising the threshold for the UI.",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 6) Hidden regime instability — single cluster absorbing all
+    # snapshots = engine state didn't move; multiple clusters with
+    # tiny membership = unstable clustering.
+    try:
+        hr = hidden_regimes(db, lookback_days=14, max_clusters=8)
+        clusters = hr.get("clusters") or []
+        if clusters and len(clusters) >= 5 and all(c["size"] <= 3 for c in clusters):
+            findings.append({
+                "kind": "unstable_clustering",
+                "severity": "warn",
+                "detail": f"{len(clusters)} hidden-regime clusters with sizes ≤3 — clusters aren't stable, more snapshots needed.",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    severity_rank = {"critical": 0, "warn": 1, "info": 2}
+    findings.sort(key=lambda f: severity_rank.get(f["severity"], 3))
+
+    # Overall health gate.
+    has_critical = any(f["severity"] == "critical" for f in findings)
+    has_warn = any(f["severity"] == "warn" for f in findings)
+    if has_critical:
+        overall = "CRITICAL"
+    elif has_warn:
+        overall = "WARN"
+    elif findings:
+        overall = "INFO"
+    else:
+        overall = "CLEAN"
+
+    return {
+        "fetched_at_ms": now_ms,
+        "overall_state": overall,
+        "findings": findings,
+        "check_count": 6,
     }
