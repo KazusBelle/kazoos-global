@@ -2024,7 +2024,10 @@ def adaptive_metric_weights(db: Session, since_ms: int) -> dict:
     ).fetchall()
     if not alerts:
         return {"since_ms": recent_ms, "weights": [
-            {"metric": m, "weight": 1.0, "relevance_score": 0.0, "samples": 0}
+            {
+                "metric": m, "weight": 1.0, "relevance_score": 0.0,
+                "samples": 0, "extreme_hits": 0, "extreme_share": 0.0,
+            }
             for m in ANALYTICS_METRICS
         ]}
 
