@@ -52,6 +52,23 @@ export type AlertEvent = {
   created_at: string;
 };
 
+export type ServerMetricPoint = {
+  created_at: string;
+  load_1m: number | null;
+  load_5m: number | null;
+  load_15m: number | null;
+  cpu_percent: number | null;
+  memory_percent: number | null;
+  swap_percent: number | null;
+  disk_percent: number | null;
+  net_connections: number | null;
+};
+
+export type ServerMetricsResponse = {
+  points: ServerMetricPoint[];
+  latest: ServerMetricPoint | null;
+};
+
 const TOKEN_KEY = "kazus_token";
 
 export function getToken(): string | null {
@@ -148,6 +165,14 @@ export async function setCall(symbol: string, tag: CallTag, note: string | null)
 
 export async function getDashboard() {
   return request<DashboardResponse>("/dashboard");
+}
+
+export async function getServerMetrics(hours = 24) {
+  const params = new URLSearchParams({
+    hours: String(hours),
+    limit: String(Math.min(12_000, hours * 60 + 10)),
+  });
+  return request<ServerMetricsResponse>(`/system/metrics?${params.toString()}`);
 }
 
 export type OHLCVBar = {
@@ -1104,4 +1129,152 @@ export type MetaHealth = {
 
 export async function getMetaHealth() {
   return request<MetaHealth>("/liquidity/research/meta-intelligence-health");
+}
+
+// ── Phase-12 coordination & synthesis ─────────────────────────────────────
+
+export type SynthesisLayer = { name: string; score: number; weight: number; delta_from_mean: number };
+export type Synthesis = {
+  fetched_at_ms: number;
+  synthesized_stress: number;
+  coordinated_state:
+    | "STABLE_COORDINATED_MARKET"
+    | "EARLY_STRUCTURAL_STRESS"
+    | "STRUCTURAL_MARKET_DETERIORATION"
+    | "FRAGMENTING_LIQUIDITY_ENVIRONMENT"
+    | "ESCALATING_SYSTEMIC_INSTABILITY"
+    | "ACTIVE_CASCADE_PROPAGATION";
+  cross_layer_agreement: number;
+  layers: SynthesisLayer[];
+  components: {
+    stress_level: string;
+    shift_warning: string;
+    structural_break_score: number;
+    meta_confidence_state: string;
+    intelligence_health_state: string;
+    strategic_state: string;
+  };
+};
+
+export async function getSynthesis() {
+  return request<Synthesis>("/liquidity/research/synthesis");
+}
+
+export type ConflictItem = {
+  kind: string;
+  description: string;
+  ops_score?: number;
+  structural_score?: number;
+  dominant_horizon?: string;
+  shift_probability?: number;
+  confidence_deficit?: number;
+};
+
+export type Conflicts = {
+  fetched_at_ms: number;
+  conflict_score: number;
+  conflicts: ConflictItem[];
+  dominant_layer: string;
+  suppressed_layers: string[];
+};
+
+export async function getConflicts() {
+  return request<Conflicts>("/liquidity/research/conflicts");
+}
+
+export type SuppressionCluster = {
+  cluster_id: number;
+  symbol: string;
+  kind: string;
+  count: number;
+  max_severity: string;
+  last_seen_ms: number;
+  redundancy_score: number;
+};
+
+export type Suppression = {
+  window_minutes: number;
+  total_alerts: number;
+  unique_clusters: number;
+  alert_compression_ratio: number;
+  redundant_clusters: SuppressionCluster[];
+};
+
+export async function getAlertSuppression(window_minutes = 60) {
+  return request<Suppression>(`/liquidity/research/alert-suppression?window_minutes=${window_minutes}`);
+}
+
+export type CrisisCluster = {
+  cluster_id: number;
+  size: number;
+  dominant_kind: string;
+  kinds: Record<string, number>;
+  frequency_per_day: number;
+  earliest_ts: number;
+  latest_ts: number;
+  avg_novelty: number;
+  centroid: Record<string, number>;
+  recent_members: { id: number; kind: string; ts: number; novelty: number }[];
+};
+
+export type CrisisClusters = { clusters: CrisisCluster[]; anomaly_count: number };
+
+export async function getCrisisClusters(max_clusters = 8) {
+  return request<CrisisClusters>(`/liquidity/research/crisis-clusters?max_clusters=${max_clusters}`);
+}
+
+export type NarrativeMetricChange = {
+  metric: string;
+  h1: number | null;
+  h24: number | null;
+  d7: number | null;
+  change_1h_vs_24h_pct: number | null;
+  change_24h_vs_7d_pct: number | null;
+};
+
+export type NarrativeEvolution = {
+  fetched_at_ms: number;
+  horizons: { label: string; window_ms: number }[];
+  metric_changes: NarrativeMetricChange[];
+  short_term_bullets: string[];
+  long_term_bullets: string[];
+};
+
+export async function getNarrativeEvolution() {
+  return request<NarrativeEvolution>("/liquidity/research/narrative-evolution");
+}
+
+export type MultiHorizon = {
+  fetched_at_ms: number;
+  scores: { short: number | null; medium: number | null; long: number | null };
+  horizon_alignment_score: number | null;
+  horizon_conflict_map: { short_vs_medium: number | null; short_vs_long: number | null; medium_vs_long: number | null };
+  dominant_horizon: string | null;
+  structural_alignment_state: "ALIGNED" | "DIVERGENT" | "FRAGMENTED" | "INSUFFICIENT_DATA";
+};
+
+export async function getMultiHorizon() {
+  return request<MultiHorizon>("/liquidity/research/multi-horizon");
+}
+
+export type AutoAnomalyDecision = {
+  kind: string;
+  action: "recorded" | "cooldown" | "below_threshold" | "error";
+  score?: number;
+  state?: string;
+  error?: string;
+  regime?: string;
+  alert_kind?: string;
+  pct?: number;
+  next_eligible_in_ms?: number;
+};
+
+export type AutoAnomalyOut = {
+  fetched_at_ms: number;
+  inserted: { id: number; kind: string; severity: string; occurred_at_ms: number; novelty_score: number; recurrence_count: number }[];
+  decisions: AutoAnomalyDecision[];
+};
+
+export async function triggerAutoAnomalyScan() {
+  return request<AutoAnomalyOut>("/liquidity/research/auto-anomaly-scan", { method: "POST" });
 }

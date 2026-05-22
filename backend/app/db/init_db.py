@@ -135,6 +135,21 @@ _ADDITIVE_MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_occurred_ts ON liquidity_anomaly_memory (occurred_at_ms)",
     "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_kind ON liquidity_anomaly_memory (kind)",
+    """
+    CREATE TABLE IF NOT EXISTS server_metrics (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        load_1m DOUBLE PRECISION,
+        load_5m DOUBLE PRECISION,
+        load_15m DOUBLE PRECISION,
+        cpu_percent DOUBLE PRECISION,
+        memory_percent DOUBLE PRECISION,
+        swap_percent DOUBLE PRECISION,
+        disk_percent DOUBLE PRECISION,
+        net_connections INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_server_metrics_created_at ON server_metrics (created_at)",
 ]
 
 

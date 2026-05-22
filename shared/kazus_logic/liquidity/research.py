@@ -2493,3 +2493,708 @@ def meta_intelligence_health(db: Session) -> dict:
         "avg_distinct_regimes_per_day": avg_dr,
         "mutation_magnitude_sum": mutation_total,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-12 — Autonomous Intelligence Coordination
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Auto-recorder + cross-layer synthesis. The auto-recorder runs from the
+# worker on its own slow cadence; the synthesis endpoints are read-only
+# views over the same data, used by the Coord page.
+
+
+# ── Auto-anomaly recording ────────────────────────────────────────────────
+
+
+# Cooldown per anomaly kind — we don't want the worker re-recording the
+# same break every cycle. The kind-specific rates reflect how slowly
+# each underlying signal moves: structural breaks are 7-day windows so
+# 6h between observations is plenty; pre_cascade is a fast signal so we
+# allow re-recording every 30 min.
+AUTO_ANOMALY_COOLDOWN_MS: Dict[str, int] = {
+    "structural_break": 6 * 3600 * 1000,
+    "regime_collapse": 2 * 3600 * 1000,
+    "venue_divergence": 2 * 3600 * 1000,
+    "pre_cascade": 30 * 60_000,
+    "edge_inversion": 6 * 3600 * 1000,
+    "regime_emergence": 6 * 3600 * 1000,
+}
+
+
+def _last_anomaly_ts(db: Session, kind: str) -> Optional[int]:
+    from kazus_db.models import LiquidityAnomalyMemory
+    row = (
+        db.query(LiquidityAnomalyMemory.occurred_at_ms)
+        .filter(LiquidityAnomalyMemory.kind == kind)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .first()
+    )
+    return int(row.occurred_at_ms) if row else None
+
+
+def auto_record_anomalies(db: Session) -> dict:
+    """One scan: pulls Phase-10/11 layers and decides whether any of
+    them are tripping the auto-record thresholds. Each candidate kind
+    is checked against its cooldown so the worker can call this every
+    few minutes without flooding the table.
+
+    Returns the list of newly inserted rows + a per-kind decision log
+    so the UI can show "scanned but suppressed by cooldown".
+    """
+    now_ms = int(time.time() * 1000)
+    decisions: List[dict] = []
+    inserted: List[dict] = []
+
+    # 1) Structural break — record if score ≥ 55 AND confidence ≥ 50.
+    try:
+        sb = structural_breaks(db, window_days=7)
+        if sb["structural_break_score"] >= 55 and sb["break_confidence"] >= 50:
+            kind = "structural_break"
+            last = _last_anomaly_ts(db, kind)
+            if last is None or now_ms - last >= AUTO_ANOMALY_COOLDOWN_MS[kind]:
+                rec = record_anomaly(
+                    db, kind=kind,
+                    severity=("critical" if sb["structural_break_score"] >= 75 else "warn"),
+                    fingerprint=_universe_fp(db, extra={
+                        "structural_break_score": sb["structural_break_score"],
+                        "correlation_drift": sb["components"]["correlation_drift"],
+                        "median_migration": sb["components"]["median_migration"],
+                        "regime_mix_shift": sb["components"]["regime_mix_shift"],
+                    }),
+                    notes=f"auto-recorded · break={sb['structural_break_score']:.0f}",
+                )
+                inserted.append(rec)
+                decisions.append({"kind": kind, "action": "recorded", "score": sb["structural_break_score"]})
+            else:
+                decisions.append({"kind": kind, "action": "cooldown",
+                                  "score": sb["structural_break_score"],
+                                  "next_eligible_in_ms": AUTO_ANOMALY_COOLDOWN_MS[kind] - (now_ms - last)})
+        else:
+            decisions.append({"kind": "structural_break", "action": "below_threshold",
+                              "score": sb["structural_break_score"]})
+    except Exception as exc:  # noqa: BLE001
+        decisions.append({"kind": "structural_break", "action": "error", "error": str(exc)})
+
+    # 2) Pre-cascade — record on PRE_CASCADE state.
+    try:
+        rsw = regime_shift_warning(db)
+        kind = "pre_cascade"
+        if rsw["warning_state"] == "PRE_CASCADE":
+            last = _last_anomaly_ts(db, kind)
+            if last is None or now_ms - last >= AUTO_ANOMALY_COOLDOWN_MS[kind]:
+                rec = record_anomaly(
+                    db, kind=kind, severity="critical",
+                    fingerprint=_universe_fp(db, extra={
+                        "regime_shift_probability": rsw["regime_shift_probability"],
+                        "instability_acceleration": rsw["instability_acceleration"],
+                    }),
+                    notes=f"auto-recorded · {rsw['warning_state']} · prob={rsw['regime_shift_probability']:.0f}%",
+                )
+                inserted.append(rec)
+                decisions.append({"kind": kind, "action": "recorded",
+                                  "score": rsw["regime_shift_probability"]})
+            else:
+                decisions.append({"kind": kind, "action": "cooldown",
+                                  "next_eligible_in_ms": AUTO_ANOMALY_COOLDOWN_MS[kind] - (now_ms - last)})
+        else:
+            decisions.append({"kind": kind, "action": "below_threshold",
+                              "state": rsw["warning_state"]})
+    except Exception as exc:  # noqa: BLE001
+        decisions.append({"kind": "pre_cascade", "action": "error", "error": str(exc)})
+
+    # 3) Regime collapse — record on a transition matrix hit where
+    #    collapse_prob ≥ 0.5 for the dominant regime.
+    try:
+        ro = regime_outcomes(db, since_ms=now_ms - 7 * 24 * 3600 * 1000)
+        for r in ro["regimes"]:
+            if r["collapse_prob"] >= 0.5 and r["count"] >= 20:
+                kind = "regime_collapse"
+                last = _last_anomaly_ts(db, kind)
+                if last is None or now_ms - last >= AUTO_ANOMALY_COOLDOWN_MS[kind]:
+                    rec = record_anomaly(
+                        db, kind=kind, severity="critical",
+                        fingerprint=_universe_fp(db, extra={
+                            "regime": hash(r["regime"]) % 10_000 / 10_000.0,  # categorical proxy
+                            "collapse_prob": r["collapse_prob"],
+                            "count": float(r["count"]),
+                        }),
+                        notes=f"auto-recorded · {r['regime']} collapse_prob={r['collapse_prob']*100:.0f}%",
+                    )
+                    inserted.append(rec)
+                    decisions.append({"kind": kind, "action": "recorded", "regime": r["regime"]})
+                    break    # one per scan
+    except Exception as exc:  # noqa: BLE001
+        decisions.append({"kind": "regime_collapse", "action": "error", "error": str(exc)})
+
+    # 4) Edge inversion — when edge_mutation flags any kind as INVERTED.
+    try:
+        mut = edge_mutation(db, since_ms=now_ms - 60 * 24 * 3600 * 1000, window_days=7)
+        inverted = [k for k in mut["kinds"] if k["inverted"]]
+        if inverted:
+            kind = "edge_inversion"
+            last = _last_anomaly_ts(db, kind)
+            if last is None or now_ms - last >= AUTO_ANOMALY_COOLDOWN_MS[kind]:
+                top = inverted[0]
+                rec = record_anomaly(
+                    db, kind=kind, severity="warn",
+                    fingerprint=_universe_fp(db, extra={
+                        "delta": (top["delta"] or 0.0),
+                        "mutation_score": top["mutation_score"],
+                    }),
+                    notes=f"auto-recorded · {top['kind']} inverted · Δ={top['delta'] * 100 if top['delta'] is not None else 0:.1f}pp",
+                )
+                inserted.append(rec)
+                decisions.append({"kind": kind, "action": "recorded", "alert_kind": top["kind"]})
+    except Exception as exc:  # noqa: BLE001
+        decisions.append({"kind": "edge_inversion", "action": "error", "error": str(exc)})
+
+    # 5) Venue divergence — when avg mid_price divergence ≥ 0.1% over the
+    #    most recent venue snapshots.
+    try:
+        recent_ms = now_ms - 60 * 60_000
+        rows = db.execute(
+            text(
+                """
+                WITH ref AS (
+                  SELECT symbol, ts_ms, mid_price
+                  FROM liquidity_crossex_history
+                  WHERE exchange = 'binance' AND ts_ms >= :since
+                ), other AS (
+                  SELECT symbol, ts_ms, exchange, mid_price
+                  FROM liquidity_crossex_history
+                  WHERE exchange != 'binance' AND ts_ms >= :since
+                )
+                SELECT
+                  AVG(ABS(other.mid_price - ref.mid_price) / NULLIF(ref.mid_price, 0)) * 100 AS pct
+                FROM other JOIN ref
+                  ON other.symbol = ref.symbol AND ABS(other.ts_ms - ref.ts_ms) < 60000
+                """
+            ),
+            {"since": recent_ms},
+        ).first()
+        pct = float(rows.pct) if rows and rows.pct is not None else 0.0
+        if pct >= 0.10:
+            kind = "venue_divergence"
+            last = _last_anomaly_ts(db, kind)
+            if last is None or now_ms - last >= AUTO_ANOMALY_COOLDOWN_MS[kind]:
+                rec = record_anomaly(
+                    db, kind=kind, severity=("critical" if pct >= 0.25 else "warn"),
+                    fingerprint=_universe_fp(db, extra={"avg_mid_divergence_pct": pct}),
+                    notes=f"auto-recorded · avg mid divergence {pct:.3f}%",
+                )
+                inserted.append(rec)
+                decisions.append({"kind": kind, "action": "recorded", "pct": pct})
+    except Exception as exc:  # noqa: BLE001
+        decisions.append({"kind": "venue_divergence", "action": "error", "error": str(exc)})
+
+    return {
+        "fetched_at_ms": now_ms,
+        "inserted": inserted,
+        "decisions": decisions,
+    }
+
+
+def _universe_fp(db: Session, extra: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """Universe fingerprint plus optional extras. Mostly for the auto
+    recorder so the anomaly carries enough context to be matched later."""
+    fp = _fingerprint_current(db)
+    if extra:
+        fp.update({k: float(v) for k, v in extra.items() if v is not None})
+    return fp
+
+
+# ── Intelligence synthesis ────────────────────────────────────────────────
+
+
+def intelligence_synthesis(db: Session) -> dict:
+    """Pulls every layer's current view + composes a single coordinated
+    interpretation. Cross-layer agreement is the share of layers that
+    agree directionally with the dominant assessment.
+    """
+    now_ms = int(time.time() * 1000)
+    since_30d = now_ms - 30 * 24 * 3600 * 1000
+
+    rs = risk_state(db)
+    rsw = regime_shift_warning(db)
+    sb = structural_breaks(db, window_days=7)
+    mc = meta_confidence(db, since_ms=since_30d)
+    mh = meta_intelligence_health(db)
+    strat = strategic_state(db)
+
+    # Each layer votes on a 0..100 "stress dial". The synthesis is the
+    # weighted mean; agreement is the fraction within ±20 of that mean.
+    layers = {
+        "operations": rs["risk_state_score"],
+        "regime_shift": rsw["regime_shift_probability"],
+        "structural": sb["structural_break_score"],
+        "meta_confidence_inverse": max(0.0, 100.0 - mc["meta_confidence_score"]),
+        "intelligence_health_inverse": max(0.0, 100.0 - mh["meta_intelligence_health"]),
+    }
+    weights = {
+        "operations": 1.2,
+        "regime_shift": 1.0,
+        "structural": 1.0,
+        "meta_confidence_inverse": 0.6,
+        "intelligence_health_inverse": 0.8,
+    }
+    total_w = sum(weights.values())
+    synthesized = sum(layers[k] * weights[k] for k in layers) / total_w
+    in_band = sum(1 for v in layers.values() if abs(v - synthesized) <= 20)
+    agreement = (in_band / len(layers)) * 100.0
+
+    # Coordinated state label — composite over the strategic state +
+    # synthesized score. We can refine these labels by tightening
+    # transitions; for now, three escalation rungs above STABLE.
+    state = "STABLE_COORDINATED_MARKET"
+    if strat["state"] == "CASCADE_RISK_ENVIRONMENT" or synthesized >= 70:
+        state = "ACTIVE_CASCADE_PROPAGATION"
+    elif strat["state"] in ("TRANSITIONAL_UNSTABLE", "LIQUIDITY_DETERIORATION_PHASE") or synthesized >= 55:
+        state = "ESCALATING_SYSTEMIC_INSTABILITY"
+    elif strat["state"] == "FRAGILE_SPECULATIVE_MARKET" or synthesized >= 40:
+        state = "FRAGMENTING_LIQUIDITY_ENVIRONMENT"
+    elif synthesized >= 25:
+        state = "EARLY_STRUCTURAL_STRESS"
+    elif sb["structural_break_score"] >= 50 and mh["state"] in ("DEGRADING", "CRITICAL"):
+        state = "STRUCTURAL_MARKET_DETERIORATION"
+
+    return {
+        "fetched_at_ms": now_ms,
+        "synthesized_stress": synthesized,
+        "coordinated_state": state,
+        "cross_layer_agreement": agreement,
+        "layers": [
+            {"name": k, "score": v, "weight": weights[k], "delta_from_mean": v - synthesized}
+            for k, v in layers.items()
+        ],
+        "components": {
+            "stress_level": rs["systemic_stress_level"],
+            "shift_warning": rsw["warning_state"],
+            "structural_break_score": sb["structural_break_score"],
+            "meta_confidence_state": mc["trustworthiness_state"],
+            "intelligence_health_state": mh["state"],
+            "strategic_state": strat["state"],
+        },
+    }
+
+
+# ── Intelligence conflict resolution ──────────────────────────────────────
+
+
+def intelligence_conflicts(db: Session) -> dict:
+    """Surface specific layer-vs-layer disagreements. The synthesis
+    agreement metric is the headline; this endpoint enumerates the
+    actual contradictions for the UI to render."""
+    synth = intelligence_synthesis(db)
+    conflicts: List[dict] = []
+
+    # 1) Operations stress vs structural stability
+    ops_score = next(l for l in synth["layers"] if l["name"] == "operations")["score"]
+    struct_score = next(l for l in synth["layers"] if l["name"] == "structural")["score"]
+    if abs(ops_score - struct_score) >= 35:
+        if ops_score > struct_score:
+            conflicts.append({
+                "kind": "ops_vs_structural",
+                "description": "Short-term stress elevated but long-term structure stable",
+                "ops_score": ops_score,
+                "structural_score": struct_score,
+                "dominant_horizon": "short",
+            })
+        else:
+            conflicts.append({
+                "kind": "ops_vs_structural",
+                "description": "Long-term structure deteriorating but short-term calm",
+                "ops_score": ops_score,
+                "structural_score": struct_score,
+                "dominant_horizon": "long",
+            })
+
+    # 2) Regime shift warning vs meta-confidence
+    shift_score = next(l for l in synth["layers"] if l["name"] == "regime_shift")["score"]
+    mc_inv = next(l for l in synth["layers"] if l["name"] == "meta_confidence_inverse")["score"]
+    if shift_score >= 50 and mc_inv >= 50:
+        conflicts.append({
+            "kind": "regime_shift_under_low_confidence",
+            "description": "Regime shift signal firing while meta-confidence is low — interpret cautiously",
+            "shift_probability": shift_score,
+            "confidence_deficit": mc_inv,
+        })
+
+    # 3) Health vs synthesized stress
+    health_inv = next(l for l in synth["layers"] if l["name"] == "intelligence_health_inverse")["score"]
+    if synth["synthesized_stress"] >= 55 and health_inv <= 25:
+        conflicts.append({
+            "kind": "stress_without_health_signal",
+            "description": "Synthesized stress is high but the engine itself reports healthy — consider whether thresholds are stale",
+        })
+
+    # Dominant layer = highest weighted contribution
+    dominant_layer = max(synth["layers"], key=lambda l: abs(l["delta_from_mean"]) * l["weight"])
+    # Suppressed = layers whose score is far below the mean
+    suppressed = [l["name"] for l in synth["layers"] if l["delta_from_mean"] < -15]
+
+    return {
+        "fetched_at_ms": synth["fetched_at_ms"],
+        "conflict_score": 100.0 - synth["cross_layer_agreement"],
+        "conflicts": conflicts,
+        "dominant_layer": dominant_layer["name"],
+        "suppressed_layers": suppressed,
+    }
+
+
+# ── Adaptive alert suppression (read-only diagnostics) ────────────────────
+
+
+def alert_suppression(db: Session, window_minutes: int = 60) -> dict:
+    """How redundant is the recent alert stream? Group recent alerts by
+    (symbol, kind) and report cluster size, dominant severity, and
+    compression ratio (unique-cluster-count / total alert count).
+
+    The Phase-5 client engine already debounces, but operators want to
+    see when the engine is "saturating" — many critical alerts on one
+    symbol over a short window means the underlying market state is
+    not multiple problems, it's one problem firing many sensors.
+    """
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - window_minutes * 60_000
+    rows = db.execute(
+        text(
+            """
+            SELECT symbol, kind, severity, COUNT(*) AS c,
+                   MAX(last_seen_at_ms) AS last_seen
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY symbol, kind, severity
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+
+    clusters: Dict[Tuple[str, str], dict] = {}
+    total = 0
+    for r in rows:
+        c = int(r.c or 0)
+        total += c
+        key = (r.symbol, r.kind)
+        cl = clusters.setdefault(key, {
+            "symbol": r.symbol,
+            "kind": r.kind,
+            "count": 0,
+            "max_severity": "info",
+            "last_seen_ms": 0,
+        })
+        cl["count"] += c
+        sev = r.severity
+        if sev == "critical" or (sev == "warn" and cl["max_severity"] != "critical"):
+            cl["max_severity"] = sev
+        if int(r.last_seen or 0) > cl["last_seen_ms"]:
+            cl["last_seen_ms"] = int(r.last_seen)
+
+    cluster_list = list(clusters.values())
+    cluster_list.sort(key=lambda c: -c["count"])
+    redundant = [c for c in cluster_list if c["count"] >= 3]
+    for i, c in enumerate(redundant, start=1):
+        c["cluster_id"] = i
+        c["redundancy_score"] = min(100.0, math.log10(c["count"]) * 60.0)
+    compression_ratio = (len(clusters) / total) if total > 0 else 1.0
+
+    return {
+        "window_minutes": window_minutes,
+        "total_alerts": total,
+        "unique_clusters": len(clusters),
+        "alert_compression_ratio": compression_ratio,
+        "redundant_clusters": redundant[:20],
+    }
+
+
+# ── Structural crisis clustering ──────────────────────────────────────────
+
+
+def crisis_clusters(db: Session, max_clusters: int = 8) -> dict:
+    """Group anomaly_memory rows into clusters of similar fingerprints.
+
+    Simple agglomerative-style first pass: walk anomalies newest-first,
+    assign each to the nearest existing cluster centroid if distance
+    < 0.5, otherwise spawn a new cluster. Centroid = arithmetic mean
+    of cluster member fingerprints. Cluster size = number of members;
+    frequency = members per day in the window covered.
+    """
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyMemory
+
+    rows = (
+        db.query(LiquidityAnomalyMemory)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(500)
+        .all()
+    )
+    if not rows:
+        return {"clusters": [], "anomaly_count": 0}
+
+    clusters: List[dict] = []   # each {"centroid": dict, "members": [row, ...]}
+
+    def _avg(maps: List[Dict[str, float]]) -> Dict[str, float]:
+        keys = set()
+        for m in maps:
+            keys.update(m.keys())
+        out: Dict[str, float] = {}
+        for k in keys:
+            vals = [m[k] for m in maps if k in m]
+            if vals:
+                out[k] = sum(vals) / len(vals)
+        return out
+
+    for r in rows:
+        try:
+            fp = _json.loads(r.fingerprint_json) if r.fingerprint_json else {}
+        except (TypeError, ValueError):
+            continue
+        if not fp:
+            continue
+        best = None
+        best_d = None
+        for c in clusters:
+            d = _fingerprint_distance(fp, c["centroid"])
+            if d is None:
+                continue
+            if best_d is None or d < best_d:
+                best_d = d
+                best = c
+        if best is not None and best_d is not None and best_d < 0.5:
+            best["members"].append({"id": r.id, "kind": r.kind, "ts": r.occurred_at_ms, "novelty": r.novelty_score})
+            # Rolling centroid: simple mean of old centroid + new fp. Drift
+            # over very large clusters is acceptable — this is for visual
+            # grouping, not k-means convergence.
+            best["centroid"] = _avg([fp, best["centroid"]])
+        else:
+            clusters.append({"centroid": dict(fp), "members": [{
+                "id": r.id, "kind": r.kind, "ts": r.occurred_at_ms, "novelty": r.novelty_score,
+            }]})
+
+    clusters.sort(key=lambda c: -len(c["members"]))
+    out_clusters: List[dict] = []
+    for idx, c in enumerate(clusters[:max_clusters], start=1):
+        members = c["members"]
+        span_ms = max(m["ts"] for m in members) - min(m["ts"] for m in members) if len(members) > 1 else 0
+        days = max(0.5, span_ms / (24 * 3600 * 1000))
+        # Dominant kind: most-frequent kind in the cluster.
+        from collections import Counter
+        kinds = Counter(m["kind"] for m in members)
+        dominant_kind, _ = kinds.most_common(1)[0]
+        out_clusters.append({
+            "cluster_id": idx,
+            "size": len(members),
+            "dominant_kind": dominant_kind,
+            "kinds": dict(kinds),
+            "frequency_per_day": len(members) / days,
+            "earliest_ts": min(m["ts"] for m in members),
+            "latest_ts": max(m["ts"] for m in members),
+            "avg_novelty": sum(m["novelty"] for m in members) / len(members),
+            "centroid": c["centroid"],
+            "recent_members": sorted(members, key=lambda m: -m["ts"])[:5],
+        })
+    return {"clusters": out_clusters, "anomaly_count": len(rows)}
+
+
+def m_fp(_x):
+    """Tiny stub so _avg above can stay simple — kept for clarity."""
+    return _x if isinstance(_x, dict) else {}
+
+
+# ── Narrative evolution (multi-period story) ──────────────────────────────
+
+
+def narrative_evolution(db: Session) -> dict:
+    """Build a multi-horizon narrative: what changed over 1h vs 24h vs 7d.
+
+    Pulls cohort medians at three time-buckets and synthesizes the
+    direction of change per metric, then composes a narrative bullet
+    list. Output is plain text — no LLM, no recommendations.
+    """
+    now_ms = int(time.time() * 1000)
+
+    def cohort_median(since_ms: int, until_ms: int) -> Dict[str, float]:
+        rows = db.execute(
+            text(
+                """
+                SELECT metric, percentile_disc(0.5) WITHIN GROUP (ORDER BY value) AS m
+                FROM liquidity_samples
+                WHERE metric = ANY(:metrics)
+                  AND ts >= :since AND ts < :until AND value IS NOT NULL
+                GROUP BY metric
+                """
+            ),
+            {"metrics": list(ANALYTICS_METRICS), "since": since_ms, "until": until_ms},
+        ).fetchall()
+        return {r.metric: float(r.m) for r in rows if r.m is not None}
+
+    h1 = cohort_median(now_ms - 1 * 3600_000, now_ms)
+    h24 = cohort_median(now_ms - 24 * 3600_000, now_ms - 1 * 3600_000)
+    d7 = cohort_median(now_ms - 7 * 24 * 3600_000, now_ms - 24 * 3600_000)
+
+    def pct_change(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        if a is None or b is None or abs(b) < 1e-9:
+            return None
+        return (a - b) / abs(b) * 100.0
+
+    metric_changes: List[dict] = []
+    for m in ANALYTICS_METRICS:
+        c_1h_vs_24h = pct_change(h1.get(m), h24.get(m))
+        c_24h_vs_7d = pct_change(h24.get(m), d7.get(m))
+        metric_changes.append({
+            "metric": m,
+            "h1": h1.get(m),
+            "h24": h24.get(m),
+            "d7": d7.get(m),
+            "change_1h_vs_24h_pct": c_1h_vs_24h,
+            "change_24h_vs_7d_pct": c_24h_vs_7d,
+        })
+
+    # Compose human-readable bullets per horizon.
+    def describe(window_label: str, changes_key: str) -> List[str]:
+        bullets: List[str] = []
+        for mc in metric_changes:
+            v = mc[changes_key]
+            if v is None:
+                continue
+            if mc["metric"] in ("fragility_score", "spread", "liq_stress", "impact_score") and v > 10:
+                bullets.append(f"{mc['metric']} rose {v:.0f}% {window_label}")
+            if mc["metric"] in ("resiliency_score", "credible_depth") and v < -10:
+                bullets.append(f"{mc['metric']} dropped {abs(v):.0f}% {window_label}")
+            if mc["metric"] == "funding_z" and abs(v) > 20:
+                bullets.append(f"funding extremity changed {v:.0f}% {window_label}")
+            if mc["metric"] == "oi_delta_1h" and abs(v) > 20:
+                bullets.append(f"OI expansion intensity moved {v:.0f}% {window_label}")
+        return bullets
+
+    short_bullets = describe("over the last hour", "change_1h_vs_24h_pct")
+    long_bullets = describe("over the last day vs prior week", "change_24h_vs_7d_pct")
+
+    return {
+        "fetched_at_ms": now_ms,
+        "horizons": [
+            {"label": "1h", "window_ms": 3600_000},
+            {"label": "24h", "window_ms": 24 * 3600_000},
+            {"label": "7d", "window_ms": 7 * 24 * 3600_000},
+        ],
+        "metric_changes": metric_changes,
+        "short_term_bullets": short_bullets,
+        "long_term_bullets": long_bullets,
+    }
+
+
+# ── Multi-horizon coordination ────────────────────────────────────────────
+
+
+def multi_horizon(db: Session) -> dict:
+    """Align scores across short / medium / long horizons.
+
+    Scores for each horizon are bounded 0..100 instability indices:
+      short  = recent stress (cohort fragility/liq_stress percentile in last 1h)
+      medium = 24h median fragility + spread vs the 7d band
+      long   = structural_break_score over 7d
+    """
+    now_ms = int(time.time() * 1000)
+
+    def cohort_band(since_ms: int) -> Dict[str, Tuple[float, float, float]]:
+        # Returns metric -> (p10, p50, p90)
+        rows = db.execute(
+            text(
+                """
+                SELECT metric,
+                       percentile_disc(0.10) WITHIN GROUP (ORDER BY value) AS p10,
+                       percentile_disc(0.50) WITHIN GROUP (ORDER BY value) AS p50,
+                       percentile_disc(0.90) WITHIN GROUP (ORDER BY value) AS p90
+                FROM liquidity_samples
+                WHERE metric = ANY(:metrics)
+                  AND ts >= :since AND value IS NOT NULL
+                GROUP BY metric
+                """
+            ),
+            {"metrics": ["fragility_score", "spread", "liq_stress", "resiliency_score"], "since": since_ms},
+        ).fetchall()
+        return {r.metric: (float(r.p10), float(r.p50), float(r.p90)) for r in rows if r.p50 is not None}
+
+    band_7d = cohort_band(now_ms - 7 * 24 * 3600_000)
+    band_24h = cohort_band(now_ms - 24 * 3600_000)
+    band_1h = cohort_band(now_ms - 3600_000)
+
+    def short_score() -> Optional[float]:
+        # Fragility median + (100 − resiliency median).
+        f = band_1h.get("fragility_score")
+        r = band_1h.get("resiliency_score")
+        if f is None and r is None:
+            return None
+        parts: List[float] = []
+        if f is not None:
+            parts.append(min(100.0, max(0.0, f[1])))
+        if r is not None:
+            parts.append(min(100.0, max(0.0, 100.0 - r[1])))
+        return sum(parts) / len(parts)
+
+    def medium_score() -> Optional[float]:
+        # How far the 24h median sits inside the 7d (p10, p90) band, for
+        # spread + fragility. 0 = at p10 (calm), 100 = at p90+ (stressed).
+        parts: List[float] = []
+        for m in ("spread", "fragility_score"):
+            b24 = band_24h.get(m)
+            b7 = band_7d.get(m)
+            if not b24 or not b7:
+                continue
+            p10, _, p90 = b7
+            span = max(1e-9, p90 - p10)
+            pos = (b24[1] - p10) / span
+            parts.append(max(0.0, min(1.0, pos)) * 100.0)
+        if not parts:
+            return None
+        return sum(parts) / len(parts)
+
+    def long_score() -> Optional[float]:
+        sb = structural_breaks(db, window_days=7)
+        return sb["structural_break_score"]
+
+    short = short_score()
+    medium = medium_score()
+    long_ = long_score()
+
+    # Alignment: stdev across the three normalized scores.
+    avail = [v for v in (short, medium, long_) if v is not None]
+    alignment = None
+    if len(avail) >= 2:
+        m = sum(avail) / len(avail)
+        var = sum((x - m) ** 2 for x in avail) / len(avail)
+        std = math.sqrt(var)
+        alignment = max(0.0, 100.0 - std * 2.0)   # std=50 → 0
+
+    dominant = None
+    if short is not None and medium is not None and long_ is not None:
+        names = [("short", short), ("medium", medium), ("long", long_)]
+        dominant = max(names, key=lambda kv: kv[1])[0]
+
+    # Conflict map: per-pair |delta|.
+    def diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        return None if a is None or b is None else abs(a - b)
+
+    conflicts = {
+        "short_vs_medium": diff(short, medium),
+        "short_vs_long": diff(short, long_),
+        "medium_vs_long": diff(medium, long_),
+    }
+
+    if alignment is None:
+        state = "INSUFFICIENT_DATA"
+    elif alignment >= 80:
+        state = "ALIGNED"
+    elif alignment >= 55:
+        state = "DIVERGENT"
+    else:
+        state = "FRAGMENTED"
+
+    return {
+        "fetched_at_ms": now_ms,
+        "scores": {"short": short, "medium": medium, "long": long_},
+        "horizon_alignment_score": alignment,
+        "horizon_conflict_map": conflicts,
+        "dominant_horizon": dominant,
+        "structural_alignment_state": state,
+    }

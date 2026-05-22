@@ -25,10 +25,12 @@ import {
   type ChartInterval,
   type ChartTheme,
 } from "./CandleChart";
+import { Coordination } from "./Coordination";
 import { Liquidity } from "./Liquidity";
 import { Meta } from "./Meta";
 import { Operations } from "./Operations";
 import { Research } from "./Research";
+import { ServerHealth } from "./ServerHealth";
 import { Strategy } from "./Strategy";
 import { ScreenerTable } from "./ScreenerTable";
 import { normalizeSymbol, SymbolSuggestInput } from "./SymbolSuggestInput";
@@ -58,7 +60,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "server";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -78,6 +80,26 @@ function FibIcon({ size = 20 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
       <circle cx="12" cy="12" r="9.5" />
       <path d="M12 12 C16 9 17.5 5.5 14.5 3 C11 0 7 3 7 7 C7 11 10 13.5 13 14.5 C16.5 15.5 19 14 18.5 10.5" />
+    </svg>
+  );
+}
+
+function CoordIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <circle cx="10" cy="10" r="2" fill="currentColor" />
+      <circle cx="4" cy="5" r="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="16" cy="5" r="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="4" cy="15" r="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="16" cy="15" r="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M5 6L9 9M15 6L11 9M5 14L9 11M15 14L11 11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -129,6 +151,23 @@ function OpsIcon({ size = 20 }: { size?: number }) {
       <circle cx="6" cy="10" r="1.2" fill="currentColor" />
       <circle cx="13" cy="6" r="1.2" fill="currentColor" />
       <circle cx="17" cy="11" r="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
+function ServerIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <rect x="3" y="4" width="14" height="5" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
+      <rect x="3" y="11" width="14" height="5" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M6 6.5h.01M6 13.5h.01M9 6.5h5M9 13.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1435,10 +1474,27 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("meta")}
             title="Self-Calibration · Anomaly Memory · Meta-Health"
           />
+          <NavBtn
+            active={page === "coord"}
+            open={sidebarOpen}
+            icon={<CoordIcon size={20} />}
+            label="COORD"
+            onClick={() => setPage("coord")}
+            title="Coordination · Synthesis · Multi-Horizon"
+          />
         </div>
 
         {/* Nav bottom */}
         <div className="mt-auto flex flex-col gap-0.5 px-1.5">
+          <NavBtn
+            active={page === "server"}
+            open={sidebarOpen}
+            icon={<ServerIcon size={20} />}
+            label="SYS"
+            onClick={() => setPage("server")}
+            title="Server Load"
+          />
+
           <button
             onClick={toggleMotion}
             className="flex items-center justify-center px-2 py-2 rounded-lg text-muted hover:text-zinc-200 hover:bg-white/[0.04] transition-colors"
@@ -1629,9 +1685,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
         {page === "ops" && <Operations />}
 
+        {page === "server" && <ServerHealth />}
+
         {page === "strat" && <Strategy />}
 
         {page === "meta" && <Meta />}
+
+        {page === "coord" && <Coordination />}
       </main>
 
       {/* ── Chart Modal ── */}

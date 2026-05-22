@@ -110,6 +110,24 @@ class SystemStatus(Base):
     last_error: Mapped[Optional[str]] = mapped_column(String(512))
 
 
+class ServerMetric(Base):
+    __tablename__ = "server_metrics"
+    __table_args__ = (
+        Index("ix_server_metrics_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    load_1m: Mapped[Optional[float]] = mapped_column(Float)
+    load_5m: Mapped[Optional[float]] = mapped_column(Float)
+    load_15m: Mapped[Optional[float]] = mapped_column(Float)
+    cpu_percent: Mapped[Optional[float]] = mapped_column(Float)
+    memory_percent: Mapped[Optional[float]] = mapped_column(Float)
+    swap_percent: Mapped[Optional[float]] = mapped_column(Float)
+    disk_percent: Mapped[Optional[float]] = mapped_column(Float)
+    net_connections: Mapped[Optional[int]] = mapped_column(Integer)
+
+
 class LiquiditySample(Base):
     """Time-series sample for a single liquidity metric on a single symbol.
 

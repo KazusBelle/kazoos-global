@@ -2241,3 +2241,221 @@ async def meta_health_endpoint(
     _user: User = Depends(get_current_user),
 ) -> MetaHealthOut:
     return MetaHealthOut(**_research.meta_intelligence_health(db))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-12 — Coordination endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class SynthesisLayer(BaseModel):
+    name: str
+    score: float
+    weight: float
+    delta_from_mean: float
+
+
+class SynthesisComponents(BaseModel):
+    stress_level: str
+    shift_warning: str
+    structural_break_score: float
+    meta_confidence_state: str
+    intelligence_health_state: str
+    strategic_state: str
+
+
+class SynthesisOut(BaseModel):
+    fetched_at_ms: int
+    synthesized_stress: float
+    coordinated_state: str
+    cross_layer_agreement: float
+    layers: List[SynthesisLayer]
+    components: SynthesisComponents
+
+
+@router.get("/research/synthesis", response_model=SynthesisOut)
+async def synthesis_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SynthesisOut:
+    return SynthesisOut(**_research.intelligence_synthesis(db))
+
+
+class ConflictItem(BaseModel):
+    kind: str
+    description: str
+    ops_score: Optional[float] = None
+    structural_score: Optional[float] = None
+    dominant_horizon: Optional[str] = None
+    shift_probability: Optional[float] = None
+    confidence_deficit: Optional[float] = None
+
+
+class ConflictsOut(BaseModel):
+    fetched_at_ms: int
+    conflict_score: float
+    conflicts: List[ConflictItem]
+    dominant_layer: str
+    suppressed_layers: List[str]
+
+
+@router.get("/research/conflicts", response_model=ConflictsOut)
+async def conflicts_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ConflictsOut:
+    return ConflictsOut(**_research.intelligence_conflicts(db))
+
+
+class SuppressionCluster(BaseModel):
+    cluster_id: int
+    symbol: str
+    kind: str
+    count: int
+    max_severity: str
+    last_seen_ms: int
+    redundancy_score: float
+
+
+class SuppressionOut(BaseModel):
+    window_minutes: int
+    total_alerts: int
+    unique_clusters: int
+    alert_compression_ratio: float
+    redundant_clusters: List[SuppressionCluster]
+
+
+@router.get("/research/alert-suppression", response_model=SuppressionOut)
+async def suppression_endpoint(
+    window_minutes: int = Query(60, ge=5, le=720),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SuppressionOut:
+    return SuppressionOut(**_research.alert_suppression(db, window_minutes=window_minutes))
+
+
+class CrisisCluster(BaseModel):
+    cluster_id: int
+    size: int
+    dominant_kind: str
+    kinds: dict
+    frequency_per_day: float
+    earliest_ts: int
+    latest_ts: int
+    avg_novelty: float
+    centroid: dict
+    recent_members: List[dict]
+
+
+class CrisisClustersOut(BaseModel):
+    clusters: List[CrisisCluster]
+    anomaly_count: int
+
+
+@router.get("/research/crisis-clusters", response_model=CrisisClustersOut)
+async def crisis_clusters_endpoint(
+    max_clusters: int = Query(8, ge=1, le=20),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> CrisisClustersOut:
+    return CrisisClustersOut(**_research.crisis_clusters(db, max_clusters=max_clusters))
+
+
+class HorizonInfo(BaseModel):
+    label: str
+    window_ms: int
+
+
+class NarrativeMetricChange(BaseModel):
+    metric: str
+    h1: Optional[float]
+    h24: Optional[float]
+    d7: Optional[float]
+    change_1h_vs_24h_pct: Optional[float]
+    change_24h_vs_7d_pct: Optional[float]
+
+
+class NarrativeEvolutionOut(BaseModel):
+    fetched_at_ms: int
+    horizons: List[HorizonInfo]
+    metric_changes: List[NarrativeMetricChange]
+    short_term_bullets: List[str]
+    long_term_bullets: List[str]
+
+
+@router.get("/research/narrative-evolution", response_model=NarrativeEvolutionOut)
+async def narrative_evolution_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> NarrativeEvolutionOut:
+    return NarrativeEvolutionOut(**_research.narrative_evolution(db))
+
+
+class MultiHorizonOut(BaseModel):
+    fetched_at_ms: int
+    scores: dict
+    horizon_alignment_score: Optional[float]
+    horizon_conflict_map: dict
+    dominant_horizon: Optional[str]
+    structural_alignment_state: str
+
+
+@router.get("/research/multi-horizon", response_model=MultiHorizonOut)
+async def multi_horizon_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MultiHorizonOut:
+    return MultiHorizonOut(**_research.multi_horizon(db))
+
+
+class AutoAnomalyInserted(BaseModel):
+    id: int
+    kind: str
+    severity: str
+    occurred_at_ms: int
+    novelty_score: float
+    recurrence_count: int
+
+
+class AutoAnomalyDecision(BaseModel):
+    kind: str
+    action: str
+    score: Optional[float] = None
+    state: Optional[str] = None
+    error: Optional[str] = None
+    regime: Optional[str] = None
+    alert_kind: Optional[str] = None
+    pct: Optional[float] = None
+    next_eligible_in_ms: Optional[int] = None
+
+
+class AutoAnomalyOut(BaseModel):
+    fetched_at_ms: int
+    inserted: List[AutoAnomalyInserted]
+    decisions: List[AutoAnomalyDecision]
+
+
+@router.post("/research/auto-anomaly-scan", response_model=AutoAnomalyOut)
+async def auto_anomaly_scan_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AutoAnomalyOut:
+    """Run one auto-anomaly scan on-demand. The worker calls the same
+    function on a 5-min cadence; this endpoint exists so the UI can
+    trigger a refresh after a manual change or for debugging."""
+    data = _research.auto_record_anomalies(db)
+    # Strip fingerprints from inserted rows for response brevity.
+    inserted = [
+        AutoAnomalyInserted(
+            id=row["id"], kind=row["kind"], severity=row["severity"],
+            occurred_at_ms=row["occurred_at_ms"],
+            novelty_score=row["novelty_score"],
+            recurrence_count=row["recurrence_count"],
+        )
+        for row in data.get("inserted", [])
+    ]
+    return AutoAnomalyOut(
+        fetched_at_ms=data["fetched_at_ms"],
+        inserted=inserted,
+        decisions=[AutoAnomalyDecision(**d) for d in data.get("decisions", [])],
+    )

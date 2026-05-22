@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
 
     refresh_interval_sec: int = 300
+    server_metrics_interval_sec: int = 60
+    server_metrics_retention_hours: int = 24 * 7
     default_coins: str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 
     @field_validator("cors_origins", mode="before")
