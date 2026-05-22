@@ -4353,9 +4353,15 @@ def propagation_graph(db: Session, lookback_days: int = 14, lead_window_ms: int 
         for s in nodes
     ]
 
-    # Systemic contagion score: average pair count / max possible.
+    # Systemic contagion: pairwise co-occurrences vs max possible pairs.
+    # Co-occurrence is O(N²) in the worst case, so the denominator has to
+    # be O(N²) too — otherwise the score scales to nonsense (we had a
+    # 6000% reading on real data because the original denominator was N,
+    # not N choose 2). Cap at 100 so the UI band stays readable.
     total_alerts = sum(len(v) for v in by_kind.values())
-    contagion_score = (sum(e["count"] for e in edges_out) / max(1, total_alerts)) * 100.0
+    max_pairs = max(1, total_alerts * (total_alerts - 1) // 2)
+    raw_total = sum(e["count"] for e in edges_out)
+    contagion_score = min(100.0, (raw_total / max_pairs) * 100.0)
     avg_velocity_s = (sum(e["avg_lead_s"] for e in edges_out) / len(edges_out)) if edges_out else None
 
     return {
