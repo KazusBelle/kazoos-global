@@ -13,14 +13,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import httpx
 from sqlalchemy.orm import Session
 
 from . import REGISTRY
 from .base import MetricContext
-from .binance_fetch import fetch_depth, fetch_h1_klines
+from .binance_fetch import (
+    fetch_depth,
+    fetch_funding_all,
+    fetch_h1_klines,
+    fetch_open_interest,
+)
+from .metrics.derived import compute_derived
 from .universe import get_universe
 
 logger = logging.getLogger("kazus.liquidity.poller")
@@ -31,30 +37,41 @@ CONCURRENCY = 8       # parallel symbol fetches; 8×(klines+depth) ≈ 16 req/s 
 RETENTION_DAYS = 35   # keep ~1 month of samples
 
 
-def _rest_metrics():
-    """Only REST-source metrics participate in the 60s polling cycle.
-    WS metrics are owned by the realtime sampler and would just write
-    NULLs if dispatched here."""
-    return [m for m in REGISTRY.values() if getattr(m, "source", "rest") == "rest"]
+def _rest_metrics_real():
+    """REST metrics that participate in the 60s per-symbol dispatch.
+
+    WS metrics (source=ws) are owned by the realtime sampler. Derived
+    metrics (source=derived — oi_delta_*, funding_z) need history and
+    are computed in a separate post-pass, not per-symbol context.
+    """
+    return [
+        m for m in REGISTRY.values()
+        if getattr(m, "source", "rest") == "rest"
+    ]
 
 
 async def _process_symbol(
     client: httpx.AsyncClient,
     symbol: str,
     now_ts: int,
+    funding_rate: Optional[float],
 ) -> List[dict]:
     """Fetch upstream for one symbol, run every REST metric in the
-    registry, return rows ready for batch insert."""
-    rest_metrics = _rest_metrics()
+    registry, return rows ready for batch insert. `funding_rate` is
+    pre-fetched in a single bulk call upstream — we just pass it in."""
+    rest_metrics = _rest_metrics_real()
     needs_klines = any("klines" in m.requires for m in rest_metrics)
     needs_depth = any("depth" in m.requires for m in rest_metrics)
+    needs_oi = any("open_interest" in m.requires for m in rest_metrics)
 
     klines_task = fetch_h1_klines(client, symbol) if needs_klines else None
     depth_task = fetch_depth(client, symbol) if needs_depth else None
+    oi_task = fetch_open_interest(client, symbol) if needs_oi else None
 
-    klines, depth = await asyncio.gather(
+    klines, depth, open_interest = await asyncio.gather(
         klines_task if klines_task else _none(),
         depth_task if depth_task else _none(),
+        oi_task if oi_task else _none(),
     )
 
     price = None
@@ -69,6 +86,8 @@ async def _process_symbol(
         price=price,
         h1_klines=klines,
         depth=depth,
+        open_interest=open_interest,
+        funding_rate=funding_rate,
     )
 
     rows: list[dict] = []
@@ -105,9 +124,13 @@ async def run_cycle(db_factory) -> int:
     all_rows: list[dict] = []
 
     async with httpx.AsyncClient(timeout=10.0) as client:
+        # One call gives every symbol's current funding rate, vs N
+        # per-symbol calls. Done upfront so each worker just looks up.
+        funding_map = await fetch_funding_all(client) or {}
+
         async def worker(sym: str):
             async with sem:
-                rows = await _process_symbol(client, sym, now_ts)
+                rows = await _process_symbol(client, sym, now_ts, funding_map.get(sym))
                 all_rows.extend(rows)
 
         await asyncio.gather(*(worker(s) for s in symbols), return_exceptions=True)
@@ -115,10 +138,30 @@ async def run_cycle(db_factory) -> int:
     if not all_rows:
         return 0
 
+    # Derived metrics (oi deltas, funding z-score) need history — one
+    # bulk SQL per metric family is much cheaper than per-symbol queries.
+    current_by_symbol: dict[str, dict[str, Optional[float]]] = {}
+    for r in all_rows:
+        sym = r["symbol"]
+        cur = current_by_symbol.setdefault(sym, {"oi": None, "funding": None, "price": None})
+        if r["metric"] == "oi":
+            cur["oi"] = r["value"]
+        elif r["metric"] == "funding":
+            cur["funding"] = r["value"]
+        if cur["price"] is None:
+            cur["price"] = r.get("price")
+
     # Batched insert — one round-trip per cycle for the whole TOP_N×metrics.
     from kazus_db.models import LiquiditySample
 
     with db_factory() as db:  # type: Session
+        try:
+            derived_rows = compute_derived(db, current_by_symbol, now_ts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("derived metrics failed: %s", exc)
+            derived_rows = []
+        if derived_rows:
+            all_rows.extend(derived_rows)
         db.bulk_insert_mappings(LiquiditySample, all_rows)
         db.commit()
 

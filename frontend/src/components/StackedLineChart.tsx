@@ -2,11 +2,19 @@ import { useMemo } from "react";
 
 type Point = { ts: number; value: number | null };
 
+export type ChartMarker = {
+  ts: number;
+  color: string;       // CSS color
+  label: string;       // tooltip text
+  kind?: "up" | "down" | "dot";
+};
+
 type Props = {
   price?: Point[];           // optional — when omitted the chart shows the metric only
   metric: Point[];
   metricLabel: string;
   height?: number;
+  markers?: ChartMarker[];
 };
 
 const PAD_X = 56;
@@ -109,6 +117,7 @@ export function StackedLineChart({
   metric,
   metricLabel,
   height = 240,
+  markers,
 }: Props) {
   const width = 880;
   const priceSeries = price ?? [];
@@ -239,6 +248,69 @@ export function StackedLineChart({
             filter={`url(#${glowId})`}
           />
         )}
+
+        {/* Event markers — small triangles/dots pinned to the metric line.
+            Anchored at the nearest metric sample so the marker visibly
+            sits on the curve, not floating above an empty x-axis tick. */}
+        {markers && markers.length > 0 && (() => {
+          const valuesByTs = new Map<number, number>();
+          for (const p of metric) {
+            if (p.value != null && Number.isFinite(p.value)) valuesByTs.set(p.ts, p.value);
+          }
+          const orderedTs = Array.from(valuesByTs.keys()).sort((a, b) => a - b);
+          if (orderedTs.length === 0 || xMax === xMin || metricMax === metricMin) return null;
+          const innerW = width - 2 * PAD_X;
+          const innerH = height - PAD_TOP - PAD_BOTTOM;
+          return (
+            <g>
+              {markers.map((m, i) => {
+                // Snap to closest available sample so the glyph rides the line.
+                let bestTs = orderedTs[0];
+                let bestDt = Math.abs(orderedTs[0] - m.ts);
+                for (const t of orderedTs) {
+                  const dt = Math.abs(t - m.ts);
+                  if (dt < bestDt) { bestDt = dt; bestTs = t; }
+                }
+                const v = valuesByTs.get(bestTs)!;
+                const x = PAD_X + ((bestTs - xMin) / (xMax - xMin)) * innerW;
+                const y = PAD_TOP + (1 - (v - metricMin) / (metricMax - metricMin)) * innerH;
+                const kind = m.kind ?? "dot";
+                if (kind === "up") {
+                  return (
+                    <g key={i}>
+                      <title>{m.label}</title>
+                      <polygon
+                        points={`${x},${y - 7} ${x - 4.5},${y - 1} ${x + 4.5},${y - 1}`}
+                        fill={m.color}
+                        stroke="#0d0e11"
+                        strokeWidth={0.5}
+                      />
+                    </g>
+                  );
+                }
+                if (kind === "down") {
+                  return (
+                    <g key={i}>
+                      <title>{m.label}</title>
+                      <polygon
+                        points={`${x},${y + 7} ${x - 4.5},${y + 1} ${x + 4.5},${y + 1}`}
+                        fill={m.color}
+                        stroke="#0d0e11"
+                        strokeWidth={0.5}
+                      />
+                    </g>
+                  );
+                }
+                return (
+                  <g key={i}>
+                    <title>{m.label}</title>
+                    <circle cx={x} cy={y} r={3.5} fill={m.color} stroke="#0d0e11" strokeWidth={0.5} />
+                  </g>
+                );
+              })}
+            </g>
+          );
+        })()}
 
         {yTicks.map((t, i) => (
           <g key={`tx${i}`}>

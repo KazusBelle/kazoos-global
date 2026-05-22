@@ -21,6 +21,15 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Set, Tuple
 
+from .intelligence import (
+    fragility_score,
+    impact_score,
+    kyle_lambda,
+    recovery_time_ms,
+    refill_velocity_usd_per_s,
+    resiliency_score,
+    update_intelligence,
+)
 from .metrics import credible_depth_usd, liquidation_stress_usd, obi_rt
 from .orderbook import Liquidation, SymbolState, Trade
 from .ws_client import FuturesWsClient
@@ -32,6 +41,12 @@ _STREAM_SUFFIXES = ("depth20@100ms", "bookTicker", "aggTrade", "forceOrder")
 RECONCILE_INTERVAL_S = 5
 SAMPLE_INTERVAL_S = 1.0
 FLUSH_INTERVAL_S = 5.0
+STATUS_INTERVAL_S = 3.0
+# Hard cap on how many pinned symbols we'll stream simultaneously — protects
+# against accidental pin-the-whole-top-100. The active (currently-opened)
+# symbol is always added on top of this cap so opening a chart never gets
+# blocked by a full pin list.
+PIN_CAP = 20
 
 
 def _streams_for(symbol: str) -> List[str]:
@@ -48,23 +63,39 @@ class RealtimeEngine:
         self.subscribed: Set[str] = set()
         self._known_conn_id: int = 0
         self._sample_buffer: list[dict] = []
+        self._last_message_at: float = 0.0  # epoch seconds of latest frame
 
     # ── desired-set reconciliation ────────────────────────────────────────
 
     async def _read_desired(self) -> Set[str]:
-        """Return the symbols that should currently be live-subscribed,
-        per the liquidity_active_subs table. Rows whose expires_at is in
-        the past are ignored (the row is left in place — its next write
-        will UPSERT a fresh expires_at)."""
-        from kazus_db.models import LiquidityActiveSub
+        """Return the union of:
+
+        * active subs (liquidity_active_subs) whose expires_at is still in
+          the future — short-lived heartbeats from an opened chart;
+        * pinned symbols (liquidity_pins) — persistent, capped at PIN_CAP
+          ordered by `pinned_order` ascending (the visually-top pins win).
+
+        Active subs are never capped (it's the symbol the user is looking
+        at right now), and they're added AFTER the pin cap so they always
+        get a slot even if PIN_CAP pins are already in the desired set.
+        """
+        from kazus_db.models import LiquidityActiveSub, LiquidityPin
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         with self.db_factory() as db:
-            rows = (
+            pins = (
+                db.query(LiquidityPin)
+                .order_by(LiquidityPin.pinned_order.asc())
+                .limit(PIN_CAP)
+                .all()
+            )
+            actives = (
                 db.query(LiquidityActiveSub)
                 .filter(LiquidityActiveSub.expires_at > now_naive)
                 .all()
             )
-            return {r.symbol.upper() for r in rows}
+        out: Set[str] = {p.symbol.upper() for p in pins}
+        out.update(a.symbol.upper() for a in actives)
+        return out
 
     async def _reconcile(self) -> None:
         try:
@@ -127,6 +158,7 @@ class RealtimeEngine:
             return  # late frame for an unsubscribed symbol
 
         now_ms = int(time.time() * 1000)
+        self._last_message_at = now_ms / 1000.0
         try:
             if suffix.startswith("depth20"):
                 # data fields: "b": [["price","qty"], ...], "a": [...]
@@ -167,10 +199,22 @@ class RealtimeEngine:
         now_ms = int(time.time() * 1000)
         for symbol, state in self.states.items():
             mid = state.mid_price()
+            depth = credible_depth_usd(state, now_ms)
+            # Intelligence layer needs the latest depth before we sample
+            # the resiliency/kyle outputs — it advances the recovery
+            # state machine and records the depth sample for the rolling
+            # history buffers.
+            update_intelligence(state, now_ms, depth)
             samples = (
                 ("obi_rt", obi_rt(state)),
-                ("credible_depth", credible_depth_usd(state, now_ms)),
+                ("credible_depth", depth),
                 ("liq_stress", liquidation_stress_usd(state, now_ms)),
+                ("resiliency_score", resiliency_score(state, now_ms)),
+                ("recovery_time_ms", recovery_time_ms(state)),
+                ("refill_velocity", refill_velocity_usd_per_s(state)),
+                ("kyle_lambda", kyle_lambda(state, now_ms)),
+                ("impact_score", impact_score(state, now_ms)),
+                ("fragility_score", fragility_score(state, now_ms)),
             )
             for metric_name, value in samples:
                 self._sample_buffer.append({
@@ -180,6 +224,30 @@ class RealtimeEngine:
                     "value": value,
                     "price": mid,
                 })
+
+    def _write_status(self) -> None:
+        """Persist current ws health into the single-row liquidity_ws_status
+        table so the API can surface it to the frontend (live dot, stale
+        indicator, reconnect badge)."""
+        import json as _json
+        from kazus_db.models import LiquidityWsStatus
+        last_msg_dt = (
+            datetime.fromtimestamp(self._last_message_at, tz=timezone.utc).replace(tzinfo=None)
+            if self._last_message_at > 0
+            else None
+        )
+        subscribed_json = _json.dumps(sorted(self.subscribed))
+        with self.db_factory() as db:
+            row = db.query(LiquidityWsStatus).filter(LiquidityWsStatus.id == 1).first()
+            if row is None:
+                row = LiquidityWsStatus(id=1)
+                db.add(row)
+            row.conn_id = self.ws.conn_id
+            row.connected = self.ws.connected
+            row.subscribed_json = subscribed_json
+            row.last_message_at = last_msg_dt
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            db.commit()
 
     async def _flush(self) -> int:
         if not self._sample_buffer:
@@ -204,6 +272,7 @@ class RealtimeEngine:
         last_reconcile = 0.0
         last_sample = 0.0
         last_flush = 0.0
+        last_status = 0.0
         while not stop_event.is_set():
             now = time.monotonic()
             if now - last_reconcile >= RECONCILE_INTERVAL_S:
@@ -212,6 +281,12 @@ class RealtimeEngine:
             if now - last_sample >= SAMPLE_INTERVAL_S and self.states:
                 self._sample_all()
                 last_sample = now
+            if now - last_status >= STATUS_INTERVAL_S:
+                try:
+                    self._write_status()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ws status write failed: %s", exc)
+                last_status = now
             if now - last_flush >= FLUSH_INTERVAL_S:
                 try:
                     n = await self._flush()

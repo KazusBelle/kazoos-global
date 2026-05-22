@@ -18,8 +18,17 @@ from typing import Optional
 
 from .base import Metric, MetricContext, MetricSample
 from .metrics.atr_liquidity import ATR_LIQUIDITY
-from .metrics.spread import SPREAD
+from .metrics.derived import (
+    DERIVED,
+    FUNDING_Z,
+    OI_DELTA_1H,
+    OI_DELTA_5M,
+    OI_DELTA_24H,
+)
+from .metrics.funding import FUNDING
 from .metrics.obi import OBI
+from .metrics.open_interest import OPEN_INTEREST
+from .metrics.spread import SPREAD
 
 
 @dataclass
@@ -40,11 +49,37 @@ class _WsMetricDescriptor:
 OBI_RT = _WsMetricDescriptor(name="obi_rt", label="Realtime OBI")
 CREDIBLE_DEPTH = _WsMetricDescriptor(name="credible_depth", label="Credible Depth")
 LIQ_STRESS = _WsMetricDescriptor(name="liq_stress", label="Liquidation Stress")
+# Phase-4 intelligence layer — WS-only. Resiliency tracks recovery from
+# microstructure events; Kyle Lambda measures price impact per signed
+# flow over a rolling tape window.
+RESILIENCY_SCORE = _WsMetricDescriptor(name="resiliency_score", label="Resiliency Score")
+RECOVERY_TIME_MS = _WsMetricDescriptor(name="recovery_time_ms", label="Recovery Time (ms)")
+REFILL_VELOCITY = _WsMetricDescriptor(name="refill_velocity", label="Refill Velocity ($/s)")
+KYLE_LAMBDA = _WsMetricDescriptor(name="kyle_lambda", label="Kyle Lambda")
+IMPACT_SCORE = _WsMetricDescriptor(name="impact_score", label="Impact Score")
+FRAGILITY_SCORE = _WsMetricDescriptor(name="fragility_score", label="Fragility Score")
 
 
 REGISTRY: dict[str, Metric] = {
     m.name: m
-    for m in (ATR_LIQUIDITY, SPREAD, OBI, OBI_RT, CREDIBLE_DEPTH, LIQ_STRESS)
+    for m in (
+        ATR_LIQUIDITY,
+        SPREAD,
+        OBI,
+        OBI_RT,
+        CREDIBLE_DEPTH,
+        LIQ_STRESS,
+        OPEN_INTEREST,
+        FUNDING,
+        *DERIVED,  # oi_delta_5m/1h/24h + funding_z
+        # Phase-4 intelligence layer (WS-only).
+        RESILIENCY_SCORE,
+        RECOVERY_TIME_MS,
+        REFILL_VELOCITY,
+        KYLE_LAMBDA,
+        IMPACT_SCORE,
+        FRAGILITY_SCORE,
+    )
 }
 
 __all__ = [
@@ -55,4 +90,16 @@ __all__ = [
     "OBI_RT",
     "CREDIBLE_DEPTH",
     "LIQ_STRESS",
+    "OPEN_INTEREST",
+    "FUNDING",
+    "OI_DELTA_5M",
+    "OI_DELTA_1H",
+    "OI_DELTA_24H",
+    "FUNDING_Z",
+    "RESILIENCY_SCORE",
+    "RECOVERY_TIME_MS",
+    "REFILL_VELOCITY",
+    "KYLE_LAMBDA",
+    "IMPACT_SCORE",
+    "FRAGILITY_SCORE",
 ]

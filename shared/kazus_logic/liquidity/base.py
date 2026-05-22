@@ -48,6 +48,8 @@ class MetricContext:
     price: Optional[float] = None                # mark or last price
     h1_klines: Optional[list[OHLCV]] = None      # most-recent 100 H1 candles
     depth: Optional[DepthSnapshot] = None        # top-N depth snapshot
+    open_interest: Optional[float] = None        # contracts (base asset)
+    funding_rate: Optional[float] = None         # current funding rate (fraction)
 
 
 @dataclass

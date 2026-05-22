@@ -24,6 +24,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 
 _TAPE_WINDOW_MS = 5 * 60 * 1000  # keep 5 min of trades / liquidations
+_DEPTH_HISTORY_WINDOW_MS = 5 * 60 * 1000  # 5-min rolling for depth/spread
+_RECOVERY_TIMEOUT_MS = 90_000             # give up tracking after this
 
 
 @dataclass
@@ -44,6 +46,34 @@ class Liquidation:
 
 
 @dataclass
+class DepthSample:
+    """One sampled snapshot of microstructure state. Populated by the
+    realtime sampler at ~1Hz and used by intelligence metrics (resiliency,
+    Kyle Lambda) that need a short rolling history."""
+    ts: int
+    depth_usd: Optional[float]   # credible depth at sample time
+    spread_bps: Optional[float]  # spread in basis points
+
+
+@dataclass
+class RecoveryEvent:
+    """A microstructure event we're measuring recovery from.
+
+    `pre_depth` is the credible depth snapshot taken just before the
+    detector tripped — the symbol is considered "recovered" once depth
+    climbs back to RECOVERY_FRACTION × pre_depth. `recovery_ms` and
+    `refill_velocity` are filled once recovery happens (or NULL if the
+    event ages out without recovering).
+    """
+    kind: str                        # "liq_spike" | "spread_explosion" | "depth_collapse" | "obi_flip"
+    started_ts: int
+    pre_depth: Optional[float]
+    recovered_ts: Optional[int] = None
+    recovery_ms: Optional[int] = None
+    refill_velocity: Optional[float] = None  # depth-USD per second
+
+
+@dataclass
 class SymbolState:
     symbol: str
     # bids/asks: price → (qty, first_seen_ts_ms)
@@ -57,6 +87,13 @@ class SymbolState:
     # trade & liquidation tapes
     trades: Deque[Trade] = field(default_factory=deque)
     liquidations: Deque[Liquidation] = field(default_factory=deque)
+    # rolling microstructure samples, populated by the realtime sampler
+    depth_history: Deque[DepthSample] = field(default_factory=deque)
+    # in-flight and completed recovery events — bounded; resiliency_score
+    # consumes the most-recent completed one.
+    events: Deque[RecoveryEvent] = field(default_factory=deque)
+    # bookkeeping for event-detector debouncing
+    last_event_ts: int = 0
 
     def apply_depth20(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], now_ms: int) -> None:
         """Replace the top-20 with the new snapshot. Levels whose qty
@@ -84,6 +121,16 @@ class SymbolState:
         cutoff = now_ms - _TAPE_WINDOW_MS
         while d and d[0].ts < cutoff:
             d.popleft()
+
+    def push_depth_sample(self, sample: DepthSample, max_events: int = 20) -> None:
+        self.depth_history.append(sample)
+        # Prune old samples
+        cutoff = sample.ts - _DEPTH_HISTORY_WINDOW_MS
+        while self.depth_history and self.depth_history[0].ts < cutoff:
+            self.depth_history.popleft()
+        # Keep the events deque bounded so a long session doesn't grow it forever.
+        while len(self.events) > max_events:
+            self.events.popleft()
 
     def mid_price(self) -> Optional[float]:
         if self.best_bid is not None and self.best_ask is not None:
