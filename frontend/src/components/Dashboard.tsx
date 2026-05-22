@@ -26,6 +26,7 @@ import {
   type ChartTheme,
 } from "./CandleChart";
 import { Liquidity } from "./Liquidity";
+import { Meta } from "./Meta";
 import { Operations } from "./Operations";
 import { Research } from "./Research";
 import { Strategy } from "./Strategy";
@@ -57,7 +58,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -77,6 +78,23 @@ function FibIcon({ size = 20 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
       <circle cx="12" cy="12" r="9.5" />
       <path d="M12 12 C16 9 17.5 5.5 14.5 3 C11 0 7 3 7 7 C7 11 10 13.5 13 14.5 C16.5 15.5 19 14 18.5 10.5" />
+    </svg>
+  );
+}
+
+function MetaIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <circle cx="10" cy="10" r="7" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="10" cy="10" r="3" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M10 1.5v4M10 14.5v4M1.5 10h4M14.5 10h4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1409,6 +1427,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("strat")}
             title="Strategic Intelligence · Structural Shifts · Adaptation"
           />
+          <NavBtn
+            active={page === "meta"}
+            open={sidebarOpen}
+            icon={<MetaIcon size={20} />}
+            label="META"
+            onClick={() => setPage("meta")}
+            title="Self-Calibration · Anomaly Memory · Meta-Health"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1604,6 +1630,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         {page === "ops" && <Operations />}
 
         {page === "strat" && <Strategy />}
+
+        {page === "meta" && <Meta />}
       </main>
 
       {/* ── Chart Modal ── */}

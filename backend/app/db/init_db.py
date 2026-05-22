@@ -118,6 +118,23 @@ _ADDITIVE_MIGRATIONS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_liq_crossex_history_sym_ts ON liquidity_crossex_history (symbol, ts_ms)",
+    # Phase-11 anomaly memory.
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_anomaly_memory (
+        id SERIAL PRIMARY KEY,
+        kind VARCHAR(48) NOT NULL,
+        severity VARCHAR(16) NOT NULL DEFAULT 'info',
+        occurred_at_ms BIGINT NOT NULL,
+        fingerprint_json TEXT NOT NULL,
+        novelty_score DOUBLE PRECISION NOT NULL DEFAULT 100.0,
+        recurrence_count INTEGER NOT NULL DEFAULT 0,
+        related_alert_ids_json TEXT,
+        notes TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_occurred_ts ON liquidity_anomaly_memory (occurred_at_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_kind ON liquidity_anomaly_memory (kind)",
 ]
 
 

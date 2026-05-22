@@ -1993,3 +1993,251 @@ async def strategic_state_endpoint(
     _user: User = Depends(get_current_user),
 ) -> StrategicStateOut:
     return StrategicStateOut(**_research.strategic_state(db))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-11 — Self-Calibration & Meta-Learning endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class ThresholdCalibrationKind(BaseModel):
+    kind: str
+    total: int
+    resolved: int
+    precision: Optional[float]
+    per_day: float
+    action: str   # TIGHTEN | LOOSEN | HOLD
+    adjustment_multiplier: float
+    calibration_confidence: float
+    rationale: List[str]
+
+
+class ThresholdCalibrationOut(BaseModel):
+    since_ms: int
+    kinds: List[ThresholdCalibrationKind]
+
+
+@router.get("/research/threshold-calibration", response_model=ThresholdCalibrationOut)
+async def threshold_calibration_endpoint(
+    since_ms: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ThresholdCalibrationOut:
+    if since_ms is None:
+        since_ms = int(time.time() * 1000) - 30 * 24 * 3600 * 1000
+    return ThresholdCalibrationOut(**_research.threshold_calibration(db, since_ms=since_ms))
+
+
+class MetricWeight(BaseModel):
+    metric: str
+    samples: int
+    extreme_hits: int
+    extreme_share: float
+    relevance_score: float
+    weight: float
+
+
+class AdaptiveWeightsOut(BaseModel):
+    since_ms: int
+    weights: List[MetricWeight]
+
+
+@router.get("/research/adaptive-metric-weights", response_model=AdaptiveWeightsOut)
+async def adaptive_metric_weights_endpoint(
+    since_ms: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AdaptiveWeightsOut:
+    if since_ms is None:
+        since_ms = int(time.time() * 1000) - 7 * 24 * 3600 * 1000
+    return AdaptiveWeightsOut(**_research.adaptive_metric_weights(db, since_ms=since_ms))
+
+
+class StateEmbeddingOut(BaseModel):
+    metrics: List[str]
+    fingerprint: dict
+    ts_ms: int
+
+
+@router.get("/research/state-embedding", response_model=StateEmbeddingOut)
+async def state_embedding_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> StateEmbeddingOut:
+    return StateEmbeddingOut(**_research.state_embedding(db))
+
+
+# ── Anomaly memory ────────────────────────────────────────────────────────
+
+
+_ANOMALY_KINDS = {
+    "structural_break", "regime_collapse", "venue_divergence",
+    "pre_cascade", "edge_inversion", "regime_emergence",
+}
+
+
+class AnomalyRecordIn(BaseModel):
+    kind: str
+    severity: str = "info"
+    fingerprint: dict
+    related_alert_ids: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
+class AnomalyRecordOut(BaseModel):
+    id: int
+    kind: str
+    severity: str
+    occurred_at_ms: int
+    novelty_score: float
+    recurrence_count: int
+    fingerprint: dict
+    best_match_id: Optional[int]
+    best_match_distance: Optional[float]
+
+
+@router.post("/research/anomaly-memory", response_model=AnomalyRecordOut)
+async def record_anomaly_endpoint(
+    payload: AnomalyRecordIn = Body(...),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AnomalyRecordOut:
+    if payload.kind not in _ANOMALY_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"kind must be one of {sorted(_ANOMALY_KINDS)}",
+        )
+    data = _research.record_anomaly(
+        db,
+        kind=payload.kind,
+        severity=payload.severity,
+        fingerprint=payload.fingerprint,
+        related_alert_ids=payload.related_alert_ids,
+        notes=payload.notes,
+    )
+    return AnomalyRecordOut(**data)
+
+
+class AnomalyMemoryItem(BaseModel):
+    id: int
+    kind: str
+    severity: str
+    occurred_at_ms: int
+    fingerprint: dict
+    novelty_score: float
+    recurrence_count: int
+    notes: Optional[str]
+
+
+class AnomalyMemoryOut(BaseModel):
+    items: List[AnomalyMemoryItem]
+    counts_by_kind: dict
+
+
+@router.get("/research/anomaly-memory", response_model=AnomalyMemoryOut)
+async def list_anomaly_memory(
+    kind: Optional[str] = Query(None),
+    since_ms: Optional[int] = Query(None),
+    limit: int = Query(100, le=500),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AnomalyMemoryOut:
+    return AnomalyMemoryOut(**_research.query_anomaly_memory(
+        db, kind=kind, since_ms=since_ms, limit=limit,
+    ))
+
+
+# ── Edge mutation ────────────────────────────────────────────────────────
+
+
+class EdgeMutationKind(BaseModel):
+    kind: str
+    recent_precision: Optional[float]
+    prior_precision: Optional[float]
+    recent_resolved: int
+    prior_resolved: int
+    delta: Optional[float]
+    mutation_velocity_per_day: Optional[float]
+    mutation_score: float
+    mutation_direction: str    # STRENGTHENING | WEAKENING | INVERTED | NEUTRAL
+    inverted: bool
+
+
+class EdgeMutationOut(BaseModel):
+    since_ms: int
+    window_days: int
+    kinds: List[EdgeMutationKind]
+
+
+@router.get("/research/edge-mutation", response_model=EdgeMutationOut)
+async def edge_mutation_endpoint(
+    since_ms: Optional[int] = Query(None),
+    window_days: int = Query(7, ge=1, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> EdgeMutationOut:
+    if since_ms is None:
+        since_ms = int(time.time() * 1000) - 2 * window_days * 24 * 3600 * 1000
+    return EdgeMutationOut(**_research.edge_mutation(db, since_ms=since_ms, window_days=window_days))
+
+
+# ── Regime compression ───────────────────────────────────────────────────
+
+
+class RegimeCompressionCell(BaseModel):
+    a: str; b: str
+    cosine: float
+    distance: float
+
+
+class RegimeCompressionMerge(BaseModel):
+    a: str; b: str
+    cosine: float
+
+
+class RegimeCompressionOut(BaseModel):
+    since_ms: int
+    regimes: List[str]
+    matrix: List[RegimeCompressionCell]
+    merge_candidates: List[RegimeCompressionMerge]
+
+
+@router.get("/research/regime-compression", response_model=RegimeCompressionOut)
+async def regime_compression_endpoint(
+    since_ms: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> RegimeCompressionOut:
+    if since_ms is None:
+        since_ms = int(time.time() * 1000) - 30 * 24 * 3600 * 1000
+    return RegimeCompressionOut(**_research.regime_compression(db, since_ms=since_ms))
+
+
+# ── Meta-intelligence health ─────────────────────────────────────────────
+
+
+class MetaHealthComponents(BaseModel):
+    meta_confidence: float
+    structural_stability: float
+    alert_saturation: float
+    edge_consistency: float
+    regime_focus: float
+
+
+class MetaHealthOut(BaseModel):
+    meta_intelligence_health: float
+    state: str    # HEALTHY | DRIFTING | DEGRADING | CRITICAL
+    self_consistency_score: float
+    adaptation_quality: float
+    components: MetaHealthComponents
+    alert_saturation_ratio: float
+    avg_distinct_regimes_per_day: float
+    mutation_magnitude_sum: float
+
+
+@router.get("/research/meta-intelligence-health", response_model=MetaHealthOut)
+async def meta_health_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MetaHealthOut:
+    return MetaHealthOut(**_research.meta_intelligence_health(db))

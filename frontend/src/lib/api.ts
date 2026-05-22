@@ -960,3 +960,148 @@ export type StrategicState = {
 export async function getStrategicState() {
   return request<StrategicState>("/liquidity/research/strategic-state");
 }
+
+// ── Phase-11 self-calibration & meta-learning ─────────────────────────────
+
+export type ThresholdCalibrationKind = {
+  kind: string;
+  total: number;
+  resolved: number;
+  precision: number | null;
+  per_day: number;
+  action: "TIGHTEN" | "LOOSEN" | "HOLD";
+  adjustment_multiplier: number;
+  calibration_confidence: number;
+  rationale: string[];
+};
+
+export type ThresholdCalibration = { since_ms: number; kinds: ThresholdCalibrationKind[] };
+
+export async function getThresholdCalibration(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<ThresholdCalibration>(`/liquidity/research/threshold-calibration${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type MetricWeight = {
+  metric: string;
+  samples: number;
+  extreme_hits: number;
+  extreme_share: number;
+  relevance_score: number;
+  weight: number;
+};
+
+export type AdaptiveWeights = { since_ms: number; weights: MetricWeight[] };
+
+export async function getAdaptiveMetricWeights(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<AdaptiveWeights>(`/liquidity/research/adaptive-metric-weights${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type StateEmbedding = {
+  metrics: string[];
+  fingerprint: Record<string, number>;
+  ts_ms: number;
+};
+
+export async function getStateEmbedding() {
+  return request<StateEmbedding>("/liquidity/research/state-embedding");
+}
+
+export type AnomalyKind =
+  | "structural_break" | "regime_collapse" | "venue_divergence"
+  | "pre_cascade" | "edge_inversion" | "regime_emergence";
+
+export type AnomalyMemoryItem = {
+  id: number;
+  kind: AnomalyKind | string;
+  severity: string;
+  occurred_at_ms: number;
+  fingerprint: Record<string, number>;
+  novelty_score: number;
+  recurrence_count: number;
+  notes: string | null;
+};
+
+export type AnomalyMemoryOut = { items: AnomalyMemoryItem[]; counts_by_kind: Record<string, number> };
+
+export async function listAnomalyMemory(opts: { kind?: AnomalyKind; since_ms?: number; limit?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.kind) usp.set("kind", opts.kind);
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.limit != null) usp.set("limit", String(opts.limit));
+  return request<AnomalyMemoryOut>(`/liquidity/research/anomaly-memory${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export async function recordAnomaly(payload: {
+  kind: AnomalyKind;
+  severity?: string;
+  fingerprint: Record<string, number>;
+  related_alert_ids?: string[];
+  notes?: string;
+}) {
+  return request<AnomalyMemoryItem & { best_match_id: number | null; best_match_distance: number | null }>(
+    "/liquidity/research/anomaly-memory",
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export type EdgeMutationKind = {
+  kind: string;
+  recent_precision: number | null;
+  prior_precision: number | null;
+  recent_resolved: number;
+  prior_resolved: number;
+  delta: number | null;
+  mutation_velocity_per_day: number | null;
+  mutation_score: number;
+  mutation_direction: "STRENGTHENING" | "WEAKENING" | "INVERTED" | "NEUTRAL";
+  inverted: boolean;
+};
+
+export type EdgeMutationOut = { since_ms: number; window_days: number; kinds: EdgeMutationKind[] };
+
+export async function getEdgeMutation(opts: { since_ms?: number; window_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.since_ms != null) usp.set("since_ms", String(opts.since_ms));
+  if (opts.window_days != null) usp.set("window_days", String(opts.window_days));
+  return request<EdgeMutationOut>(`/liquidity/research/edge-mutation${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type RegimeCompressionCell = { a: string; b: string; cosine: number; distance: number };
+export type RegimeCompressionMerge = { a: string; b: string; cosine: number };
+export type RegimeCompression = {
+  since_ms: number;
+  regimes: string[];
+  matrix: RegimeCompressionCell[];
+  merge_candidates: RegimeCompressionMerge[];
+};
+
+export async function getRegimeCompression(since_ms?: number) {
+  const usp = new URLSearchParams();
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<RegimeCompression>(`/liquidity/research/regime-compression${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type MetaHealth = {
+  meta_intelligence_health: number;
+  state: "HEALTHY" | "DRIFTING" | "DEGRADING" | "CRITICAL";
+  self_consistency_score: number;
+  adaptation_quality: number;
+  components: {
+    meta_confidence: number;
+    structural_stability: number;
+    alert_saturation: number;
+    edge_consistency: number;
+    regime_focus: number;
+  };
+  alert_saturation_ratio: number;
+  avg_distinct_regimes_per_day: number;
+  mutation_magnitude_sum: number;
+};
+
+export async function getMetaHealth() {
+  return request<MetaHealth>("/liquidity/research/meta-intelligence-health");
+}

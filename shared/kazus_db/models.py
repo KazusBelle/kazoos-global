@@ -294,6 +294,43 @@ class LiquidityCrossExHistory(Base):
     mid_price: Mapped[Optional[float]] = mapped_column(Float)
 
 
+class LiquidityAnomalyMemory(Base):
+    """Persistent record of structural anomalies the engine has noticed.
+
+    Phase-11 self-calibration needs long-term memory: "have we seen this
+    kind of structural break / regime collapse / venue divergence before,
+    or is this new?". Each row is one observation; recurrence is detected
+    later by similarity over `fingerprint_json` rather than by primary
+    key — anomaly kinds aren't strictly typed, so we cluster by content.
+
+    The novelty_score is set at insertion time (0 = exact recurrence,
+    100 = never seen anything like it) and is what makes the memory
+    layer worth keeping — it gives the UI an at-a-glance sense of
+    whether to take this seriously or treat it as a known pattern.
+    """
+
+    __tablename__ = "liquidity_anomaly_memory"
+    __table_args__ = (
+        Index("ix_liq_anomaly_memory_occurred_ts", "occurred_at_ms"),
+        Index("ix_liq_anomaly_memory_kind", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    # "structural_break" | "regime_collapse" | "venue_divergence" |
+    # "pre_cascade" | "edge_inversion" | "regime_emergence"
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
+    occurred_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # JSON-encoded compact state fingerprint (metric_name -> value) that
+    # can be diffed against future anomalies for recurrence detection.
+    fingerprint_json: Mapped[str] = mapped_column(Text, nullable=False)
+    novelty_score: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    recurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    related_alert_ids_json: Mapped[Optional[str]] = mapped_column(Text)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class UserTDAState(Base):
     __tablename__ = "user_tda_states"
     __table_args__ = (

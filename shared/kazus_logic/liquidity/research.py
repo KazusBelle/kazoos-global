@@ -1885,3 +1885,608 @@ def strategic_state(db: Session) -> dict:
             "dominant_regime": dominant,
         },
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-11 — Self-Calibration & Meta-Learning
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Layers that look at the system itself and recommend adjustments — not
+# auto-applied (that's how alert engines blow up); the UI surfaces the
+# recommendations and stores anomaly memory so we can detect recurrence
+# of structural events across long time horizons.
+
+
+# ── Threshold self-calibration ───────────────────────────────────────────
+
+
+def threshold_calibration(db: Session, since_ms: int) -> dict:
+    """Per alert kind, recommend a threshold adjustment from the last 30d
+    of validated outcomes.
+
+    Heuristic:
+      * if precision < 35% AND volume is high → threshold TOO LOOSE,
+        recommend tighten (×1.2);
+      * if precision > 70% AND volume is very low (< 5/day) →
+        threshold TOO TIGHT, recommend loosen (×0.85);
+      * if precision is between, threshold is good as-is.
+
+    Returns the recommendation and a `calibration_confidence` based on
+    sample count — low confidence => UI suggests "wait".
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT kind, COUNT(*) AS total,
+                   SUM(CASE WHEN validated_outcome = 'followed_through' THEN 1 ELSE 0 END) AS ft,
+                   SUM(CASE WHEN validated_outcome = 'noise' THEN 1 ELSE 0 END) AS noise,
+                   MIN(started_at_ms) AS min_ts,
+                   MAX(started_at_ms) AS max_ts
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY kind
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+
+    out: List[dict] = []
+    for r in rows:
+        ft = int(r.ft or 0)
+        noise = int(r.noise or 0)
+        resolved = ft + noise
+        precision = ft / resolved if resolved > 0 else None
+        span_ms = int(r.max_ts or 0) - int(r.min_ts or 0) if r.max_ts and r.min_ts else 0
+        days = max(0.5, span_ms / (24 * 3600 * 1000)) if span_ms > 0 else 0.5
+        per_day = int(r.total or 0) / days
+
+        # Decide adjustment.
+        adjustment = 1.0
+        action = "HOLD"
+        rationale: List[str] = []
+        if precision is not None and resolved >= 20:
+            if precision < 0.35 and per_day >= 1.0:
+                adjustment = 1.20
+                action = "TIGHTEN"
+                rationale.append(f"precision {precision*100:.0f}% < 35% over {resolved} resolved")
+            elif precision > 0.70 and per_day < 5.0:
+                adjustment = 0.85
+                action = "LOOSEN"
+                rationale.append(f"precision {precision*100:.0f}% > 70% but only {per_day:.1f}/day")
+            else:
+                rationale.append(f"precision {precision*100:.0f}% in healthy band")
+        elif precision is None:
+            rationale.append("no resolved alerts in window")
+        else:
+            rationale.append(f"only {resolved} resolved — need ≥20 for recommendation")
+
+        # Confidence — log-scaled in [0, 100].
+        confidence = min(100.0, math.log10(max(2, resolved)) * 50.0)
+
+        out.append({
+            "kind": r.kind,
+            "total": int(r.total or 0),
+            "resolved": resolved,
+            "precision": precision,
+            "per_day": per_day,
+            "action": action,
+            "adjustment_multiplier": adjustment,
+            "calibration_confidence": confidence,
+            "rationale": rationale,
+        })
+
+    out.sort(key=lambda d: (d["action"] == "HOLD", -d["resolved"]))
+    return {"since_ms": since_ms, "kinds": out}
+
+
+# ── Adaptive metric weights ──────────────────────────────────────────────
+
+
+def adaptive_metric_weights(db: Session, since_ms: int) -> dict:
+    """For every analytics metric, compute a relevance score from the
+    most recent alert history: how often did this metric show an
+    extreme value (top decile or bottom decile of its cohort) ahead of
+    a followed-through alert?
+
+    The output is per-metric weight in 0..2 — 1.0 is "neutral", >1
+    "more relevant now", <1 "less relevant". Frontends can apply this
+    to the static intelligence-score weights so the composite tracks
+    what is currently informative.
+    """
+    # Pull recent samples for cohort percentiles.
+    recent_ms = max(since_ms, int(time.time() * 1000) - 7 * 24 * 3600 * 1000)
+    rows = db.execute(
+        text(
+            """
+            SELECT metric, percentile_disc(0.10) WITHIN GROUP (ORDER BY value) AS p10,
+                           percentile_disc(0.90) WITHIN GROUP (ORDER BY value) AS p90
+            FROM liquidity_samples
+            WHERE metric = ANY(:metrics) AND ts >= :since AND value IS NOT NULL
+            GROUP BY metric
+            """
+        ),
+        {"metrics": list(ANALYTICS_METRICS), "since": recent_ms},
+    ).fetchall()
+    cohort: Dict[str, Tuple[float, float]] = {r.metric: (float(r.p10), float(r.p90)) for r in rows if r.p10 is not None}
+
+    # Followed-through alerts: take the symbol's metric values at the
+    # alert timestamp and count which metrics were in the extreme deciles.
+    alerts = db.execute(
+        text(
+            """
+            SELECT symbol, started_at_ms
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+              AND validated_outcome = 'followed_through'
+            """
+        ),
+        {"since": recent_ms},
+    ).fetchall()
+    if not alerts:
+        return {"since_ms": recent_ms, "weights": [
+            {"metric": m, "weight": 1.0, "relevance_score": 0.0, "samples": 0}
+            for m in ANALYTICS_METRICS
+        ]}
+
+    # For each alert, find the most-recent sample-per-metric for that
+    # symbol within ±5min. Bulk-fetch all relevant rows once.
+    alert_keys: List[Tuple[str, int]] = [(a.symbol, int(a.started_at_ms)) for a in alerts]
+    syms = list({k[0] for k in alert_keys})
+    sample_rows = db.execute(
+        text(
+            """
+            SELECT symbol, metric, ts, value
+            FROM liquidity_samples
+            WHERE symbol = ANY(:syms)
+              AND metric = ANY(:metrics)
+              AND ts >= :since
+              AND value IS NOT NULL
+            ORDER BY symbol, metric, ts
+            """
+        ),
+        {"syms": syms, "metrics": list(ANALYTICS_METRICS), "since": recent_ms},
+    ).fetchall()
+    by_sym_metric: Dict[Tuple[str, str], List[Tuple[int, float]]] = defaultdict(list)
+    for s in sample_rows:
+        by_sym_metric[(s.symbol, s.metric)].append((int(s.ts), float(s.value)))
+
+    extreme_counts: Dict[str, int] = defaultdict(int)
+    total_counts: Dict[str, int] = defaultdict(int)
+    for sym, ts in alert_keys:
+        for metric in ANALYTICS_METRICS:
+            series = by_sym_metric.get((sym, metric))
+            if not series:
+                continue
+            # Find closest sample within 5 minutes.
+            best = min(series, key=lambda p: abs(p[0] - ts))
+            if abs(best[0] - ts) > 5 * 60_000:
+                continue
+            total_counts[metric] += 1
+            band = cohort.get(metric)
+            if band is None:
+                continue
+            p10, p90 = band
+            if best[1] <= p10 or best[1] >= p90:
+                extreme_counts[metric] += 1
+
+    out: List[dict] = []
+    for metric in ANALYTICS_METRICS:
+        seen = total_counts.get(metric, 0)
+        ext = extreme_counts.get(metric, 0)
+        # Relevance share — what fraction of followed-through alerts had
+        # this metric in an extreme decile. Random expectation is 20%
+        # (top + bottom decile). Map (share / 0.20) into a weight band
+        # 0.5 .. 1.8.
+        share = (ext / seen) if seen > 0 else 0.0
+        relevance = share / 0.20 if share > 0 else 0.0
+        weight = max(0.5, min(1.8, 0.7 + 0.55 * relevance))   # 0 share→0.7; 1.0 share→1.25; 2.0→1.8
+        out.append({
+            "metric": metric,
+            "samples": seen,
+            "extreme_hits": ext,
+            "extreme_share": share,
+            "relevance_score": relevance * 100.0,
+            "weight": weight,
+        })
+    out.sort(key=lambda d: -d["relevance_score"])
+    return {"since_ms": recent_ms, "weights": out}
+
+
+# ── State fingerprints & embeddings ──────────────────────────────────────
+
+
+# A compact, hand-picked feature set — covers the four families that
+# Phase 5 alert engine cares about (positioning, microstructure, stress,
+# stability). Keep this short so anomaly-similarity hashing stays cheap.
+EMBEDDING_METRICS: Tuple[str, ...] = (
+    "fragility_score", "resiliency_score", "credible_depth",
+    "spread", "obi", "liq_stress", "funding_z", "oi_delta_1h",
+)
+
+
+def _fingerprint_current(db: Session) -> Dict[str, float]:
+    """Universe-level fingerprint right now: cohort median per metric
+    over the last 30 minutes."""
+    rows = db.execute(
+        text(
+            """
+            SELECT metric, percentile_disc(0.5) WITHIN GROUP (ORDER BY value) AS med
+            FROM liquidity_samples
+            WHERE metric = ANY(:metrics)
+              AND ts >= :since
+              AND value IS NOT NULL
+            GROUP BY metric
+            """
+        ),
+        {
+            "metrics": list(EMBEDDING_METRICS),
+            "since": int(time.time() * 1000) - 30 * 60_000,
+        },
+    ).fetchall()
+    return {r.metric: float(r.med) for r in rows if r.med is not None}
+
+
+def state_embedding(db: Session) -> dict:
+    """Public read of the current universe fingerprint — handy for the
+    Meta page's 'where are we in state-space right now' panel."""
+    fp = _fingerprint_current(db)
+    return {
+        "metrics": list(EMBEDDING_METRICS),
+        "fingerprint": fp,
+        "ts_ms": int(time.time() * 1000),
+    }
+
+
+def _fingerprint_distance(a: Dict[str, float], b: Dict[str, float], scales: Optional[Dict[str, float]] = None) -> Optional[float]:
+    if not a or not b:
+        return None
+    metrics = set(a) & set(b)
+    if not metrics:
+        return None
+    if scales is None:
+        scales = {m: max(abs(a[m]), abs(b[m]), 1e-6) for m in metrics}
+    ssq = 0.0
+    for m in metrics:
+        ssq += ((a[m] - b[m]) / max(scales[m], 1e-9)) ** 2
+    return math.sqrt(ssq / len(metrics))
+
+
+# ── Anomaly memory ───────────────────────────────────────────────────────
+
+
+def record_anomaly(
+    db: Session,
+    kind: str,
+    severity: str,
+    fingerprint: Dict[str, float],
+    related_alert_ids: Optional[List[str]] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """Insert an anomaly observation and compute its novelty against
+    all prior observations of the same kind. Returns the new row.
+
+    Novelty = 100 × min(distance / 1.0, 1) — distances are normalized
+    L2 in the metric space, so distance ≥ 1 means "essentially unrelated
+    to anything in memory" → novelty 100. Distance 0 → novelty 0 (exact
+    recurrence).
+    """
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyMemory
+
+    occurred_ms = int(time.time() * 1000)
+    fp_json = _json.dumps(fingerprint, sort_keys=True)
+
+    # Look at the prior history for this kind.
+    prior = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(LiquidityAnomalyMemory.kind == kind)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(500)
+        .all()
+    )
+    best_distance: Optional[float] = None
+    best_match_id: Optional[int] = None
+    for p in prior:
+        try:
+            prev_fp = _json.loads(p.fingerprint_json)
+        except (TypeError, ValueError):
+            continue
+        d = _fingerprint_distance(fingerprint, prev_fp)
+        if d is None:
+            continue
+        if best_distance is None or d < best_distance:
+            best_distance = d
+            best_match_id = p.id
+
+    if best_distance is None:
+        novelty = 100.0
+        recurrence_count = 0
+    else:
+        novelty = min(100.0, max(0.0, best_distance * 100.0))
+        recurrence_count = sum(1 for p in prior if _fingerprint_distance(fingerprint, _json.loads(p.fingerprint_json) if p.fingerprint_json else {}) is not None and _fingerprint_distance(fingerprint, _json.loads(p.fingerprint_json)) < 0.4)
+
+    row = LiquidityAnomalyMemory(
+        kind=kind,
+        severity=severity,
+        occurred_at_ms=occurred_ms,
+        fingerprint_json=fp_json,
+        novelty_score=novelty,
+        recurrence_count=recurrence_count,
+        related_alert_ids_json=_json.dumps(related_alert_ids) if related_alert_ids else None,
+        notes=notes,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    return {
+        "id": row.id,
+        "kind": row.kind,
+        "severity": row.severity,
+        "occurred_at_ms": row.occurred_at_ms,
+        "novelty_score": row.novelty_score,
+        "recurrence_count": row.recurrence_count,
+        "fingerprint": fingerprint,
+        "best_match_id": best_match_id,
+        "best_match_distance": best_distance,
+    }
+
+
+def query_anomaly_memory(db: Session, kind: Optional[str], since_ms: Optional[int], limit: int = 100) -> dict:
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyMemory
+
+    q = db.query(LiquidityAnomalyMemory)
+    if kind:
+        q = q.filter(LiquidityAnomalyMemory.kind == kind)
+    if since_ms is not None:
+        q = q.filter(LiquidityAnomalyMemory.occurred_at_ms >= since_ms)
+    rows = q.order_by(LiquidityAnomalyMemory.occurred_at_ms.desc()).limit(limit).all()
+    out: List[dict] = []
+    for r in rows:
+        try:
+            fp = _json.loads(r.fingerprint_json) if r.fingerprint_json else {}
+        except (TypeError, ValueError):
+            fp = {}
+        out.append({
+            "id": r.id,
+            "kind": r.kind,
+            "severity": r.severity,
+            "occurred_at_ms": r.occurred_at_ms,
+            "fingerprint": fp,
+            "novelty_score": r.novelty_score,
+            "recurrence_count": r.recurrence_count,
+            "notes": r.notes,
+        })
+    # Counts per kind across the queried window.
+    from sqlalchemy import func
+    counts_rows = q.with_entities(LiquidityAnomalyMemory.kind, func.count()).group_by(LiquidityAnomalyMemory.kind).all()
+    counts = {k: int(c) for k, c in counts_rows}
+    return {"items": out, "counts_by_kind": counts}
+
+
+# ── Edge mutation tracking ───────────────────────────────────────────────
+
+
+def edge_mutation(db: Session, since_ms: int, window_days: int = 7) -> dict:
+    """Compare per-kind precision in the recent window vs the prior
+    window-of-equal-length. Surface kinds whose precision moved
+    materially → mutation_score scaled by |delta|, mutation_direction
+    is sign, mutation_velocity is per-day rate.
+
+    Inversion is the special case where precision crosses 0.5: a former
+    edge has become anti-predictive.
+    """
+    half_ms = window_days * 24 * 3600 * 1000
+    mid_ms = max(since_ms, int(time.time() * 1000) - half_ms)
+    rows = db.execute(
+        text(
+            """
+            SELECT kind,
+              SUM(CASE WHEN started_at_ms >= :mid THEN 1 ELSE 0 END) AS recent_total,
+              SUM(CASE WHEN started_at_ms < :mid THEN 1 ELSE 0 END) AS prior_total,
+              SUM(CASE WHEN started_at_ms >= :mid AND validated_outcome = 'followed_through' THEN 1 ELSE 0 END) AS recent_ft,
+              SUM(CASE WHEN started_at_ms < :mid AND validated_outcome = 'followed_through' THEN 1 ELSE 0 END) AS prior_ft,
+              SUM(CASE WHEN started_at_ms >= :mid AND validated_outcome = 'noise' THEN 1 ELSE 0 END) AS recent_noise,
+              SUM(CASE WHEN started_at_ms < :mid AND validated_outcome = 'noise' THEN 1 ELSE 0 END) AS prior_noise
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY kind
+            """
+        ),
+        {"since": since_ms, "mid": mid_ms},
+    ).fetchall()
+
+    out: List[dict] = []
+    for r in rows:
+        rec_resolved = int(r.recent_ft or 0) + int(r.recent_noise or 0)
+        pri_resolved = int(r.prior_ft or 0) + int(r.prior_noise or 0)
+        if rec_resolved < 5 and pri_resolved < 5:
+            continue
+        rec_p = (int(r.recent_ft) / rec_resolved) if rec_resolved > 0 else None
+        pri_p = (int(r.prior_ft) / pri_resolved) if pri_resolved > 0 else None
+        delta = None
+        velocity = None
+        if rec_p is not None and pri_p is not None:
+            delta = rec_p - pri_p
+            velocity = delta / max(1.0, window_days)
+        inverted = (
+            rec_p is not None and pri_p is not None and
+            ((rec_p - 0.5) * (pri_p - 0.5) < 0)
+        )
+        direction = "NEUTRAL"
+        if delta is not None:
+            if delta > 0.08:
+                direction = "STRENGTHENING"
+            elif delta < -0.08:
+                direction = "WEAKENING"
+        if inverted:
+            direction = "INVERTED"
+        mutation_score = (abs(delta) * 100.0) if delta is not None else 0.0
+        out.append({
+            "kind": r.kind,
+            "recent_precision": rec_p,
+            "prior_precision": pri_p,
+            "recent_resolved": rec_resolved,
+            "prior_resolved": pri_resolved,
+            "delta": delta,
+            "mutation_velocity_per_day": velocity,
+            "mutation_score": mutation_score,
+            "mutation_direction": direction,
+            "inverted": inverted,
+        })
+    out.sort(key=lambda d: -d["mutation_score"])
+    return {"since_ms": since_ms, "window_days": window_days, "kinds": out}
+
+
+# ── Dynamic regime compression ───────────────────────────────────────────
+
+
+def regime_compression(db: Session, since_ms: int) -> dict:
+    """Pairwise similarity between regimes based on their alert-kind
+    distributions. Regimes whose alert profiles overlap closely are
+    candidates for merging; novel/isolated profiles are emergent
+    clusters.
+
+    Distance = 1 − cosine similarity on the normalized alert-kind vector.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT regime, kind, COUNT(*) AS c
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY regime, kind
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+
+    profiles: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        profiles[r.regime][r.kind] = float(r.c)
+    # Normalize.
+    norms: Dict[str, dict] = {}
+    for regime, kc in profiles.items():
+        total = sum(kc.values())
+        if total <= 0:
+            continue
+        norms[regime] = {k: v / total for k, v in kc.items()}
+
+    regimes = list(norms.keys())
+    cells: List[dict] = []
+    merge_candidates: List[dict] = []
+    for i, a in enumerate(regimes):
+        for j, b in enumerate(regimes):
+            if i > j:
+                continue
+            va = norms[a]
+            vb = norms[b]
+            keys = set(va) | set(vb)
+            dot = sum(va.get(k, 0.0) * vb.get(k, 0.0) for k in keys)
+            na = math.sqrt(sum(v * v for v in va.values()))
+            nb = math.sqrt(sum(v * v for v in vb.values()))
+            cos = (dot / (na * nb)) if (na > 0 and nb > 0) else 0.0
+            distance = 1.0 - cos
+            cells.append({"a": a, "b": b, "cosine": cos, "distance": distance})
+            if a != b and cos >= 0.85:
+                merge_candidates.append({"a": a, "b": b, "cosine": cos})
+
+    merge_candidates.sort(key=lambda d: -d["cosine"])
+    return {
+        "since_ms": since_ms,
+        "regimes": regimes,
+        "matrix": cells,
+        "merge_candidates": merge_candidates[:10],
+    }
+
+
+# ── Meta-intelligence health ─────────────────────────────────────────────
+
+
+def meta_intelligence_health(db: Session) -> dict:
+    """One composite health number for the engine itself. Blends:
+
+      * meta_confidence (Phase 10) — how reliable is our own confidence
+      * structural break score — if structure broke, our calibration is
+        stale by definition
+      * alert saturation — alerts/hour vs the long-term baseline
+      * edge mutation magnitude — sum of |delta| across mutating kinds
+      * regime fragmentation — distinct dominant regimes per day
+    """
+    now_ms = int(time.time() * 1000)
+    since_30d = now_ms - 30 * 24 * 3600 * 1000
+    since_7d = now_ms - 7 * 24 * 3600 * 1000
+
+    mc = meta_confidence(db, since_ms=since_30d)
+    sb = structural_breaks(db, window_days=7)
+    mut = edge_mutation(db, since_ms=since_30d, window_days=7)
+
+    # Alert saturation: alerts/hour in last 24h vs in last 30d.
+    sat_rows = db.execute(
+        text(
+            """
+            SELECT
+              SUM(CASE WHEN started_at_ms >= :last_24h THEN 1 ELSE 0 END) AS recent,
+              COUNT(*) AS total
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            """
+        ),
+        {"since": since_30d, "last_24h": now_ms - 24 * 3600 * 1000},
+    ).first()
+    recent_rate = int(sat_rows.recent or 0) / 24.0 if sat_rows else 0.0
+    avg_rate = int(sat_rows.total or 0) / (30 * 24.0) if sat_rows else 0.0
+    saturation_ratio = (recent_rate / avg_rate) if avg_rate > 0 else 1.0
+    saturation_score = max(0.0, 100.0 - max(0.0, saturation_ratio - 2.0) * 20.0)  # >2x saturation tax
+
+    mutation_total = sum(abs(k.get("delta") or 0) for k in mut.get("kinds", []))
+    mutation_score = max(0.0, 100.0 - mutation_total * 100.0)
+
+    # Regime fragmentation — distinct regimes per day in last 7d.
+    frag_rows = db.execute(
+        text(
+            """
+            SELECT (started_at_ms / 86400000) AS day_bucket, COUNT(DISTINCT regime) AS dr
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY day_bucket
+            """
+        ),
+        {"since": since_7d},
+    ).fetchall()
+    avg_dr = sum(int(r.dr) for r in frag_rows) / len(frag_rows) if frag_rows else 1.0
+    # Above 3 distinct regimes/day is fragmented.
+    fragmentation_score = max(0.0, 100.0 - max(0.0, avg_dr - 2.5) * 25.0)
+
+    components = {
+        "meta_confidence": mc["meta_confidence_score"],
+        "structural_stability": max(0.0, 100.0 - sb["structural_break_score"]),
+        "alert_saturation": saturation_score,
+        "edge_consistency": mutation_score,
+        "regime_focus": fragmentation_score,
+    }
+    health = sum(components.values()) / len(components)
+
+    if health >= 75:
+        state = "HEALTHY"
+    elif health >= 55:
+        state = "DRIFTING"
+    elif health >= 35:
+        state = "DEGRADING"
+    else:
+        state = "CRITICAL"
+
+    self_consistency = mc["confidence_stability"]
+    adaptation_quality = min(100.0, 100.0 - mutation_total * 200.0 + (100 - sb["structural_break_score"]) * 0.3)
+
+    return {
+        "meta_intelligence_health": health,
+        "state": state,
+        "self_consistency_score": self_consistency,
+        "adaptation_quality": max(0.0, min(100.0, adaptation_quality)),
+        "components": components,
+        "alert_saturation_ratio": saturation_ratio,
+        "avg_distinct_regimes_per_day": avg_dr,
+        "mutation_magnitude_sum": mutation_total,
+    }
