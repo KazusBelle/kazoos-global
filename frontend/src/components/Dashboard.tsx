@@ -27,6 +27,7 @@ import {
 } from "./CandleChart";
 import { Coordination } from "./Coordination";
 import { Liquidity } from "./Liquidity";
+import { MemoryPage } from "./Memory";
 import { Meta } from "./Meta";
 import { Operations } from "./Operations";
 import { Research } from "./Research";
@@ -60,7 +61,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "server";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "server";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -80,6 +81,27 @@ function FibIcon({ size = 20 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
       <circle cx="12" cy="12" r="9.5" />
       <path d="M12 12 C16 9 17.5 5.5 14.5 3 C11 0 7 3 7 7 C7 11 10 13.5 13 14.5 C16.5 15.5 19 14 18.5 10.5" />
+    </svg>
+  );
+}
+
+function MemoryIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <circle cx="4" cy="4" r="1.5" fill="currentColor" />
+      <circle cx="10" cy="6" r="1.5" fill="currentColor" />
+      <circle cx="16" cy="4" r="1.5" fill="currentColor" />
+      <circle cx="6" cy="13" r="1.5" fill="currentColor" />
+      <circle cx="14" cy="14" r="1.5" fill="currentColor" />
+      <circle cx="10" cy="17" r="1.5" fill="currentColor" />
+      <path d="M4 4L10 6L16 4M10 6L6 13L14 14L10 17L6 13" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1482,6 +1504,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("coord")}
             title="Coordination · Synthesis · Multi-Horizon"
           />
+          <NavBtn
+            active={page === "mem"}
+            open={sidebarOpen}
+            icon={<MemoryIcon size={20} />}
+            label="MEM"
+            onClick={() => setPage("mem")}
+            title="Memory · Genealogy · Evolution · Cycles"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1692,6 +1722,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         {page === "meta" && <Meta />}
 
         {page === "coord" && <Coordination />}
+
+        {page === "mem" && <MemoryPage />}
       </main>
 
       {/* ── Chart Modal ── */}

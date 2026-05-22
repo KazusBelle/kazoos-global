@@ -344,13 +344,15 @@ def _due_timeframes(boundary: datetime) -> Set[str]:
 
 
 _ANOMALY_INTERVAL_S = 300
+_INTEL_SNAPSHOT_INTERVAL_S = 300
 
 
 async def _anomaly_loop(stop_event: asyncio.Event) -> None:
     """Periodically scan recent intelligence layers and auto-record
-    anomalies that meet the bake-in thresholds. The recorder lives in
-    kazus_logic.liquidity.research; this loop just paces it."""
-    from kazus_logic.liquidity.research import auto_record_anomalies
+    anomalies + genealogy edges. Phase 13 added the auto-linker so
+    each new anomaly is wired into the memory graph the moment it
+    lands."""
+    from kazus_logic.liquidity.research import auto_record_anomalies_with_links
 
     # Initial delay so the worker isn't fighting the first poll cycle.
     try:
@@ -361,16 +363,42 @@ async def _anomaly_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             with SessionLocal() as db:
-                result = auto_record_anomalies(db)
+                result = auto_record_anomalies_with_links(db)
             inserted = len(result.get("inserted") or [])
-            if inserted:
-                logger.info("auto-anomaly scan: recorded %d", inserted)
-            else:
-                logger.debug("auto-anomaly scan: nothing new")
+            edges = len(result.get("edges") or [])
+            if inserted or edges:
+                logger.info("auto-anomaly scan: recorded %d · linked %d edges", inserted, edges)
         except Exception as exc:  # noqa: BLE001
             logger.exception("auto-anomaly scan failed: %s", exc)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=_ANOMALY_INTERVAL_S)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _intel_snapshot_loop(stop_event: asyncio.Event) -> None:
+    """Persist a snapshot of the engine's aggregate state so the
+    evolution timeline + market cycle decomposition have history to
+    plot. Mirrors the anomaly cadence (5 min)."""
+    from kazus_logic.liquidity.research import snapshot_intelligence_history
+
+    # Offset start so the snapshot doesn't fire at the same instant as
+    # the anomaly scan (DB-load smoothing).
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=90.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+    while not stop_event.is_set():
+        try:
+            with SessionLocal() as db:
+                row = snapshot_intelligence_history(db)
+            logger.debug("intel snapshot persisted id=%s state=%s", row["id"], row["coordinated_state"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("intel snapshot failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=_INTEL_SNAPSHOT_INTERVAL_S)
             break
         except asyncio.TimeoutError:
             continue
@@ -419,6 +447,9 @@ async def main() -> None:
     anomaly_task = asyncio.create_task(
         _anomaly_loop(stop_event), name="liquidity-anomaly-recorder"
     )
+    intel_snapshot_task = asyncio.create_task(
+        _intel_snapshot_loop(stop_event), name="liquidity-intel-snapshot"
+    )
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -453,7 +484,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task):
+        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task):
             t.cancel()
             try:
                 await t

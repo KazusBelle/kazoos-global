@@ -135,6 +135,38 @@ _ADDITIVE_MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_occurred_ts ON liquidity_anomaly_memory (occurred_at_ms)",
     "CREATE INDEX IF NOT EXISTS ix_liq_anomaly_memory_kind ON liquidity_anomaly_memory (kind)",
+    # Phase-13 anomaly genealogy + intelligence evolution timeline.
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_anomaly_edges (
+        id SERIAL PRIMARY KEY,
+        from_id INTEGER NOT NULL,
+        to_id INTEGER NOT NULL,
+        kind VARCHAR(32) NOT NULL,
+        weight DOUBLE PRECISION DEFAULT 1.0,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_liq_anom_edge_triple UNIQUE (from_id, to_id, kind)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_anom_edge_from ON liquidity_anomaly_edges (from_id)",
+    "CREATE INDEX IF NOT EXISTS ix_liq_anom_edge_to ON liquidity_anomaly_edges (to_id)",
+    """
+    CREATE TABLE IF NOT EXISTS liquidity_intelligence_history (
+        id SERIAL PRIMARY KEY,
+        ts_ms BIGINT NOT NULL,
+        synthesized_stress DOUBLE PRECISION,
+        coordinated_state VARCHAR(48),
+        cross_layer_agreement DOUBLE PRECISION,
+        structural_break_score DOUBLE PRECISION,
+        meta_confidence_score DOUBLE PRECISION,
+        meta_intelligence_health DOUBLE PRECISION,
+        health_state VARCHAR(24),
+        risk_state_score DOUBLE PRECISION,
+        regime_shift_probability DOUBLE PRECISION,
+        dominant_regime VARCHAR(32),
+        fingerprint_json TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_liq_intel_history_ts ON liquidity_intelligence_history (ts_ms)",
     """
     CREATE TABLE IF NOT EXISTS server_metrics (
         id SERIAL PRIMARY KEY,

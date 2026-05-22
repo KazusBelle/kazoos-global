@@ -6,8 +6,10 @@ from kazus_db.models import (
     LiquidityActiveSub,
     LiquidityAlertHistory,
     LiquidityAnnotation,
+    LiquidityAnomalyEdge,
     LiquidityAnomalyMemory,
     LiquidityCrossExHistory,
+    LiquidityIntelligenceHistory,
     LiquidityPin,
     LiquiditySample,
     LiquidityWsStatus,
@@ -35,5 +37,7 @@ __all__ = [
     "LiquidityAlertHistory",
     "LiquidityAnnotation",
     "LiquidityAnomalyMemory",
+    "LiquidityAnomalyEdge",
+    "LiquidityIntelligenceHistory",
     "LiquidityCrossExHistory",
 ]

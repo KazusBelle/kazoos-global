@@ -3198,3 +3198,744 @@ def multi_horizon(db: Session) -> dict:
         "dominant_horizon": dominant,
         "structural_alignment_state": state,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-13 — Market Memory & Evolution
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Genealogy edges over anomaly_memory + intelligence-state history. The
+# worker writes both — endpoints below are read-only views over them.
+
+
+# ── Auto-linking edges on insertion ───────────────────────────────────────
+
+
+def link_anomaly_edges(db: Session, new_id: int) -> List[dict]:
+    """Inspect a freshly-recorded anomaly and link it to recent /
+    historically-similar prior ones. Returns the list of inserted edges.
+
+    Heuristic:
+      * `preceded` — any anomaly of the same kind in the last 7d that
+        landed before this one;
+      * `historically_similar` — top-3 priors with normalized L2
+        distance < 0.5 across all kinds;
+      * `caused_by` — for "pre_cascade" / "regime_collapse", any
+        anomaly in the last 24h whose distance < 0.7 is treated as a
+        likely precursor.
+    """
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyEdge, LiquidityAnomalyMemory
+
+    new_row = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(LiquidityAnomalyMemory.id == new_id)
+        .first()
+    )
+    if new_row is None:
+        return []
+    try:
+        new_fp = _json.loads(new_row.fingerprint_json) if new_row.fingerprint_json else {}
+    except (TypeError, ValueError):
+        new_fp = {}
+
+    now_ms = int(time.time() * 1000)
+    week_ago = now_ms - 7 * 24 * 3600 * 1000
+    day_ago = now_ms - 24 * 3600 * 1000
+
+    same_kind = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(
+            LiquidityAnomalyMemory.id != new_id,
+            LiquidityAnomalyMemory.kind == new_row.kind,
+            LiquidityAnomalyMemory.occurred_at_ms >= week_ago,
+            LiquidityAnomalyMemory.occurred_at_ms < new_row.occurred_at_ms,
+        )
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(20)
+        .all()
+    )
+    all_recent = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(
+            LiquidityAnomalyMemory.id != new_id,
+            LiquidityAnomalyMemory.occurred_at_ms < new_row.occurred_at_ms,
+        )
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(200)
+        .all()
+    )
+
+    inserts: List[Tuple[int, int, str, float]] = []
+
+    # preceded — latest same-kind prior wins as the strongest link.
+    if same_kind:
+        prev = same_kind[0]
+        inserts.append((prev.id, new_id, "preceded", 1.0))
+
+    # historically_similar — top-3 closest across all kinds.
+    scored: List[Tuple[float, LiquidityAnomalyMemory]] = []
+    for p in all_recent:
+        try:
+            prev_fp = _json.loads(p.fingerprint_json) if p.fingerprint_json else {}
+        except (TypeError, ValueError):
+            continue
+        d = _fingerprint_distance(new_fp, prev_fp)
+        if d is None or d >= 0.5:
+            continue
+        scored.append((d, p))
+    scored.sort(key=lambda x: x[0])
+    for d, p in scored[:3]:
+        # Convention: store with from_id < to_id for similarity edges to dedup.
+        lo, hi = (p.id, new_id) if p.id < new_id else (new_id, p.id)
+        inserts.append((lo, hi, "historically_similar", 1.0 - d))
+
+    # caused_by — only for escalation kinds, against priors within last day.
+    if new_row.kind in ("pre_cascade", "regime_collapse"):
+        for d, p in scored[:5]:
+            if p.occurred_at_ms < day_ago:
+                continue
+            if d >= 0.7:
+                continue
+            inserts.append((p.id, new_id, "caused_by", 1.0 - d))
+
+    # evolved_into — escalation between sequential anomalies on the same
+    # rough fingerprint locus: if the closest prior across all kinds is
+    # within distance 0.35 AND less than 6h old, treat the new one as
+    # an evolution of the prior.
+    if scored and scored[0][0] <= 0.35 and (now_ms - scored[0][1].occurred_at_ms) <= 6 * 3600 * 1000:
+        inserts.append((scored[0][1].id, new_id, "evolved_into", 1.0 - scored[0][0]))
+
+    written: List[dict] = []
+    seen = set()
+    for fr, to, k, w in inserts:
+        key = (fr, to, k)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            db.add(LiquidityAnomalyEdge(from_id=fr, to_id=to, kind=k, weight=w))
+            db.flush()
+            written.append({"from_id": fr, "to_id": to, "kind": k, "weight": w})
+        except Exception:
+            db.rollback()
+            continue
+    if written:
+        db.commit()
+    return written
+
+
+def auto_record_anomalies_with_links(db: Session) -> dict:
+    """Wrapper around auto_record_anomalies that also writes genealogy
+    edges for every fresh insertion. The worker calls this instead of
+    the bare recorder so the graph stays current without a second job.
+    """
+    result = auto_record_anomalies(db)
+    inserted = result.get("inserted") or []
+    all_edges: List[dict] = []
+    for row in inserted:
+        try:
+            edges = link_anomaly_edges(db, row["id"])
+            all_edges.extend(edges)
+        except Exception as exc:  # noqa: BLE001
+            # never let edge creation break the recorder
+            db.rollback()
+    result["edges"] = all_edges
+    return result
+
+
+# ── Periodic intelligence snapshot ────────────────────────────────────────
+
+
+def snapshot_intelligence_history(db: Session) -> dict:
+    """Persist one row into liquidity_intelligence_history with all the
+    aggregate state numbers. Called by the worker every few minutes."""
+    import json as _json
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    synth = intelligence_synthesis(db)
+    mh = meta_intelligence_health(db)
+    rs = risk_state(db)
+    rsw = regime_shift_warning(db)
+    sb = structural_breaks(db, window_days=7)
+    fp = _fingerprint_current(db)
+
+    # Dominant regime in last hour (descending count).
+    rows = db.execute(
+        text(
+            """
+            SELECT regime, COUNT(*) AS c
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            GROUP BY regime
+            ORDER BY c DESC
+            LIMIT 1
+            """
+        ),
+        {"since": int(time.time() * 1000) - 3600_000},
+    ).first()
+    dominant = rows.regime if rows else "HEALTHY_TREND"
+
+    row = LiquidityIntelligenceHistory(
+        ts_ms=int(time.time() * 1000),
+        synthesized_stress=synth["synthesized_stress"],
+        coordinated_state=synth["coordinated_state"],
+        cross_layer_agreement=synth["cross_layer_agreement"],
+        structural_break_score=sb["structural_break_score"],
+        meta_confidence_score=mh["components"].get("meta_confidence"),
+        meta_intelligence_health=mh["meta_intelligence_health"],
+        health_state=mh["state"],
+        risk_state_score=rs["risk_state_score"],
+        regime_shift_probability=rsw["regime_shift_probability"],
+        dominant_regime=dominant,
+        fingerprint_json=_json.dumps(fp, sort_keys=True),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "ts_ms": row.ts_ms,
+        "synthesized_stress": row.synthesized_stress,
+        "coordinated_state": row.coordinated_state,
+        "meta_intelligence_health": row.meta_intelligence_health,
+    }
+
+
+# ── Anomaly genealogy / lineage ───────────────────────────────────────────
+
+
+def anomaly_lineage(db: Session, anomaly_id: int, depth: int = 3) -> dict:
+    """Walk both ancestor and descendant edges from an anomaly_id, up to
+    `depth` hops. Returns parents/descendants grouped by edge kind so
+    the UI can render lineage trees + similarity neighborhoods."""
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyEdge, LiquidityAnomalyMemory
+
+    root = db.query(LiquidityAnomalyMemory).filter(LiquidityAnomalyMemory.id == anomaly_id).first()
+    if root is None:
+        return {"id": anomaly_id, "root": None, "parents": [], "descendants": [], "lineage_depth": 0, "neighborhood_size": 0}
+
+    def _row_to_dict(r: LiquidityAnomalyMemory) -> dict:
+        try:
+            fp = _json.loads(r.fingerprint_json) if r.fingerprint_json else {}
+        except (TypeError, ValueError):
+            fp = {}
+        return {
+            "id": r.id, "kind": r.kind, "severity": r.severity,
+            "occurred_at_ms": r.occurred_at_ms,
+            "novelty_score": r.novelty_score,
+            "recurrence_count": r.recurrence_count,
+            "fingerprint": fp,
+        }
+
+    visited_up = {anomaly_id}
+    visited_down = {anomaly_id}
+    frontier_up = {anomaly_id}
+    frontier_down = {anomaly_id}
+    parents_by_depth: List[List[dict]] = []
+    descendants_by_depth: List[List[dict]] = []
+    edges: List[dict] = []
+    max_depth_seen = 0
+
+    for d in range(1, depth + 1):
+        # Up: edges pointing INTO frontier_up.
+        if frontier_up:
+            up_rows = (
+                db.query(LiquidityAnomalyEdge)
+                .filter(LiquidityAnomalyEdge.to_id.in_(frontier_up))
+                .all()
+            )
+            next_up = set()
+            level_nodes: List[dict] = []
+            for e in up_rows:
+                if e.from_id in visited_up:
+                    continue
+                visited_up.add(e.from_id)
+                next_up.add(e.from_id)
+                edges.append({"from_id": e.from_id, "to_id": e.to_id, "kind": e.kind, "weight": e.weight, "depth": d})
+            if next_up:
+                rows = (
+                    db.query(LiquidityAnomalyMemory)
+                    .filter(LiquidityAnomalyMemory.id.in_(next_up))
+                    .all()
+                )
+                level_nodes = [_row_to_dict(r) for r in rows]
+            if level_nodes:
+                parents_by_depth.append(level_nodes)
+                max_depth_seen = max(max_depth_seen, d)
+            frontier_up = next_up
+
+        # Down: edges pointing FROM frontier_down.
+        if frontier_down:
+            down_rows = (
+                db.query(LiquidityAnomalyEdge)
+                .filter(LiquidityAnomalyEdge.from_id.in_(frontier_down))
+                .all()
+            )
+            next_down = set()
+            level_nodes: List[dict] = []
+            for e in down_rows:
+                if e.to_id in visited_down:
+                    continue
+                visited_down.add(e.to_id)
+                next_down.add(e.to_id)
+                edges.append({"from_id": e.from_id, "to_id": e.to_id, "kind": e.kind, "weight": e.weight, "depth": d})
+            if next_down:
+                rows = (
+                    db.query(LiquidityAnomalyMemory)
+                    .filter(LiquidityAnomalyMemory.id.in_(next_down))
+                    .all()
+                )
+                level_nodes = [_row_to_dict(r) for r in rows]
+            if level_nodes:
+                descendants_by_depth.append(level_nodes)
+                max_depth_seen = max(max_depth_seen, d)
+            frontier_down = next_down
+
+    neighborhood_size = len(visited_up) + len(visited_down) - 1   # root counted twice
+    return {
+        "id": anomaly_id,
+        "root": _row_to_dict(root),
+        "parents": parents_by_depth,
+        "descendants": descendants_by_depth,
+        "edges": edges,
+        "lineage_depth": max_depth_seen,
+        "neighborhood_size": neighborhood_size,
+    }
+
+
+def memory_graph(db: Session, limit_nodes: int = 100) -> dict:
+    """Return up to `limit_nodes` most-recent anomaly nodes + all edges
+    between them. The UI renders this as a force-directed-ish graph
+    panel; we keep edge density low by bounding nodes."""
+    import json as _json
+    from kazus_db.models import LiquidityAnomalyEdge, LiquidityAnomalyMemory
+
+    nodes_rows = (
+        db.query(LiquidityAnomalyMemory)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(limit_nodes)
+        .all()
+    )
+    node_ids = [r.id for r in nodes_rows]
+    edges_rows = (
+        db.query(LiquidityAnomalyEdge)
+        .filter(
+            LiquidityAnomalyEdge.from_id.in_(node_ids),
+            LiquidityAnomalyEdge.to_id.in_(node_ids),
+        )
+        .all()
+    )
+    nodes: List[dict] = []
+    for r in nodes_rows:
+        try:
+            fp = _json.loads(r.fingerprint_json) if r.fingerprint_json else {}
+        except (TypeError, ValueError):
+            fp = {}
+        nodes.append({
+            "id": r.id, "kind": r.kind, "severity": r.severity,
+            "occurred_at_ms": r.occurred_at_ms,
+            "novelty_score": r.novelty_score,
+            "fingerprint": fp,
+        })
+    edges = [{"from_id": e.from_id, "to_id": e.to_id, "kind": e.kind, "weight": e.weight} for e in edges_rows]
+    by_kind: Dict[str, int] = defaultdict(int)
+    for e in edges_rows:
+        by_kind[e.kind] += 1
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "edge_counts_by_kind": dict(by_kind),
+    }
+
+
+# ── Crisis evolution tree ─────────────────────────────────────────────────
+
+
+_ESCALATION_ORDER = [
+    "EARLY_STRUCTURAL_STRESS",
+    "STRUCTURAL_MARKET_DETERIORATION",
+    "FRAGMENTING_LIQUIDITY_ENVIRONMENT",
+    "ESCALATING_SYSTEMIC_INSTABILITY",
+    "ACTIVE_CASCADE_PROPAGATION",
+]
+
+
+def crisis_evolution_tree(db: Session, lookback_days: int = 30) -> dict:
+    """Build state-transition counts from the intelligence_history table
+    and return per-state escalation/stabilization probabilities.
+
+    For each state, we count how often the NEXT row was at a higher
+    escalation rung (escalation), the same rung (persistence), or a
+    lower rung (stabilization). Output drives the UI's "tree of crisis
+    development" by showing branch weights per state.
+    """
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = (
+        db.query(LiquidityIntelligenceHistory.ts_ms, LiquidityIntelligenceHistory.coordinated_state)
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+    if len(rows) < 2:
+        return {"since_ms": since_ms, "states": [], "tree": []}
+
+    rank = {s: i for i, s in enumerate(_ESCALATION_ORDER)}
+    # STABLE_COORDINATED_MARKET sits below the escalation list.
+    rank["STABLE_COORDINATED_MARKET"] = -1
+
+    per_state: Dict[str, Dict[str, int]] = defaultdict(lambda: {"persist": 0, "escalate": 0, "stabilize": 0, "total_out": 0})
+    transitions: Dict[Tuple[str, str], int] = defaultdict(int)
+
+    prev_state = rows[0].coordinated_state
+    for ts, cur in rows[1:]:
+        if cur is None or prev_state is None:
+            prev_state = cur
+            continue
+        if cur == prev_state:
+            per_state[prev_state]["persist"] += 1
+        elif rank.get(cur, -1) > rank.get(prev_state, -1):
+            per_state[prev_state]["escalate"] += 1
+        else:
+            per_state[prev_state]["stabilize"] += 1
+        transitions[(prev_state, cur)] += 1
+        per_state[prev_state]["total_out"] += 1
+        prev_state = cur
+
+    states_out: List[dict] = []
+    for state, c in per_state.items():
+        total = max(1, c["total_out"])
+        states_out.append({
+            "state": state,
+            "persist_count": c["persist"],
+            "escalate_count": c["escalate"],
+            "stabilize_count": c["stabilize"],
+            "total_transitions": c["total_out"],
+            "escalation_prob": c["escalate"] / total,
+            "stabilization_prob": c["stabilize"] / total,
+        })
+    states_out.sort(key=lambda s: rank.get(s["state"], -1))
+
+    tree_edges = [
+        {"from_state": a, "to_state": b, "count": c}
+        for (a, b), c in sorted(transitions.items(), key=lambda kv: -kv[1])
+    ]
+    return {"since_ms": since_ms, "states": states_out, "tree": tree_edges[:25]}
+
+
+# ── Regime ancestry ───────────────────────────────────────────────────────
+
+
+def regime_ancestry(db: Session, lookback_days: int = 30) -> dict:
+    """Per-symbol regime sequence → which regimes inherit instability
+    from which. Edge weight = number of (parent, child) consecutive
+    pairs observed in alert_history."""
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = db.execute(
+        text(
+            """
+            SELECT symbol, started_at_ms, regime
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            ORDER BY symbol, started_at_ms
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+    transitions: Dict[Tuple[str, str], int] = defaultdict(int)
+    last: Dict[str, str] = {}
+    counts: Dict[str, int] = defaultdict(int)
+    for r in rows:
+        counts[r.regime] += 1
+        prev = last.get(r.symbol)
+        if prev and prev != r.regime:
+            transitions[(prev, r.regime)] += 1
+        last[r.symbol] = r.regime
+
+    nodes = [{"regime": r, "count": c} for r, c in sorted(counts.items(), key=lambda kv: -kv[1])]
+    edges = [
+        {"parent_regime": a, "child_regime": b, "weight": c}
+        for (a, b), c in sorted(transitions.items(), key=lambda kv: -kv[1])
+    ]
+    # Dominant lineage: walk regimes by highest-outgoing-weight greedily
+    # from HEALTHY_TREND.
+    by_parent: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+    for (a, b), c in transitions.items():
+        by_parent[a].append((b, c))
+    for a in by_parent:
+        by_parent[a].sort(key=lambda kv: -kv[1])
+    dominant_lineage: List[str] = []
+    seen_states: set = set()
+    cur = "HEALTHY_TREND" if "HEALTHY_TREND" in counts else (nodes[0]["regime"] if nodes else None)
+    while cur and cur not in seen_states and len(dominant_lineage) < 6:
+        dominant_lineage.append(cur)
+        seen_states.add(cur)
+        next_options = by_parent.get(cur, [])
+        if not next_options:
+            break
+        cur = next_options[0][0]
+    return {
+        "since_ms": since_ms,
+        "nodes": nodes,
+        "edges": edges,
+        "dominant_lineage": dominant_lineage,
+    }
+
+
+# ── Edge lineage (mutation timeline per kind) ─────────────────────────────
+
+
+def edge_lineage(db: Session, kind: str, lookback_days: int = 60, bucket_days: int = 7) -> dict:
+    """Per-kind precision timeline + lifecycle annotations (origin,
+    strengthening, degradation, inversion phases). Output drives the
+    Edge Lifecycle panel on the Memory page."""
+    bucket_ms = bucket_days * 24 * 3600 * 1000
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = db.execute(
+        text(
+            """
+            SELECT
+              (started_at_ms / :bucket_ms) * :bucket_ms AS bucket_ts,
+              COUNT(*) AS total,
+              SUM(CASE WHEN validated_outcome = 'followed_through' THEN 1 ELSE 0 END) AS ft,
+              SUM(CASE WHEN validated_outcome = 'noise' THEN 1 ELSE 0 END) AS noise
+            FROM liquidity_alert_history
+            WHERE kind = :kind AND started_at_ms >= :since
+            GROUP BY bucket_ts
+            ORDER BY bucket_ts
+            """
+        ),
+        {"bucket_ms": bucket_ms, "kind": kind, "since": since_ms},
+    ).fetchall()
+    series: List[dict] = []
+    phases: List[dict] = []
+    prev_p: Optional[float] = None
+    phase_start_ts: Optional[int] = None
+    phase_kind: Optional[str] = None
+    for r in rows:
+        ft = int(r.ft or 0); ns = int(r.noise or 0)
+        resolved = ft + ns
+        p = ft / resolved if resolved > 0 else None
+        series.append({"bucket_ts": int(r.bucket_ts), "precision": p, "total": int(r.total or 0)})
+        if p is None or prev_p is None:
+            prev_p = p
+            continue
+        # Phase changes
+        cur_phase = (
+            "INVERTED" if (p - 0.5) * (prev_p - 0.5) < 0
+            else "STRENGTHENING" if p - prev_p >= 0.05
+            else "DEGRADATION" if p - prev_p <= -0.05
+            else "STEADY"
+        )
+        if cur_phase != phase_kind:
+            if phase_kind is not None and phase_start_ts is not None:
+                phases.append({"phase": phase_kind, "start_ts": phase_start_ts, "end_ts": int(r.bucket_ts)})
+            phase_kind = cur_phase
+            phase_start_ts = int(r.bucket_ts)
+        prev_p = p
+    if phase_kind is not None and phase_start_ts is not None and series:
+        phases.append({"phase": phase_kind, "start_ts": phase_start_ts, "end_ts": series[-1]["bucket_ts"]})
+
+    return {
+        "kind": kind,
+        "since_ms": since_ms,
+        "bucket_days": bucket_days,
+        "series": series,
+        "phases": phases,
+        "origin_ts": series[0]["bucket_ts"] if series else None,
+    }
+
+
+# ── Intelligence evolution timeline ───────────────────────────────────────
+
+
+def intelligence_history_series(db: Session, since_ms: Optional[int] = None, limit: int = 500) -> dict:
+    """Read from the snapshot table for the evolution timeline."""
+    from kazus_db.models import LiquidityIntelligenceHistory
+    q = db.query(LiquidityIntelligenceHistory)
+    if since_ms is not None:
+        q = q.filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+    rows = q.order_by(LiquidityIntelligenceHistory.ts_ms.asc()).limit(limit).all()
+    series: List[dict] = []
+    for r in rows:
+        series.append({
+            "ts_ms": r.ts_ms,
+            "synthesized_stress": r.synthesized_stress,
+            "coordinated_state": r.coordinated_state,
+            "cross_layer_agreement": r.cross_layer_agreement,
+            "structural_break_score": r.structural_break_score,
+            "meta_confidence_score": r.meta_confidence_score,
+            "meta_intelligence_health": r.meta_intelligence_health,
+            "health_state": r.health_state,
+            "risk_state_score": r.risk_state_score,
+            "regime_shift_probability": r.regime_shift_probability,
+            "dominant_regime": r.dominant_regime,
+        })
+    return {"since_ms": since_ms, "count": len(series), "series": series}
+
+
+# ── Market cycle decomposition ────────────────────────────────────────────
+
+
+# Map coordinated_state → cycle phase. The cycle taxonomy is the user-facing
+# vocabulary; coordinated_state is the internal classifier — we surface
+# both so the user can audit the mapping.
+_CYCLE_PHASE_FROM_STATE: Dict[str, str] = {
+    "STABLE_COORDINATED_MARKET": "STABLE_LIQUIDITY",
+    "EARLY_STRUCTURAL_STRESS": "SPECULATIVE_EXPANSION",
+    "STRUCTURAL_MARKET_DETERIORATION": "INSTABILITY_PROPAGATION",
+    "FRAGMENTING_LIQUIDITY_ENVIRONMENT": "INSTABILITY_PROPAGATION",
+    "ESCALATING_SYSTEMIC_INSTABILITY": "CASCADE_PHASE",
+    "ACTIVE_CASCADE_PROPAGATION": "CASCADE_PHASE",
+}
+
+
+def market_cycle(db: Session, lookback_days: int = 60) -> dict:
+    """Decompose the intelligence_history timeline into cycle phases:
+    contiguous runs of the same cycle-phase label. Returns per-run
+    duration + transition probabilities + an inferred current phase."""
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = (
+        db.query(LiquidityIntelligenceHistory.ts_ms, LiquidityIntelligenceHistory.coordinated_state)
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+    runs: List[dict] = []
+    transitions: Dict[Tuple[str, str], int] = defaultdict(int)
+    cur_phase: Optional[str] = None
+    cur_start: Optional[int] = None
+    last_ts: Optional[int] = None
+    for ts, state in rows:
+        phase = _CYCLE_PHASE_FROM_STATE.get(state or "", "STABLE_LIQUIDITY")
+        if cur_phase is None:
+            cur_phase = phase
+            cur_start = int(ts)
+        elif phase != cur_phase:
+            runs.append({"phase": cur_phase, "start_ts": cur_start, "end_ts": int(ts),
+                         "duration_ms": int(ts) - (cur_start or int(ts))})
+            transitions[(cur_phase, phase)] += 1
+            cur_phase = phase
+            cur_start = int(ts)
+        last_ts = int(ts)
+    if cur_phase is not None and cur_start is not None and last_ts is not None:
+        runs.append({"phase": cur_phase, "start_ts": cur_start, "end_ts": last_ts,
+                     "duration_ms": last_ts - cur_start, "open": True})
+
+    # Average duration per phase + transition probability matrix.
+    by_phase: Dict[str, List[int]] = defaultdict(list)
+    for r in runs:
+        if r.get("open"):
+            continue
+        by_phase[r["phase"]].append(r["duration_ms"])
+    avg_duration = {p: (sum(d) / len(d) if d else None) for p, d in by_phase.items()}
+    phase_totals: Dict[str, int] = defaultdict(int)
+    for (a, _), c in transitions.items():
+        phase_totals[a] += c
+    matrix = [
+        {"from_phase": a, "to_phase": b, "count": c,
+         "probability": c / phase_totals[a] if phase_totals.get(a) else 0.0}
+        for (a, b), c in sorted(transitions.items(), key=lambda kv: -kv[1])
+    ]
+    current = cur_phase
+    return {
+        "since_ms": since_ms,
+        "runs": runs,
+        "current_phase": current,
+        "avg_duration_ms_per_phase": avg_duration,
+        "transition_matrix": matrix,
+    }
+
+
+# ── Narrative chronicle (multi-week story) ────────────────────────────────
+
+
+def narrative_chronicle(db: Session, lookback_days: int = 21) -> dict:
+    """Compose a multi-week chronicle of how the market evolved. Looks
+    at the intelligence_history series + recent anomaly memory and
+    composes deterministic prose."""
+    from kazus_db.models import LiquidityIntelligenceHistory, LiquidityAnomalyMemory
+
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    hist = (
+        db.query(
+            LiquidityIntelligenceHistory.ts_ms,
+            LiquidityIntelligenceHistory.synthesized_stress,
+            LiquidityIntelligenceHistory.meta_intelligence_health,
+            LiquidityIntelligenceHistory.structural_break_score,
+            LiquidityIntelligenceHistory.coordinated_state,
+        )
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+    if len(hist) < 5:
+        return {
+            "since_ms": since_ms,
+            "summary": "Insufficient history to compose a multi-week chronicle.",
+            "highlights": [],
+            "anomaly_count": 0,
+        }
+
+    def _slope(values: List[Optional[float]]) -> Optional[float]:
+        clean = [(i, v) for i, v in enumerate(values) if v is not None]
+        if len(clean) < 3:
+            return None
+        n = len(clean)
+        mx = sum(p[0] for p in clean) / n
+        my = sum(p[1] for p in clean) / n
+        num = sum((p[0] - mx) * (p[1] - my) for p in clean)
+        den = sum((p[0] - mx) ** 2 for p in clean)
+        return num / den if den > 0 else None
+
+    stress_slope = _slope([h.synthesized_stress for h in hist])
+    health_slope = _slope([h.meta_intelligence_health for h in hist])
+    break_slope = _slope([h.structural_break_score for h in hist])
+
+    state_first = hist[0].coordinated_state
+    state_last = hist[-1].coordinated_state
+
+    anomalies = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(LiquidityAnomalyMemory.occurred_at_ms >= since_ms)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .all()
+    )
+    counts_by_kind: Dict[str, int] = defaultdict(int)
+    for a in anomalies:
+        counts_by_kind[a.kind] += 1
+
+    bullets: List[str] = []
+    if stress_slope is not None:
+        if stress_slope > 0.5:
+            bullets.append(f"synthesized stress rose steadily ({stress_slope:+.1f}/snapshot)")
+        elif stress_slope < -0.5:
+            bullets.append(f"synthesized stress eased ({stress_slope:+.1f}/snapshot)")
+    if break_slope is not None and break_slope > 0.5:
+        bullets.append(f"structural break score climbing ({break_slope:+.1f}/snapshot)")
+    if health_slope is not None and health_slope < -0.5:
+        bullets.append(f"intelligence-engine health degraded ({health_slope:+.1f}/snapshot)")
+    if counts_by_kind:
+        top = sorted(counts_by_kind.items(), key=lambda kv: -kv[1])[:3]
+        bullets.append("anomaly memory accumulated " + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in top))
+    if state_first and state_last and state_first != state_last:
+        bullets.append(f"coordinated state transitioned {state_first.replace('_', ' ')} → {state_last.replace('_', ' ')}")
+    if not bullets:
+        bullets.append("market evolution was largely uneventful in the window")
+
+    summary = f"Over the last {lookback_days} days the market " + ("escalated" if stress_slope and stress_slope > 0.5 else "stabilized" if stress_slope and stress_slope < -0.5 else "drifted laterally") + "."
+
+    return {
+        "since_ms": since_ms,
+        "summary": summary,
+        "highlights": bullets,
+        "anomaly_count": len(anomalies),
+        "anomaly_counts_by_kind": dict(counts_by_kind),
+        "first_state": state_first,
+        "last_state": state_last,
+    }

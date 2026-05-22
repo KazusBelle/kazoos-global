@@ -349,6 +349,70 @@ class LiquidityAnomalyMemory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class LiquidityAnomalyEdge(Base):
+    """Directed edge between two `liquidity_anomaly_memory` rows.
+
+    Phase-13 builds market-behavior genealogy by linking anomalies in
+    causal / similarity / escalation relationships. Edges are typed —
+    "caused_by" means the parent contributed to the child arising,
+    "historically_similar" is non-directional in meaning but stored
+    with from_id < to_id by convention to dedup, "evolved_into" is the
+    escalation tree path, etc.
+
+    Edges are auto-created by the worker's anomaly recorder when a new
+    row lands; they're never deleted automatically — the graph is the
+    memory.
+    """
+
+    __tablename__ = "liquidity_anomaly_edges"
+    __table_args__ = (
+        UniqueConstraint("from_id", "to_id", "kind", name="uq_liq_anom_edge_triple"),
+        Index("ix_liq_anom_edge_from", "from_id"),
+        Index("ix_liq_anom_edge_to", "to_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # "caused_by" | "evolved_into" | "historically_similar" | "preceded"
+    # | "destabilized" | "stabilized"
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class LiquidityIntelligenceHistory(Base):
+    """Periodic snapshots of the intelligence engine's own state.
+
+    The Phase-13 evolution timeline + market-cycle decomposition both
+    need a history of system-level metrics (synthesized stress, meta-
+    health, structural break score, alert saturation, regime mix).
+    Persisting them on a slow cadence lets us plot drift and compose
+    long-horizon narratives without re-running every aggregation on
+    every read.
+    """
+
+    __tablename__ = "liquidity_intelligence_history"
+    __table_args__ = (
+        Index("ix_liq_intel_history_ts", "ts_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    synthesized_stress: Mapped[Optional[float]] = mapped_column(Float)
+    coordinated_state: Mapped[Optional[str]] = mapped_column(String(48))
+    cross_layer_agreement: Mapped[Optional[float]] = mapped_column(Float)
+    structural_break_score: Mapped[Optional[float]] = mapped_column(Float)
+    meta_confidence_score: Mapped[Optional[float]] = mapped_column(Float)
+    meta_intelligence_health: Mapped[Optional[float]] = mapped_column(Float)
+    health_state: Mapped[Optional[str]] = mapped_column(String(24))
+    risk_state_score: Mapped[Optional[float]] = mapped_column(Float)
+    regime_shift_probability: Mapped[Optional[float]] = mapped_column(Float)
+    dominant_regime: Mapped[Optional[str]] = mapped_column(String(32))
+    # JSON dict of cohort medians for ANALYTICS_METRICS at snapshot time.
+    fingerprint_json: Mapped[Optional[str]] = mapped_column(Text)
+
+
 class UserTDAState(Base):
     __tablename__ = "user_tda_states"
     __table_args__ = (

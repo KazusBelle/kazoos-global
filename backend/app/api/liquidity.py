@@ -2459,3 +2459,232 @@ async def auto_anomaly_scan_endpoint(
         inserted=inserted,
         decisions=[AutoAnomalyDecision(**d) for d in data.get("decisions", [])],
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase-13 — Market Memory & Evolution endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class AnomalyNode(BaseModel):
+    id: int
+    kind: str
+    severity: str
+    occurred_at_ms: int
+    novelty_score: float
+    recurrence_count: int
+    fingerprint: dict
+
+
+class AnomalyEdge(BaseModel):
+    from_id: int
+    to_id: int
+    kind: str
+    weight: float
+    depth: Optional[int] = None
+
+
+class AnomalyLineageOut(BaseModel):
+    id: int
+    root: Optional[AnomalyNode]
+    parents: List[List[AnomalyNode]]
+    descendants: List[List[AnomalyNode]]
+    edges: List[AnomalyEdge]
+    lineage_depth: int
+    neighborhood_size: int
+
+
+@router.get("/research/anomaly-lineage/{anomaly_id}", response_model=AnomalyLineageOut)
+async def anomaly_lineage_endpoint(
+    anomaly_id: int,
+    depth: int = Query(3, ge=1, le=6),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AnomalyLineageOut:
+    return AnomalyLineageOut(**_research.anomaly_lineage(db, anomaly_id=anomaly_id, depth=depth))
+
+
+class MemoryGraphOut(BaseModel):
+    nodes: List[AnomalyNode]
+    edges: List[AnomalyEdge]
+    edge_counts_by_kind: dict
+
+
+@router.get("/research/memory-graph", response_model=MemoryGraphOut)
+async def memory_graph_endpoint(
+    limit_nodes: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MemoryGraphOut:
+    return MemoryGraphOut(**_research.memory_graph(db, limit_nodes=limit_nodes))
+
+
+class CrisisEvolutionState(BaseModel):
+    state: str
+    persist_count: int
+    escalate_count: int
+    stabilize_count: int
+    total_transitions: int
+    escalation_prob: float
+    stabilization_prob: float
+
+
+class CrisisEvolutionEdge(BaseModel):
+    from_state: str
+    to_state: str
+    count: int
+
+
+class CrisisEvolutionOut(BaseModel):
+    since_ms: int
+    states: List[CrisisEvolutionState]
+    tree: List[CrisisEvolutionEdge]
+
+
+@router.get("/research/crisis-evolution-tree", response_model=CrisisEvolutionOut)
+async def crisis_evolution_tree_endpoint(
+    lookback_days: int = Query(30, ge=3, le=180),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> CrisisEvolutionOut:
+    return CrisisEvolutionOut(**_research.crisis_evolution_tree(db, lookback_days=lookback_days))
+
+
+class RegimeAncestryNode(BaseModel):
+    regime: str
+    count: int
+
+
+class RegimeAncestryEdge(BaseModel):
+    parent_regime: str
+    child_regime: str
+    weight: int
+
+
+class RegimeAncestryOut(BaseModel):
+    since_ms: int
+    nodes: List[RegimeAncestryNode]
+    edges: List[RegimeAncestryEdge]
+    dominant_lineage: List[str]
+
+
+@router.get("/research/regime-ancestry", response_model=RegimeAncestryOut)
+async def regime_ancestry_endpoint(
+    lookback_days: int = Query(30, ge=3, le=180),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> RegimeAncestryOut:
+    return RegimeAncestryOut(**_research.regime_ancestry(db, lookback_days=lookback_days))
+
+
+class EdgeLineagePoint(BaseModel):
+    bucket_ts: int
+    precision: Optional[float]
+    total: int
+
+
+class EdgeLineagePhase(BaseModel):
+    phase: str
+    start_ts: int
+    end_ts: int
+
+
+class EdgeLineageOut(BaseModel):
+    kind: str
+    since_ms: int
+    bucket_days: int
+    series: List[EdgeLineagePoint]
+    phases: List[EdgeLineagePhase]
+    origin_ts: Optional[int]
+
+
+@router.get("/research/edge-lineage/{kind}", response_model=EdgeLineageOut)
+async def edge_lineage_endpoint(
+    kind: str,
+    lookback_days: int = Query(60, ge=7, le=180),
+    bucket_days: int = Query(7, ge=1, le=14),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> EdgeLineageOut:
+    return EdgeLineageOut(**_research.edge_lineage(db, kind=kind, lookback_days=lookback_days, bucket_days=bucket_days))
+
+
+class IntelligenceSnapshotRow(BaseModel):
+    ts_ms: int
+    synthesized_stress: Optional[float]
+    coordinated_state: Optional[str]
+    cross_layer_agreement: Optional[float]
+    structural_break_score: Optional[float]
+    meta_confidence_score: Optional[float]
+    meta_intelligence_health: Optional[float]
+    health_state: Optional[str]
+    risk_state_score: Optional[float]
+    regime_shift_probability: Optional[float]
+    dominant_regime: Optional[str]
+
+
+class IntelligenceHistoryOut(BaseModel):
+    since_ms: Optional[int]
+    count: int
+    series: List[IntelligenceSnapshotRow]
+
+
+@router.get("/research/intelligence-history", response_model=IntelligenceHistoryOut)
+async def intelligence_history_endpoint(
+    since_ms: Optional[int] = Query(None),
+    limit: int = Query(500, ge=1, le=5000),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> IntelligenceHistoryOut:
+    return IntelligenceHistoryOut(**_research.intelligence_history_series(db, since_ms=since_ms, limit=limit))
+
+
+class CycleRun(BaseModel):
+    phase: str
+    start_ts: int
+    end_ts: int
+    duration_ms: int
+    open: Optional[bool] = None
+
+
+class CycleTransition(BaseModel):
+    from_phase: str
+    to_phase: str
+    count: int
+    probability: float
+
+
+class MarketCycleOut(BaseModel):
+    since_ms: int
+    runs: List[CycleRun]
+    current_phase: Optional[str]
+    avg_duration_ms_per_phase: dict
+    transition_matrix: List[CycleTransition]
+
+
+@router.get("/research/market-cycle", response_model=MarketCycleOut)
+async def market_cycle_endpoint(
+    lookback_days: int = Query(60, ge=7, le=180),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MarketCycleOut:
+    return MarketCycleOut(**_research.market_cycle(db, lookback_days=lookback_days))
+
+
+class NarrativeChronicleOut(BaseModel):
+    since_ms: int
+    summary: str
+    highlights: List[str]
+    anomaly_count: int
+    anomaly_counts_by_kind: Optional[dict] = None
+    first_state: Optional[str] = None
+    last_state: Optional[str] = None
+
+
+@router.get("/research/narrative-chronicle", response_model=NarrativeChronicleOut)
+async def narrative_chronicle_endpoint(
+    lookback_days: int = Query(21, ge=7, le=90),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> NarrativeChronicleOut:
+    return NarrativeChronicleOut(**_research.narrative_chronicle(db, lookback_days=lookback_days))

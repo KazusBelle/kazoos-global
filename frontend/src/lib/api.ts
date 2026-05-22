@@ -1278,3 +1278,150 @@ export type AutoAnomalyOut = {
 export async function triggerAutoAnomalyScan() {
   return request<AutoAnomalyOut>("/liquidity/research/auto-anomaly-scan", { method: "POST" });
 }
+
+// ── Phase-13 market memory & evolution ────────────────────────────────────
+
+export type AnomalyNode = {
+  id: number;
+  kind: string;
+  severity: string;
+  occurred_at_ms: number;
+  novelty_score: number;
+  recurrence_count: number;
+  fingerprint: Record<string, number>;
+};
+
+export type AnomalyEdge = {
+  from_id: number;
+  to_id: number;
+  kind: "caused_by" | "evolved_into" | "historically_similar" | "preceded" | "destabilized" | "stabilized" | string;
+  weight: number;
+  depth?: number;
+};
+
+export type AnomalyLineage = {
+  id: number;
+  root: AnomalyNode | null;
+  parents: AnomalyNode[][];
+  descendants: AnomalyNode[][];
+  edges: AnomalyEdge[];
+  lineage_depth: number;
+  neighborhood_size: number;
+};
+
+export async function getAnomalyLineage(anomaly_id: number, depth = 3) {
+  return request<AnomalyLineage>(`/liquidity/research/anomaly-lineage/${anomaly_id}?depth=${depth}`);
+}
+
+export type MemoryGraph = {
+  nodes: AnomalyNode[];
+  edges: AnomalyEdge[];
+  edge_counts_by_kind: Record<string, number>;
+};
+
+export async function getMemoryGraph(limit_nodes = 100) {
+  return request<MemoryGraph>(`/liquidity/research/memory-graph?limit_nodes=${limit_nodes}`);
+}
+
+export type CrisisEvolutionState = {
+  state: string;
+  persist_count: number;
+  escalate_count: number;
+  stabilize_count: number;
+  total_transitions: number;
+  escalation_prob: number;
+  stabilization_prob: number;
+};
+
+export type CrisisEvolution = {
+  since_ms: number;
+  states: CrisisEvolutionState[];
+  tree: { from_state: string; to_state: string; count: number }[];
+};
+
+export async function getCrisisEvolutionTree(lookback_days = 30) {
+  return request<CrisisEvolution>(`/liquidity/research/crisis-evolution-tree?lookback_days=${lookback_days}`);
+}
+
+export type RegimeAncestry = {
+  since_ms: number;
+  nodes: { regime: string; count: number }[];
+  edges: { parent_regime: string; child_regime: string; weight: number }[];
+  dominant_lineage: string[];
+};
+
+export async function getRegimeAncestry(lookback_days = 30) {
+  return request<RegimeAncestry>(`/liquidity/research/regime-ancestry?lookback_days=${lookback_days}`);
+}
+
+export type EdgeLineage = {
+  kind: string;
+  since_ms: number;
+  bucket_days: number;
+  series: { bucket_ts: number; precision: number | null; total: number }[];
+  phases: { phase: "STRENGTHENING" | "DEGRADATION" | "INVERTED" | "STEADY" | string; start_ts: number; end_ts: number }[];
+  origin_ts: number | null;
+};
+
+export async function getEdgeLineage(kind: string, opts: { lookback_days?: number; bucket_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.bucket_days != null) usp.set("bucket_days", String(opts.bucket_days));
+  return request<EdgeLineage>(`/liquidity/research/edge-lineage/${encodeURIComponent(kind)}${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type IntelligenceSnapshotRow = {
+  ts_ms: number;
+  synthesized_stress: number | null;
+  coordinated_state: string | null;
+  cross_layer_agreement: number | null;
+  structural_break_score: number | null;
+  meta_confidence_score: number | null;
+  meta_intelligence_health: number | null;
+  health_state: string | null;
+  risk_state_score: number | null;
+  regime_shift_probability: number | null;
+  dominant_regime: string | null;
+};
+
+export type IntelligenceHistory = { since_ms: number | null; count: number; series: IntelligenceSnapshotRow[] };
+
+export async function getIntelligenceHistory(since_ms?: number, limit = 500) {
+  const usp = new URLSearchParams({ limit: String(limit) });
+  if (since_ms != null) usp.set("since_ms", String(since_ms));
+  return request<IntelligenceHistory>(`/liquidity/research/intelligence-history?${usp.toString()}`);
+}
+
+export type CycleRun = {
+  phase: string;
+  start_ts: number;
+  end_ts: number;
+  duration_ms: number;
+  open?: boolean;
+};
+
+export type MarketCycle = {
+  since_ms: number;
+  runs: CycleRun[];
+  current_phase: string | null;
+  avg_duration_ms_per_phase: Record<string, number | null>;
+  transition_matrix: { from_phase: string; to_phase: string; count: number; probability: number }[];
+};
+
+export async function getMarketCycle(lookback_days = 60) {
+  return request<MarketCycle>(`/liquidity/research/market-cycle?lookback_days=${lookback_days}`);
+}
+
+export type NarrativeChronicle = {
+  since_ms: number;
+  summary: string;
+  highlights: string[];
+  anomaly_count: number;
+  anomaly_counts_by_kind?: Record<string, number>;
+  first_state?: string | null;
+  last_state?: string | null;
+};
+
+export async function getNarrativeChronicle(lookback_days = 21) {
+  return request<NarrativeChronicle>(`/liquidity/research/narrative-chronicle?lookback_days=${lookback_days}`);
+}
