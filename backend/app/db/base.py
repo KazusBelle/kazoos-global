@@ -7,8 +7,38 @@ from ..core.config import get_settings
 
 
 _settings = get_settings()
-engine = create_engine(_settings.database_url, pool_pre_ping=True, future=True)
+# Explicit pool config — defaults (5 + 10 overflow, no timeout) were sized
+# for snappy CRUD and starve under heavy research endpoints. Sized for the
+# audit's worst case: ~10 simultaneous Coordination/Discovery tabs each
+# holding one session for the duration of an uncached heavy call.
+#   pool_size=20      base connections held open
+#   max_overflow=20   burst capacity above pool_size
+#   pool_timeout=10   fail fast (10s) instead of stacking client waits
+#   pool_recycle=1800 reset connections every 30 min to dodge stale TCP
+#   pool_pre_ping     verify the connection is alive before checkout
+engine = create_engine(
+    _settings.database_url,
+    pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=20,
+    pool_timeout=10,
+    pool_recycle=1800,
+    future=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+def pool_status() -> dict:
+    """Snapshot of the pool — exposed via /admin/runtime-health for ops
+    visibility. ``checked_out`` ≈ active concurrent users; sustained high
+    values are the early-warning sign of pool exhaustion."""
+    pool = engine.pool
+    return {
+        "size": pool.size(),
+        "checked_in": pool.checkedin(),
+        "checked_out": pool.checkedout(),
+        "overflow": pool.overflow(),
+    }
 
 
 def get_db():

@@ -18,12 +18,80 @@ Design rules:
 
 from __future__ import annotations
 
+import functools
 import math
+import threading
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+
+# ── TTL-cache for heavy research functions ──────────────────────────────
+#
+# Background: production audit on 2026-05-23 found that `intelligence_synthesis`
+# (~30s/call) was being polled every 30s from Coordination.tsx, single tab
+# saturating the DB pool. `sanity_audit` was also calling several heavy
+# functions on every 60s polling cycle. Wrapping the heavy functions in a
+# per-process TTL cache eliminates 95%+ of the redundant work because the
+# windows under analysis (7-30 days of history) don't move meaningfully in
+# 5 minutes — staleness up to TTL_RESEARCH_S is invisible to operators.
+#
+# Invalidation is purely time-based: there is no write path that needs to
+# punch the cache, since these are read-only aggregates. If a fresher read
+# is ever needed, callers can lower the TTL per-call or bypass the wrapper.
+
+TTL_RESEARCH_S = 300.0  # 5 minutes — well above polling cadences
+
+_cache_lock = threading.Lock()
+_cache_stats: Dict[str, Dict[str, int]] = {}  # fn → {hits, misses}
+
+
+def _ttl_cached(ttl_seconds: float = TTL_RESEARCH_S) -> Callable:
+    """Decorator: wrap a research function so the result is cached per
+    non-Session args for ``ttl_seconds``. The first positional arg is
+    assumed to be ``db: Session`` and is excluded from the cache key.
+
+    Thread-safe but not stampede-proof — two concurrent misses will both
+    compute and the later write wins. At our polling cadences (30-60s)
+    this is acceptable; if synthesis ever attracts genuine fan-out, swap
+    in a per-key lock or single-flight wrapper.
+    """
+    def decorator(fn: Callable) -> Callable:
+        cache: Dict[Tuple, Tuple[float, Any]] = {}
+        name = fn.__name__
+        _cache_stats[name] = {"hits": 0, "misses": 0}
+
+        @functools.wraps(fn)
+        def wrapper(db: Session, *args, **kwargs):
+            try:
+                key = (args, tuple(sorted(kwargs.items())))
+            except TypeError:
+                # un-hashable kwarg — bypass cache
+                return fn(db, *args, **kwargs)
+            now = time.time()
+            with _cache_lock:
+                entry = cache.get(key)
+                if entry and entry[0] > now:
+                    _cache_stats[name]["hits"] += 1
+                    return entry[1]
+                _cache_stats[name]["misses"] += 1
+            value = fn(db, *args, **kwargs)
+            with _cache_lock:
+                cache[key] = (now + ttl_seconds, value)
+            return value
+
+        wrapper._cache = cache  # type: ignore[attr-defined]  # exposed for inspection
+        wrapper._cached_fn = fn  # type: ignore[attr-defined]  # for bypass when needed
+        return wrapper
+    return decorator
+
+
+def cache_stats() -> Dict[str, Dict[str, int]]:
+    """Return per-function {hits, misses} counters for the admin/runtime
+    health endpoint. Cheap snapshot — no lock held while reading."""
+    return {k: dict(v) for k, v in _cache_stats.items()}
 
 
 # ── Metric set used by the analytics ─────────────────────────────────────
@@ -5308,7 +5376,9 @@ def sanity_audit(db: Session) -> dict:
 
     # ── 6) Pattern explosion (existing, enriched) ─────────────────────
     try:
-        pdisc = discover_patterns(db, since_ms=now_ms - 14 * H24, min_support=8)
+        # Round to 5-min granularity so the cache key matches across polls.
+        pdisc_since = ((now_ms - 14 * H24) // (5 * 60_000)) * (5 * 60_000)
+        pdisc = discover_patterns(db, since_ms=pdisc_since, min_support=8)
         n_patterns = len(pdisc.get("patterns") or [])
         f = _classify_finding(
             kind="pattern_explosion",
@@ -5482,3 +5552,28 @@ def sanity_audit(db: Session) -> dict:
         "findings": findings,
         "check_count": 10,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Heavy-function TTL wrapping
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Applied AFTER all definitions so internal callers (e.g. sanity_audit's
+# calls to propagation_graph / discover_patterns / hidden_regimes /
+# intelligence_evolution_forecast) automatically hit the cache too.
+# Function lookups are resolved at call time, not def time, so rebinding
+# the names at module level transparently redirects every caller.
+
+intelligence_synthesis = _ttl_cached(300.0)(intelligence_synthesis)  # 30s baseline → ~50ms cached
+propagation_graph = _ttl_cached(300.0)(propagation_graph)
+discover_patterns = _ttl_cached(300.0)(discover_patterns)
+intelligence_evolution_forecast = _ttl_cached(300.0)(intelligence_evolution_forecast)
+hidden_regimes = _ttl_cached(300.0)(hidden_regimes)
+multi_horizon = _ttl_cached(300.0)(multi_horizon)
+adaptation_recommendations = _ttl_cached(300.0)(adaptation_recommendations)
+evolutionary_behavior = _ttl_cached(300.0)(evolutionary_behavior)
+# sanity_audit caches itself too — it composes 5 of the above + several
+# SQL reads, and its UI polling is 60s. 30s TTL gives the operator a
+# fresh view on the next polling cycle without paying the full cost
+# every minute.
+sanity_audit = _ttl_cached(30.0)(sanity_audit)

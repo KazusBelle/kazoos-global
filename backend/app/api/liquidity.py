@@ -2737,6 +2737,10 @@ async def pattern_discovery_endpoint(
 ) -> PatternDiscoveryOut:
     if since_ms is None:
         since_ms = int(time.time() * 1000) - 14 * 24 * 3600 * 1000
+        # Round to 5-minute granularity so the discover_patterns TTL cache
+        # actually hits on subsequent polls — without this, since_ms drifts
+        # with wall clock and every call recomputes (~400ms).
+        since_ms = (since_ms // (5 * 60_000)) * (5 * 60_000)
     return PatternDiscoveryOut(**_research.discover_patterns(
         db, since_ms=since_ms, min_support=min_support, bucket_minutes=bucket_minutes,
     ))
@@ -2996,3 +3000,22 @@ async def sanity_audit_endpoint(
     _user: User = Depends(get_current_user),
 ) -> SanityAuditOut:
     return SanityAuditOut(**_research.sanity_audit(db))
+
+
+class RuntimeHealthOut(BaseModel):
+    pool: dict
+    research_cache: dict
+
+
+@router.get("/admin/runtime-health", response_model=RuntimeHealthOut)
+async def runtime_health_endpoint(
+    _user: User = Depends(get_current_user),
+) -> RuntimeHealthOut:
+    """Operational visibility: DB pool occupancy + research-function cache
+    hit/miss counters. Used to verify that the P0 caching/pool fixes are
+    actually doing their job in production."""
+    from ..db.base import pool_status
+    return RuntimeHealthOut(
+        pool=pool_status(),
+        research_cache=_research.cache_stats(),
+    )
