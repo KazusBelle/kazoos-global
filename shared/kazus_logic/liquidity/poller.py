@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import httpx
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from . import REGISTRY
@@ -184,6 +185,69 @@ async def prune_old(db_factory, retention_days: int = RETENTION_DAYS) -> int:
     return int(deleted or 0)
 
 
+# Retention horizons for the slow-growth research tables. Picked from the
+# 2026-05-23 audit:
+#   - alert_history: ~700/day → ~250K/y, 90d ≈ 63K rows (small but
+#     bounded; aggregations need a recent window anyway)
+#   - intelligence_history: 5-min cadence → 288/day max → 90d ≈ 26K rows
+#   - anomaly_memory + anomaly_edges: ~10/day → 180d ≈ 1.8K rows; the
+#     genealogy graph is more valuable than samples but still needs a cap
+#   - crossex_history: ~10/day → 90d ≈ 900 rows
+ALERT_HISTORY_RETENTION_DAYS = 90
+INTELLIGENCE_HISTORY_RETENTION_DAYS = 90
+ANOMALY_RETENTION_DAYS = 180
+CROSSEX_RETENTION_DAYS = 90
+
+
+async def prune_research_tables(db_factory) -> Dict[str, int]:
+    """Prune the slow-growth research tables. Returns per-table deletion
+    counts so the worker can log a single line. Independent of the
+    sample-pruning function so callers can tune cadence separately."""
+    from kazus_db.models import (
+        LiquidityAlertHistory,
+        LiquidityIntelligenceHistory,
+        LiquidityAnomalyMemory,
+        LiquidityCrossExHistory,
+    )
+
+    now_ms = int(time.time() * 1000)
+    H = 86_400_000
+    cutoffs = {
+        "alert_history":        (LiquidityAlertHistory,        "started_at_ms",  now_ms - ALERT_HISTORY_RETENTION_DAYS * H),
+        "intelligence_history": (LiquidityIntelligenceHistory, "ts_ms",          now_ms - INTELLIGENCE_HISTORY_RETENTION_DAYS * H),
+        "anomaly_memory":       (LiquidityAnomalyMemory,       "occurred_at_ms", now_ms - ANOMALY_RETENTION_DAYS * H),
+        "crossex_history":      (LiquidityCrossExHistory,      "ts_ms",          now_ms - CROSSEX_RETENTION_DAYS * H),
+    }
+    deleted: Dict[str, int] = {}
+    with db_factory() as db:  # type: Session
+        for label, (model, ts_col, cutoff) in cutoffs.items():
+            try:
+                n = (
+                    db.query(model)
+                    .filter(getattr(model, ts_col) < cutoff)
+                    .delete(synchronize_session=False)
+                )
+                deleted[label] = int(n or 0)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("prune %s failed: %s", label, exc)
+                deleted[label] = -1
+        # anomaly_edges: prune edges pointing to records that no longer
+        # exist (FK-equivalent cleanup, since we delete anomaly_memory
+        # above without ON DELETE CASCADE).
+        try:
+            n = db.execute(text(
+                "DELETE FROM liquidity_anomaly_edges "
+                "WHERE from_id NOT IN (SELECT id FROM liquidity_anomaly_memory) "
+                "OR to_id NOT IN (SELECT id FROM liquidity_anomaly_memory)"
+            )).rowcount
+            deleted["anomaly_edges"] = int(n or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("prune anomaly_edges failed: %s", exc)
+            deleted["anomaly_edges"] = -1
+        db.commit()
+    return deleted
+
+
 async def loop(db_factory, stop_event: asyncio.Event) -> None:
     """Top-level loop. Polls every POLL_INTERVAL_S, prunes once an hour."""
     last_prune = 0.0
@@ -206,6 +270,13 @@ async def loop(db_factory, stop_event: asyncio.Event) -> None:
                     logger.info("liquidity prune: dropped %d old samples", pruned)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("liquidity prune failed: %s", exc)
+            try:
+                res_pruned = await prune_research_tables(db_factory)
+                non_zero = {k: v for k, v in res_pruned.items() if v}
+                if non_zero:
+                    logger.info("research prune: %s", non_zero)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("research prune failed: %s", exc)
             last_prune = now
 
         wait_s = max(1.0, POLL_INTERVAL_S - (time.monotonic() - t0))

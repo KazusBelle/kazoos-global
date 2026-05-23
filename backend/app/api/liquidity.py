@@ -2853,6 +2853,7 @@ class PropagationOut(BaseModel):
     total_alerts: int
     integrity_score: float = 0.0
     integrity_components: Optional[PropagationIntegrityComponents] = None
+    overloaded: bool = False
 
 
 @router.get("/research/propagation", response_model=PropagationOut)
@@ -3002,20 +3003,125 @@ async def sanity_audit_endpoint(
     return SanityAuditOut(**_research.sanity_audit(db))
 
 
+class WorkerHeartbeat(BaseModel):
+    task: str
+    last_tick_ms: Optional[int] = None
+    seconds_since: Optional[float] = None
+    expected_max_seconds: float
+    state: str  # "live" | "lagging" | "stale" | "dead"
+
+
+class TableSnapshot(BaseModel):
+    table: str
+    rows: int
+    size_bytes: int
+    bytes_per_row: float
+
+
 class RuntimeHealthOut(BaseModel):
     pool: dict
     research_cache: dict
+    worker_heartbeats: List[WorkerHeartbeat]
+    tables: List[TableSnapshot]
+    overall: str  # "ok" | "degraded" | "down"
+
+
+# Each background task surfaces a "freshest output row" we can query to
+# decide whether the task is still ticking. expected_max_seconds is the
+# upper bound for normal operation (cadence × ~2 to absorb skew/restart).
+_HEARTBEAT_PROBES = [
+    # task name, table, ts_column (ms epoch), expected max gap
+    ("liquidity_samples_writer",   "liquidity_samples",              "ts",              60.0),
+    ("intel_snapshot",             "liquidity_intelligence_history", "ts_ms",          900.0),  # 5min × 3
+    ("anomaly_recorder",           "liquidity_anomaly_memory",       "occurred_at_ms", 86400.0),  # slow signal: > 1d gap = suspicious
+    ("alert_history_writer",       "liquidity_alert_history",        "started_at_ms", 86400.0),  # also slow
+]
 
 
 @router.get("/admin/runtime-health", response_model=RuntimeHealthOut)
 async def runtime_health_endpoint(
+    db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> RuntimeHealthOut:
-    """Operational visibility: DB pool occupancy + research-function cache
-    hit/miss counters. Used to verify that the P0 caching/pool fixes are
-    actually doing their job in production."""
+    """Operational visibility for the integrity layer itself. Combines:
+
+      * DB pool occupancy + per-function cache hit/miss counters (P0)
+      * Worker heartbeats by proxy: latest-row queries on the tables each
+        background task writes to. Avoids a dedicated heartbeat table
+        while still detecting task death within one expected cadence.
+      * Per-table row counts + size for the heaviest tables — early
+        warning when prune/aggregation policies start to slip.
+    """
     from ..db.base import pool_status
+
+    now_ms = int(time.time() * 1000)
+    heartbeats: List[WorkerHeartbeat] = []
+    for task, table, col, expected in _HEARTBEAT_PROBES:
+        try:
+            row = db.execute(text(f"SELECT MAX({col}) AS last_ts FROM {table}")).first()
+            last = int(row.last_ts) if row and row.last_ts is not None else None
+        except Exception:  # noqa: BLE001
+            last = None
+        if last is None:
+            heartbeats.append(WorkerHeartbeat(
+                task=task, last_tick_ms=None, seconds_since=None,
+                expected_max_seconds=expected, state="dead",
+            ))
+            continue
+        gap = (now_ms - last) / 1000.0
+        if gap <= expected:
+            state = "live"
+        elif gap <= expected * 3:
+            state = "lagging"
+        else:
+            state = "stale"
+        heartbeats.append(WorkerHeartbeat(
+            task=task, last_tick_ms=last, seconds_since=gap,
+            expected_max_seconds=expected, state=state,
+        ))
+
+    # Top-5 heaviest tables — surface size + row count so the operator
+    # sees retention/aggregation slippage as it happens.
+    tables: List[TableSnapshot] = []
+    try:
+        rows = db.execute(text(
+            """
+            SELECT c.relname AS table_name,
+                   pg_total_relation_size(c.oid) AS size_bytes,
+                   COALESCE(s.n_live_tup, 0) AS rows
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+            WHERE n.nspname = 'public' AND c.relkind = 'r'
+            ORDER BY pg_total_relation_size(c.oid) DESC
+            LIMIT 8
+            """
+        )).fetchall()
+        for r in rows:
+            rows_n = int(r.rows or 0)
+            sz = int(r.size_bytes or 0)
+            tables.append(TableSnapshot(
+                table=r.table_name, rows=rows_n, size_bytes=sz,
+                bytes_per_row=(sz / rows_n) if rows_n > 0 else 0.0,
+            ))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Overall: "down" if any task is stale, "degraded" if any lagging,
+    # else "ok". Heartbeat-by-proxy can have false positives on cold
+    # boot (table never written to yet) — that's why "dead" includes
+    # the case last_ts is None.
+    if any(h.state in ("stale", "dead") for h in heartbeats):
+        overall = "down"
+    elif any(h.state == "lagging" for h in heartbeats):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
     return RuntimeHealthOut(
         pool=pool_status(),
         research_cache=_research.cache_stats(),
+        worker_heartbeats=heartbeats,
+        tables=tables,
+        overall=overall,
     )

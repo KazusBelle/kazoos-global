@@ -44,6 +44,14 @@ def pool_status() -> dict:
 def get_db():
     db = SessionLocal()
     try:
+        # Hard ceiling per request so a pathological query (e.g. a future
+        # propagation reading 1M+ alerts after a cascade) can't hold the
+        # pool connection forever. 45s leaves headroom above the slowest
+        # uncached call observed (synthesis ≈ 30s) but kills runaways.
+        # SET LOCAL scopes to this session only; closing returns it to
+        # the pool with global defaults restored.
+        from sqlalchemy import text as _text
+        db.execute(_text("SET LOCAL statement_timeout = '45s'"))
         yield db
     finally:
         db.close()

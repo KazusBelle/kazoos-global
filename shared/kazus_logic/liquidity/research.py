@@ -4516,6 +4516,19 @@ def propagation_graph(
         {"since": since_ms},
     ).fetchall()
 
+    # Overload guard. Propagation's inner pairing is O(N²) per kind,
+    # so unbounded alert ingress (during a cascade or a tracker bug) can
+    # turn one request into a 60s CPU spike that also poisons the cache.
+    # Hard cap the input and signal degradation in the response so the UI
+    # can flag it instead of silently returning truncated results.
+    OVERLOAD_HARD_CAP = 50_000
+    overloaded = len(rows) > OVERLOAD_HARD_CAP
+    if overloaded:
+        # Keep only the most recent OVERLOAD_HARD_CAP alerts so the
+        # window slides toward "now" rather than truncating arbitrary
+        # heads. Still O(N²) on the cap, but bounded.
+        rows = rows[-OVERLOAD_HARD_CAP:]
+
     by_kind: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
     for r in rows:
         by_kind[r.kind].append((int(r.started_at_ms), r.symbol))
@@ -4746,6 +4759,7 @@ def propagation_graph(
         "integrity_score": integrity_score,
         "integrity_components": integrity_components,
         "all_symmetric_pairs": all_symmetric_pairs,
+        "overloaded": overloaded,
     }
 
 
