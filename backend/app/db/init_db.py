@@ -182,6 +182,66 @@ _ADDITIVE_MIGRATIONS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_server_metrics_created_at ON server_metrics (created_at)",
+    # Phase-17 Pass B: operator persistence tables.
+    """
+    CREATE TABLE IF NOT EXISTS operator_priority_history (
+        id SERIAL PRIMARY KEY,
+        priority_key VARCHAR(192) NOT NULL,
+        source_layer VARCHAR(24) NOT NULL,
+        kind VARCHAR(64) NOT NULL,
+        headline TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        rationale TEXT NOT NULL DEFAULT '',
+        priority_score DOUBLE PRECISION NOT NULL,
+        current_escalation VARCHAR(12) NOT NULL,
+        severity_raw DOUBLE PRECISION NOT NULL DEFAULT 0,
+        confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+        source_weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+        current_lifecycle VARCHAR(16) NOT NULL DEFAULT 'NEW',
+        current_status VARCHAR(12) NOT NULL DEFAULT 'active',
+        first_seen_at_ms BIGINT NOT NULL,
+        last_seen_at_ms BIGINT NOT NULL,
+        resolved_at_ms BIGINT,
+        occurrence_count INTEGER NOT NULL DEFAULT 1,
+        peak_priority_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        peak_escalation VARCHAR(12) NOT NULL DEFAULT 'NORMAL',
+        members_json TEXT,
+        extra_json TEXT,
+        CONSTRAINT uq_operator_priority_history_key UNIQUE (priority_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_operator_priority_history_last_seen ON operator_priority_history (last_seen_at_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_operator_priority_history_status_escalation ON operator_priority_history (current_status, current_escalation)",
+    """
+    CREATE TABLE IF NOT EXISTS operator_priority_events (
+        id SERIAL PRIMARY KEY,
+        ts_ms BIGINT NOT NULL,
+        priority_key VARCHAR(192) NOT NULL,
+        source_layer VARCHAR(24) NOT NULL,
+        event_type VARCHAR(24) NOT NULL,
+        priority_before DOUBLE PRECISION,
+        priority_after DOUBLE PRECISION,
+        escalation_before VARCHAR(12),
+        escalation_after VARCHAR(12),
+        note TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_operator_priority_events_key_ts ON operator_priority_events (priority_key, ts_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_operator_priority_events_ts_type ON operator_priority_events (ts_ms, event_type)",
+    """
+    CREATE TABLE IF NOT EXISTS operator_acknowledgements (
+        id SERIAL PRIMARY KEY,
+        priority_key VARCHAR(192) NOT NULL,
+        action VARCHAR(16) NOT NULL,
+        created_at_ms BIGINT NOT NULL,
+        expires_at_ms BIGINT,
+        user_id INTEGER,
+        note TEXT,
+        active BOOLEAN NOT NULL DEFAULT TRUE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_operator_ack_key_active ON operator_acknowledgements (priority_key, active)",
+    "CREATE INDEX IF NOT EXISTS ix_operator_ack_created ON operator_acknowledgements (created_at_ms)",
 ]
 
 

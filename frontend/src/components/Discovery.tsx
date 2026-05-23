@@ -19,7 +19,11 @@ import {
   getCrisisGenesis,
   getMarketStateTransitions,
   getNarrativeCausality,
+  getOperatorDigest,
+  getOperatorEscalationHistory,
+  getOperatorPriorities,
   getStructuralDependencies,
+  postOperatorAck,
   getEvolutionaryBehavior,
   getHiddenRegimes,
   getIntelligenceForecast,
@@ -31,6 +35,9 @@ import {
   type AdaptationState,
   type CausalEdge,
   type CausalPropagation,
+  type OperatorAckAction,
+  type OperatorDigest,
+  type OperatorEscalationHistory,
   type CausalRole,
   type CausalVerdict,
   type CrisisArchetypes,
@@ -39,6 +46,10 @@ import {
   type CrisisGenesisVerdict,
   type MarketStateTransitions,
   type NarrativeCausality,
+  type OperatorEscalation,
+  type OperatorLifecycle,
+  type OperatorPriorities,
+  type OperatorPriorityItem,
   type TransitionVerdict,
   type StructuralDependencies,
   type DataQuality,
@@ -63,6 +74,7 @@ export function Discovery() {
         </div>
       </div>
 
+      <OperatorPrioritiesPanel />
       <SanityBanner />
       <AdaptationStatePanel />
       <CrisisGenesisPanel />
@@ -324,6 +336,462 @@ function SanityBanner() {
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+// ── Operator Priorities (Phase 17) ──────────────────────────────────────
+
+const ESCALATION_COLOR: Record<OperatorEscalation, string> = {
+  CRITICAL:  "rgba(214, 75, 75, 0.95)",
+  IMPORTANT: "rgba(214, 139, 105, 0.95)",
+  WATCH:     "rgba(227, 180, 87, 0.95)",
+  NORMAL:    "rgba(140, 170, 235, 0.85)",
+};
+
+const LIFECYCLE_LABEL: Record<OperatorLifecycle, string> = {
+  NEW:          "new",
+  WORSENING:    "worsening",
+  STABILIZING:  "stabilizing",
+  PERSISTENT:   "persistent",
+  RESOLVED:     "resolved",
+};
+
+const LIFECYCLE_COLOR: Record<OperatorLifecycle, string> = {
+  NEW:          "rgba(140, 170, 235, 0.95)",
+  WORSENING:    "rgba(214, 105, 105, 0.95)",
+  STABILIZING:  "rgba(82, 185, 122, 0.95)",
+  PERSISTENT:   "rgba(170, 170, 180, 0.85)",
+  RESOLVED:     "rgba(120, 120, 120, 0.75)",
+};
+
+const SOURCE_LAYER_LABEL: Record<string, string> = {
+  sanity:       "integrity",
+  genesis:      "crisis genesis",
+  transitions:  "state transitions",
+  causal:       "causal",
+  structural:   "structural",
+  adaptation:   "adaptation",
+};
+
+const ACK_COLOR: Record<OperatorAckAction, string> = {
+  ack:     "rgba(140, 170, 235, 0.95)",
+  ignore:  "rgba(140, 140, 140, 0.85)",
+  resolve: "rgba(82, 185, 122, 0.95)",
+  mute:    "rgba(227, 180, 87, 0.95)",
+};
+
+function OperatorPriorityItemRow({
+  item,
+  onAction,
+  onHistory,
+  busy,
+}: {
+  item: OperatorPriorityItem;
+  onAction: (key: string, action: OperatorAckAction) => void;
+  onHistory: (key: string) => void;
+  busy: boolean;
+}) {
+  const escColor = ESCALATION_COLOR[item.escalation_state];
+  const lifeColor = LIFECYCLE_COLOR[item.lifecycle];
+  const ack = item.ack ?? null;
+  const tip = [
+    `priority      ${item.priority_score.toFixed(1)}/100  →  ${item.escalation_state}`,
+    `decomposition severity ${item.severity_raw.toFixed(0)} × confidence ${(item.confidence * 100).toFixed(0)}% × recency ${(item.recency * 100).toFixed(0)}% × source_weight ${item.source_weight.toFixed(2)}`,
+    `lifecycle     ${item.lifecycle}${item.priority_delta != null ? ` (Δ ${item.priority_delta > 0 ? "+" : ""}${item.priority_delta.toFixed(1)})` : ""}`,
+    `source        ${item.source_layer} (${item.kind})`,
+    item.occurrence_count != null ? `occurrences   ${item.occurrence_count}` : "",
+    ack ? `ack           ${ack.action.toUpperCase()} at ${new Date(ack.created_at_ms).toISOString().slice(11, 16)}${ack.expires_at_ms ? ` (until ${new Date(ack.expires_at_ms).toISOString().slice(11, 16)})` : ""}` : "",
+    ``,
+    item.detail,
+    item.members.length > 0 ? `\nmembers: ${item.members.join(", ")}` : "",
+  ].filter(Boolean).join("\n");
+  const muted = ack && (ack.action === "ignore" || ack.action === "mute");
+  return (
+    <li className={`rounded border border-border/40 bg-bg/40 px-3 py-2 ${muted ? "opacity-50" : ""}`} title={tip}>
+      <div className="flex items-baseline gap-2 flex-wrap mb-1">
+        <span
+          className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
+          style={{
+            color: escColor,
+            borderColor: escColor.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+            background: escColor.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+            minWidth: "3.4rem",
+            textAlign: "center",
+          }}
+        >
+          {item.priority_score.toFixed(0)}
+        </span>
+        <span className="text-[9px] uppercase tracking-[0.14em]" style={{ color: escColor }}>
+          {item.escalation_state}
+        </span>
+        <span className={`text-[9px] uppercase tracking-[0.14em]`} style={{ color: lifeColor }}>
+          {LIFECYCLE_LABEL[item.lifecycle]}
+          {item.priority_delta != null && Math.abs(item.priority_delta) >= 1 && (
+            <span className="ml-1 tabular-nums">
+              ({item.priority_delta > 0 ? "+" : ""}{item.priority_delta.toFixed(0)})
+            </span>
+          )}
+        </span>
+        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">
+          {SOURCE_LAYER_LABEL[item.source_layer] ?? item.source_layer}
+        </span>
+        {ack && (
+          <span
+            className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+            style={{
+              color: ACK_COLOR[ack.action],
+              borderColor: ACK_COLOR[ack.action].replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+              background: ACK_COLOR[ack.action].replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+            }}
+          >
+            {ack.action}
+          </span>
+        )}
+        {item.occurrence_count != null && item.occurrence_count > 1 && (
+          <span className="text-[9px] text-muted/70">×{item.occurrence_count}</span>
+        )}
+        <div className="ml-auto flex items-center gap-0.5">
+          <button
+            disabled={busy}
+            onClick={() => onAction(item.key, "ack")}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-[#8caaeb] hover:border-[#8caaeb]/50 disabled:opacity-30"
+            title="acknowledge"
+          >ack</button>
+          <button
+            disabled={busy}
+            onClick={() => onAction(item.key, "mute")}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-[#e3b457] hover:border-[#e3b457]/50 disabled:opacity-30"
+            title="mute for 60 min"
+          >mute</button>
+          <button
+            disabled={busy}
+            onClick={() => onAction(item.key, "ignore")}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-400 hover:border-zinc-500 disabled:opacity-30"
+            title="ignore"
+          >ign</button>
+          <button
+            disabled={busy}
+            onClick={() => onAction(item.key, "resolve")}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-[#52b97a] hover:border-[#52b97a]/50 disabled:opacity-30"
+            title="resolve"
+          >res</button>
+          <button
+            onClick={() => onHistory(item.key)}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200 hover:border-zinc-400"
+            title="show escalation history"
+          >hist</button>
+        </div>
+      </div>
+      <div className="text-[12px] text-zinc-200 leading-snug">{item.headline}</div>
+      {item.detail && item.detail !== item.headline && (
+        <div className="text-[10px] text-muted mt-0.5 truncate">{item.detail}</div>
+      )}
+    </li>
+  );
+}
+
+function OperatorHistoryDrawer({
+  data,
+  onClose,
+}: {
+  data: OperatorEscalationHistory;
+  onClose: () => void;
+}) {
+  if (!data.found || data.history == null) {
+    return (
+      <div className="rounded border border-border/40 bg-bg/60 px-3 py-2 text-[11px] text-muted">
+        No persistent history found for {data.priority_key}. <button onClick={onClose} className="text-zinc-300 underline">close</button>
+      </div>
+    );
+  }
+  const h = data.history;
+  return (
+    <div className="rounded border border-border/60 bg-bg/60 px-3 py-2.5 text-[11px]">
+      <div className="flex items-baseline justify-between mb-2">
+        <span className="text-[10px] uppercase tracking-[0.18em] text-zinc-200">
+          history · {h.kind}
+        </span>
+        <button onClick={onClose} className="text-[10px] text-muted hover:text-zinc-300">close</button>
+      </div>
+      <div className="text-zinc-300 mb-2">{h.headline}</div>
+      <div className="text-[10px] text-muted mb-3 font-mono">
+        status {h.current_status} · escalation {h.current_escalation} (peak {h.peak_escalation} at {h.peak_priority_score.toFixed(0)}) · {h.occurrence_count}×
+        <br />
+        first {new Date(h.first_seen_at_ms).toISOString().slice(0, 16)} · last {new Date(h.last_seen_at_ms).toISOString().slice(0, 16)}
+        {h.resolved_at_ms && <> · resolved {new Date(h.resolved_at_ms).toISOString().slice(0, 16)}</>}
+      </div>
+      {data.events.length === 0 ? (
+        <div className="text-[10px] text-muted">No events recorded.</div>
+      ) : (
+        <ul className="space-y-1 font-mono text-[10px]">
+          {data.events.map((e, i) => (
+            <li key={i} className="text-muted">
+              <span className="text-zinc-400 mr-2">{new Date(e.ts_ms).toISOString().slice(11, 19)}</span>
+              <span className="text-zinc-300 mr-2">{e.event_type}</span>
+              {e.priority_before != null && e.priority_after != null && (
+                <span className="mr-2">{e.priority_before.toFixed(0)} → {e.priority_after.toFixed(0)}</span>
+              )}
+              {e.escalation_before && e.escalation_after && e.escalation_before !== e.escalation_after && (
+                <span className="mr-2">{e.escalation_before} → {e.escalation_after}</span>
+              )}
+              {e.note && <span className="text-zinc-300">{e.note}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {data.acknowledgements.length > 0 && (
+        <div className="mt-3 pt-2 border-t border-border/40">
+          <div className="text-[9px] uppercase tracking-[0.18em] text-muted mb-1">ack history</div>
+          <ul className="space-y-0.5 font-mono text-[10px] text-muted">
+            {data.acknowledgements.map((a, i) => (
+              <li key={i}>
+                <span className={a.active ? "text-zinc-300" : "text-zinc-500"}>
+                  {a.action.toUpperCase()}
+                </span>
+                <span className="ml-2">{new Date(a.created_at_ms).toISOString().slice(11, 19)}</span>
+                {a.expires_at_ms && <span className="ml-2">until {new Date(a.expires_at_ms).toISOString().slice(11, 19)}</span>}
+                {!a.active && <span className="ml-2 text-zinc-600">[superseded]</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+type DigestWindow = 1 | 6 | 24;
+
+function OperatorDigestBlock() {
+  const [window, setWindow] = useState<DigestWindow>(24);
+  const [data, setData] = useState<OperatorDigest | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setData(null);
+    getOperatorDigest(window)
+      .then((d) => { if (!cancelled) setData(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [window]);
+
+  return (
+    <div className="rounded border border-border/40 bg-bg/40 px-3 py-2.5 mt-3">
+      <div className="flex items-baseline gap-2 mb-2">
+        <span className="text-[10px] uppercase tracking-[0.18em] text-muted">digest</span>
+        <div className="flex gap-1">
+          {[1, 6, 24].map((w) => (
+            <button
+              key={w}
+              onClick={() => setWindow(w as DigestWindow)}
+              className={`h-5 px-1.5 rounded border text-[9px] uppercase tracking-[0.14em] ${
+                window === w ? "border-accent text-accent bg-accent/10" : "border-border text-muted hover:text-zinc-200"
+              }`}
+            >{w}h</button>
+          ))}
+        </div>
+        {data && (
+          <span className="text-[10px] text-muted ml-2 truncate flex-1">{data.summary}</span>
+        )}
+      </div>
+      {data && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px] font-mono">
+          {[
+            { title: "new", items: data.new, color: LIFECYCLE_COLOR.NEW },
+            { title: "worsened", items: data.worsened, color: LIFECYCLE_COLOR.WORSENING },
+            { title: "stabilized", items: data.stabilized, color: LIFECYCLE_COLOR.STABILIZING },
+            { title: "resolved", items: data.resolved, color: LIFECYCLE_COLOR.RESOLVED },
+            { title: "reappeared", items: data.reappeared, color: ESCALATION_COLOR.WATCH },
+          ].filter((s) => s.items.length > 0).map((s) => (
+            <div key={s.title}>
+              <div className="text-[9px] uppercase tracking-[0.18em] mb-1" style={{ color: s.color }}>
+                {s.title} ({s.items.length})
+              </div>
+              <ul className="space-y-0.5 text-[10px] text-zinc-300">
+                {s.items.slice(0, 6).map((it) => (
+                  <li key={it.priority_key} className="truncate">{it.headline}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+      {data && data.new.length === 0 && data.worsened.length === 0 && data.stabilized.length === 0 && data.resolved.length === 0 && data.reappeared.length === 0 && (
+        <div className="text-[11px] text-muted">No material changes in the last {window}h.</div>
+      )}
+    </div>
+  );
+}
+
+function OperatorPrioritiesPanel() {
+  const [data, setData] = useState<OperatorPriorities | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [historyKey, setHistoryKey] = useState<string | null>(null);
+  const [historyData, setHistoryData] = useState<OperatorEscalationHistory | null>(null);
+  const [showFilter, setShowFilter] = useState<"active" | "all" | "acked">("active");
+
+  const refresh = () =>
+    getOperatorPriorities()
+      .then(setData)
+      .catch((e) => setError(e?.message ?? "failed"));
+
+  useEffect(() => {
+    refresh();
+    const id = window.setInterval(refresh, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const handleAction = async (key: string, action: OperatorAckAction) => {
+    setBusyKey(key);
+    try {
+      await postOperatorAck(key, { action, mute_minutes: action === "mute" ? 60 : undefined });
+      await refresh();
+    } catch (e: any) {
+      console.error("ack failed", e);
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleHistory = async (key: string) => {
+    if (historyKey === key) {
+      setHistoryKey(null);
+      setHistoryData(null);
+      return;
+    }
+    setHistoryKey(key);
+    setHistoryData(null);
+    try {
+      const h = await getOperatorEscalationHistory(key, 50);
+      setHistoryData(h);
+    } catch (e: any) {
+      console.error("history fetch failed", e);
+    }
+  };
+
+  if (error) return null;
+  if (!data) return null;
+
+  const ec = data.escalation_counts ?? {};
+  const nCritical = ec.CRITICAL ?? 0;
+  const nImportant = ec.IMPORTANT ?? 0;
+  const nWatch = ec.WATCH ?? 0;
+  const nNormal = ec.NORMAL ?? 0;
+
+  const overallColor =
+    nCritical > 0 ? ESCALATION_COLOR.CRITICAL :
+    nImportant > 0 ? ESCALATION_COLOR.IMPORTANT :
+    nWatch > 0 ? ESCALATION_COLOR.WATCH :
+    "rgba(82, 185, 122, 0.85)";
+
+  return (
+    <div
+      className="rounded-lg border bg-panel/70 px-3 py-3"
+      style={{ borderColor: overallColor.replace(/0\.95\)$|0\.85\)$/, "0.55)") }}
+    >
+      <div className="flex items-baseline gap-3 mb-2.5 flex-wrap">
+        <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: overallColor }}>
+          ● operator queue
+        </span>
+        <span className="text-[10px] uppercase tracking-[0.2em] text-muted flex-1">
+          {data.summary}
+        </span>
+        <div className="text-[9px] uppercase tracking-[0.16em] flex gap-2 items-baseline">
+          {nCritical > 0 && <span style={{ color: ESCALATION_COLOR.CRITICAL }}>{nCritical} crit</span>}
+          {nImportant > 0 && <span style={{ color: ESCALATION_COLOR.IMPORTANT }}>{nImportant} imp</span>}
+          {nWatch > 0 && <span style={{ color: ESCALATION_COLOR.WATCH }}>{nWatch} watch</span>}
+          {nNormal > 0 && <span className="text-muted">{nNormal} normal</span>}
+        </div>
+      </div>
+
+      {data.narrative_headline && (
+        <div className="text-[10px] text-muted leading-snug mb-2 italic">
+          “{data.narrative_headline}”
+        </div>
+      )}
+
+      <div className="flex items-baseline gap-2 mb-2 text-[9px] uppercase tracking-[0.14em]">
+        <span className="text-muted">show:</span>
+        {(["active", "acked", "all"] as const).map((f) => (
+          <button
+            key={f}
+            onClick={() => setShowFilter(f)}
+            className={`px-1.5 py-0.5 rounded border ${
+              showFilter === f ? "border-accent text-accent" : "border-border/50 text-muted hover:text-zinc-200"
+            }`}
+          >{f}</button>
+        ))}
+      </div>
+
+      {(() => {
+        const filtered = data.items.filter((it) => {
+          if (showFilter === "all") return true;
+          if (showFilter === "acked") return it.ack != null;
+          // "active": exclude resolved + items that are ignored/muted+expired
+          return it.ack?.action !== "resolve" && !(it.ack?.action === "ignore");
+        });
+        if (filtered.length === 0) {
+          return (
+            <div className="text-xs text-muted">
+              {showFilter === "active"
+                ? "Nothing active above the priority floor (try 'all' to see ignored/muted)."
+                : showFilter === "acked"
+                ? "No acknowledged items right now."
+                : "Operator queue empty."}
+            </div>
+          );
+        }
+        return (
+          <ul className="space-y-1.5">
+            {filtered.map((it) => (
+              <OperatorPriorityItemRow
+                key={it.key}
+                item={it}
+                onAction={handleAction}
+                onHistory={handleHistory}
+                busy={busyKey === it.key}
+              />
+            ))}
+          </ul>
+        );
+      })()}
+
+      {historyKey && historyData && (
+        <div className="mt-3">
+          <OperatorHistoryDrawer
+            data={historyData}
+            onClose={() => { setHistoryKey(null); setHistoryData(null); }}
+          />
+        </div>
+      )}
+
+      {data.filtered_count > 0 && (
+        <div className="text-[10px] text-muted mt-2.5">
+          + {data.filtered_count} more item(s) below the attention budget ({data.attention_budget}).
+        </div>
+      )}
+
+      {data.resolved.length > 0 && (
+        <div className="mt-3 pt-2.5 border-t border-border/40">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-muted mb-1.5">
+            recently resolved
+          </div>
+          <ul className="space-y-1 text-[11px] font-mono text-muted">
+            {data.resolved.map((r) => (
+              <li key={r.key} className="truncate">
+                <span className="text-[9px] uppercase tracking-[0.14em] mr-2" style={{ color: LIFECYCLE_COLOR.RESOLVED }}>
+                  resolved
+                </span>
+                {r.headline}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <OperatorDigestBlock />
     </div>
   );
 }

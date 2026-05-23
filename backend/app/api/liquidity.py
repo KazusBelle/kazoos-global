@@ -3305,6 +3305,200 @@ async def adapted_recommendations_endpoint(
     return AdaptedRecsOut(**_research.adapted_recommendations(db, lookback_days=lookback_days))
 
 
+class OperatorAck(BaseModel):
+    action: str    # ack | ignore | resolve | mute
+    created_at_ms: int
+    expires_at_ms: Optional[int] = None
+    note: Optional[str] = None
+
+
+class OperatorPriorityItem(BaseModel):
+    key: str
+    source_layer: str   # sanity | genesis | transitions | causal | structural | adaptation
+    kind: str
+    headline: str
+    detail: str
+    rationale: str
+    severity_raw: float
+    confidence: float
+    recency: float
+    source_weight: float
+    priority_score: float
+    escalation_state: str  # NORMAL | WATCH | IMPORTANT | CRITICAL
+    lifecycle: str         # NEW | WORSENING | STABILIZING | PERSISTENT | RESOLVED
+    priority_delta: Optional[float] = None
+    members: List[str] = []
+    extra: dict = {}
+    # Pass-B persistence fields.
+    first_seen_at_ms: Optional[int] = None
+    occurrence_count: Optional[int] = None
+    ack: Optional[OperatorAck] = None
+
+
+class OperatorPrioritiesOut(BaseModel):
+    fetched_at_ms: int
+    lookback_days: int
+    attention_budget: int
+    snapshot_fresh: bool
+    items: List[OperatorPriorityItem]
+    resolved: List[OperatorPriorityItem]
+    filtered_count: int
+    total_items: int
+    escalation_counts: dict
+    summary: str
+    narrative_headline: Optional[str] = None
+
+
+@router.get("/research/operator-priorities", response_model=OperatorPrioritiesOut)
+async def operator_priorities_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    attention_budget: int = Query(15, ge=3, le=50),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> OperatorPrioritiesOut:
+    return OperatorPrioritiesOut(**_research.operator_priorities(
+        db, lookback_days=lookback_days, attention_budget=attention_budget,
+    ))
+
+
+class OperatorAckRequest(BaseModel):
+    action: str    # ack | ignore | resolve | mute
+    note: Optional[str] = None
+    mute_minutes: Optional[int] = None
+
+
+class OperatorAckResponse(BaseModel):
+    priority_key: str
+    action: str
+    created_at_ms: int
+    expires_at_ms: Optional[int] = None
+    note: Optional[str] = None
+
+
+@router.post("/research/operator-priorities/{priority_key:path}/ack", response_model=OperatorAckResponse)
+async def operator_ack_endpoint(
+    priority_key: str,
+    payload: OperatorAckRequest = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> OperatorAckResponse:
+    """Apply an operator workflow action (ack / ignore / resolve / mute)
+    to a priority_key. NOT a trading action — purely operator workflow."""
+    if payload.action not in ("ack", "ignore", "resolve", "mute"):
+        raise HTTPException(status_code=400, detail=f"unknown action: {payload.action}")
+    try:
+        result = _research.operator_priority_ack(
+            db,
+            priority_key=priority_key,
+            action=payload.action,
+            user_id=user.id,
+            note=payload.note,
+            mute_minutes=payload.mute_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OperatorAckResponse(**result)
+
+
+class OperatorPriorityEventOut(BaseModel):
+    ts_ms: int
+    event_type: str
+    priority_before: Optional[float] = None
+    priority_after: Optional[float] = None
+    escalation_before: Optional[str] = None
+    escalation_after: Optional[str] = None
+    note: Optional[str] = None
+
+
+class OperatorPriorityHistoryRow(BaseModel):
+    source_layer: str
+    kind: str
+    headline: str
+    current_status: str
+    current_escalation: str
+    current_lifecycle: str
+    priority_score: float
+    peak_priority_score: float
+    peak_escalation: str
+    first_seen_at_ms: int
+    last_seen_at_ms: int
+    resolved_at_ms: Optional[int] = None
+    occurrence_count: int
+
+
+class OperatorAckHistoryEntry(BaseModel):
+    action: str
+    created_at_ms: int
+    expires_at_ms: Optional[int] = None
+    note: Optional[str] = None
+    active: bool
+
+
+class OperatorEscalationHistoryOut(BaseModel):
+    priority_key: str
+    found: bool
+    history: Optional[OperatorPriorityHistoryRow] = None
+    events: List[OperatorPriorityEventOut]
+    acknowledgements: List[OperatorAckHistoryEntry]
+
+
+@router.get("/research/operator-priorities/{priority_key:path}/history", response_model=OperatorEscalationHistoryOut)
+async def operator_escalation_history_endpoint(
+    priority_key: str,
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> OperatorEscalationHistoryOut:
+    return OperatorEscalationHistoryOut(**_research.operator_escalation_history(
+        db, priority_key=priority_key, limit=limit,
+    ))
+
+
+class OperatorDigestEntry(BaseModel):
+    priority_key: str
+    headline: str
+    source_layer: str
+    event_type: str
+    ts_ms: int
+    priority_before: Optional[float] = None
+    priority_after: Optional[float] = None
+    escalation_before: Optional[str] = None
+    escalation_after: Optional[str] = None
+    note: Optional[str] = None
+
+
+class OperatorDigestActiveRow(BaseModel):
+    priority_key: str
+    headline: str
+    priority_score: float
+    source_layer: str
+    first_seen_at_ms: int
+
+
+class OperatorDigestOut(BaseModel):
+    window_hours: int
+    since_ms: int
+    fetched_at_ms: int
+    new: List[OperatorDigestEntry]
+    worsened: List[OperatorDigestEntry]
+    stabilized: List[OperatorDigestEntry]
+    resolved: List[OperatorDigestEntry]
+    reappeared: List[OperatorDigestEntry]
+    active_critical: List[OperatorDigestActiveRow]
+    active_important: List[OperatorDigestActiveRow]
+    contributing_layers: dict
+    summary: str
+
+
+@router.get("/research/operator-digest", response_model=OperatorDigestOut)
+async def operator_digest_endpoint(
+    window_hours: int = Query(24, ge=1, le=168),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> OperatorDigestOut:
+    return OperatorDigestOut(**_research.operator_digest(db, window_hours=window_hours))
+
+
 class WorkerHeartbeat(BaseModel):
     task: str
     last_tick_ms: Optional[int] = None

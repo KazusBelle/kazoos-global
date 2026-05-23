@@ -7184,6 +7184,885 @@ def adaptation_state(db: Session, lookback_days: int = 7) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 17 — Execution & Operator Layer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Operator-attention prioritization. Reads from every upstream layer
+# (sanity, crisis_genesis, transitions, causal, structural, adaptation)
+# and emits a single ranked queue with explicit decomposition of why
+# each item ranks where it does. NOT trading signals — operator
+# intelligence only.
+#
+# Design principles:
+#   * Every priority_score has a documented multiplicative decomposition
+#     (severity_raw × confidence × source_weight × recency). No
+#     black-box scoring.
+#   * Items are grouped before scoring to avoid flooding operators with
+#     N nearly-identical findings.
+#   * Lifecycle (NEW/WORSENING/STABILIZING/PERSISTENT/RESOLVED) computed
+#     from an in-memory snapshot diff against the previous call. Window
+#     is the TTL cache lifetime (300s) — anything older is treated as
+#     NEW. After backend restart everything looks NEW, which is honest.
+#   * Attention budget caps the visible queue; filtered-out count is
+#     surfaced so operators know how much they're NOT seeing.
+
+OPERATOR_ATTENTION_BUDGET = 15
+
+# Source weights: items from higher-trust layers get a bigger
+# contribution to priority. Sanity is the most direct signal (the
+# engine flagging its own integrity), then crisis_genesis composite,
+# then individual layer findings.
+_OPERATOR_SOURCE_WEIGHTS: Dict[str, float] = {
+    "sanity":         1.50,
+    "genesis":        1.30,
+    "transitions":    1.00,
+    "structural":     0.80,
+    "causal":         0.70,
+    "adaptation":     0.90,
+}
+
+# Escalation bands: applied to final priority_score (post-multiplication).
+def _operator_escalation(score: float) -> str:
+    if score >= 75: return "CRITICAL"
+    if score >= 50: return "IMPORTANT"
+    if score >= 25: return "WATCH"
+    return "NORMAL"
+
+
+# Phase 17 Pass A used an in-memory snapshot diff. Pass B replaces it
+# with DB-backed history (operator_priority_history) so lifecycle
+# survives restarts and digests / escalation timelines become possible.
+# The thresholds below are how the persistence layer decides what
+# counts as a material change worth logging an event for.
+OPERATOR_DELTA_THRESHOLD = 8.0           # ±8 score change → WORSENING/STABILIZING
+OPERATOR_NEW_WINDOW_MS = 5 * 60_000      # < 5 min since first_seen → still NEW
+OPERATOR_PRIORITY_JUMP_LOG_THRESHOLD = 15.0  # ≥15 jump → log explicit event
+
+
+def _operator_item(
+    *,
+    key: str,
+    source_layer: str,
+    kind: str,
+    headline: str,
+    detail: str,
+    severity_raw: float,
+    confidence: float,
+    recency: float = 1.0,
+    rationale: str = "",
+    members: Optional[List[str]] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    """Build a uniform operator item with explicit score decomposition."""
+    severity_raw = max(0.0, min(100.0, severity_raw))
+    confidence = max(0.0, min(1.0, confidence))
+    recency = max(0.0, min(1.0, recency))
+    source_weight = _OPERATOR_SOURCE_WEIGHTS.get(source_layer, 1.0)
+    priority_score = max(0.0, min(100.0,
+        severity_raw * confidence * recency * source_weight
+    ))
+    return {
+        "key": key,
+        "source_layer": source_layer,
+        "kind": kind,
+        "headline": headline,
+        "detail": detail,
+        "rationale": rationale or (
+            f"severity {severity_raw:.0f} × confidence {confidence * 100:.0f}% × "
+            f"recency {recency * 100:.0f}% × source_weight {source_weight:.2f}"
+        ),
+        "severity_raw": severity_raw,
+        "confidence": confidence,
+        "recency": recency,
+        "source_weight": source_weight,
+        "priority_score": priority_score,
+        "escalation_state": _operator_escalation(priority_score),
+        "members": members or [],
+        "extra": extra or {},
+    }
+
+
+def _operator_extract_sanity(sanity: dict) -> List[dict]:
+    out: List[dict] = []
+    for f in sanity.get("findings") or []:
+        # severity_score is already in [0, 100]
+        severity = float(f.get("severity_score") or 0.0)
+        confidence = {"critical": 1.0, "warn": 0.85, "info": 0.65}.get(f.get("severity") or "info", 0.65)
+        out.append(_operator_item(
+            key=f"sanity:{f['kind']}",
+            source_layer="sanity",
+            kind=f["kind"],
+            headline=f.get("detail", "")[:140],
+            detail=f.get("detail", ""),
+            severity_raw=severity,
+            confidence=confidence,
+            extra={"trend": f.get("trend"), "category": f.get("category")},
+        ))
+    return out
+
+
+def _operator_extract_genesis(genesis: dict) -> List[dict]:
+    out: List[dict] = []
+    verdict = genesis.get("verdict", "INSUFFICIENT")
+    if verdict in ("INSUFFICIENT", "CALM"):
+        return out
+    gen_score = float(genesis.get("genesis_score", 0.0))
+    confidence = float(genesis.get("confidence", 0.0))
+    # One composite item summarizing the verdict.
+    out.append(_operator_item(
+        key="genesis:composite",
+        source_layer="genesis",
+        kind="crisis_genesis_composite",
+        headline=f"Crisis genesis {verdict.lower().replace('_', ' ')} (score {gen_score:.0f})",
+        detail=genesis.get("summary", ""),
+        severity_raw=gen_score,
+        confidence=confidence,
+        extra={"verdict": verdict, "hot_count": genesis.get("hot_count", 0)},
+    ))
+    # Plus one item per HOT probe (these are the actionable signals).
+    for p in genesis.get("probes") or []:
+        if p.get("status") != "hot":
+            continue
+        out.append(_operator_item(
+            key=f"genesis:probe:{p['kind']}",
+            source_layer="genesis",
+            kind=f"genesis_probe_{p['kind']}",
+            headline=f"{p['name']} hot ({p.get('score', 0):.0f}/100)",
+            detail=p.get("rationale", ""),
+            severity_raw=float(p.get("score") or 0.0),
+            confidence=confidence,
+        ))
+    return out
+
+
+def _operator_extract_transitions(tr: dict) -> List[dict]:
+    out: List[dict] = []
+    if tr.get("exploratory"):
+        return out
+
+    # One item per recent ACCELERATING transition (top 3).
+    accelerating = [t for t in (tr.get("transitions") or []) if t.get("verdict") == "ACCELERATING"]
+    for t in accelerating[:3]:
+        accel = t.get("acceleration") or 0.0
+        out.append(_operator_item(
+            key=f"transition:accel:{t['ts_ms']}:{t['from_state']}->{t['to_state']}",
+            source_layer="transitions",
+            kind="accelerating_transition",
+            headline=f"{t['from_state']} → {t['to_state']} accelerating ({accel:+.1f}/tick)",
+            detail=t.get("rationale", ""),
+            severity_raw=min(100.0, abs(accel) * 10.0 + 40.0),
+            confidence=float(t.get("confidence") or 0.0),
+        ))
+
+    # One item for oscillation presence.
+    osc = tr.get("oscillation_periods") or []
+    if osc:
+        out.append(_operator_item(
+            key="transition:oscillation",
+            source_layer="transitions",
+            kind="transition_oscillation",
+            headline=f"{len(osc)} oscillation period(s) — state layer unstable",
+            detail=(
+                f"State changed ≥3 times within 1h on {len(osc)} window(s). "
+                f"Transitions inside oscillation periods are exploratory."
+            ),
+            severity_raw=min(100.0, 50.0 + 15.0 * len(osc)),
+            confidence=0.85,
+        ))
+
+    # High-flicker as its own signal.
+    flicker = float(tr.get("flicker_ratio") or 0.0)
+    if flicker >= 0.25:
+        out.append(_operator_item(
+            key="transition:flicker",
+            source_layer="transitions",
+            kind="transition_flicker",
+            headline=f"State transitions {flicker * 100:.0f}% flicker — engine noisy",
+            detail=f"{tr.get('flicker_count', 0)} of {tr.get('transition_count', 0)} transitions reverted or held briefly.",
+            severity_raw=min(100.0, flicker * 200.0),
+            confidence=0.75,
+        ))
+    return out
+
+
+def _operator_extract_causal(causal: dict) -> List[dict]:
+    """Directional findings are positive signals (we discovered structure),
+    but they still want operator attention because they imply where to
+    look. Weight them lower than failures."""
+    out: List[dict] = []
+    if causal.get("data_quality") in ("INSUFFICIENT", "LOW"):
+        return out
+    counts = causal.get("verdict_counts") or {}
+    directional = counts.get("DIRECTIONAL", 0)
+    if directional == 0:
+        return out
+    top = next((e for e in (causal.get("edges") or []) if e.get("verdict") == "DIRECTIONAL"), None)
+    if top is None:
+        return out
+    headline = (
+        f"{directional} directional lead-lag relationship(s) — "
+        f"strongest {top['from_symbol']} → {top['to_symbol']}"
+    )
+    out.append(_operator_item(
+        key="causal:directional_summary",
+        source_layer="causal",
+        kind="causal_directional",
+        headline=headline,
+        detail=top.get("rationale", ""),
+        severity_raw=50.0,  # informational discovery — not a failure
+        confidence=float(top.get("causal_confidence") or 0.0),
+    ))
+    return out
+
+
+def _operator_extract_structural(sd: dict) -> List[dict]:
+    out: List[dict] = []
+    if sd.get("exploratory"):
+        return out
+
+    drivers = sd.get("dominant_drivers") or []
+    if drivers:
+        top = drivers[0]
+        out.append(_operator_item(
+            key=f"structural:dominant:{top['symbol']}",
+            source_layer="structural",
+            kind="dominant_driver",
+            headline=(
+                f"{top['symbol']} dominant driver — reaches "
+                f"{top['reach_size']} symbol(s) within 3 hops"
+            ),
+            detail=top.get("rationale", ""),
+            severity_raw=min(100.0, 30.0 + top["reach_size"] * 5.0),
+            confidence=float(top.get("avg_out_confidence") or 0.0),
+        ))
+
+    clusters = sd.get("dependency_clusters") or []
+    if clusters:
+        top_c = clusters[0]
+        out.append(_operator_item(
+            key=f"structural:cluster:{top_c['driver']}",
+            source_layer="structural",
+            kind="dependency_cluster",
+            headline=(
+                f"Co-driver cluster — {top_c['driver']} mediates "
+                f"{top_c['size']} symbol(s)"
+            ),
+            detail=top_c.get("rationale", ""),
+            severity_raw=min(100.0, 30.0 + top_c["size"] * 3.0),
+            confidence=0.7,
+            members=top_c.get("members") or [],
+        ))
+    return out
+
+
+def _operator_extract_adaptation(adapt: dict) -> List[dict]:
+    out: List[dict] = []
+    modifiers = adapt.get("modifiers") or {}
+    audit = {a["layer"]: a for a in (adapt.get("audit_trail") or [])}
+    for name, value in modifiers.items():
+        if abs(value - 1.0) < 1e-9:
+            continue
+        # Severity: how far the modifier moved from neutral, normalized
+        # to 0-100. ±0.50 from neutral → 100.
+        severity_raw = min(100.0, abs(value - 1.0) * 200.0)
+        entry = audit.get(name)
+        out.append(_operator_item(
+            key=f"adaptation:{name}",
+            source_layer="adaptation",
+            kind=f"adaptation_modifier_{name}",
+            headline=f"Adaptation: {name.replace('_modifier', '').replace('_', ' ')} ×{value:.2f}",
+            detail=entry["reason"] if entry else "",
+            severity_raw=severity_raw,
+            confidence=float(entry["input_confidence"]) if entry else 0.7,
+        ))
+    return out
+
+
+def _operator_group_related(items: List[dict]) -> List[dict]:
+    """Group items with the same (source_layer, kind) by collapsing into
+    one entry with member list + count. Keeps single occurrences as-is."""
+    by_key: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    for item in items:
+        by_key[(item["source_layer"], item["kind"])].append(item)
+    grouped: List[dict] = []
+    for (layer, kind), members in by_key.items():
+        if len(members) == 1:
+            grouped.append(members[0])
+            continue
+        # Aggregate: take max severity, mean confidence, sum members.
+        top = max(members, key=lambda m: m["priority_score"])
+        agg = dict(top)
+        agg["headline"] = f"{len(members)} × {top['kind']}"
+        agg["detail"] = " | ".join(m["headline"] for m in members[:3])
+        agg["members"] = [m["headline"] for m in members]
+        agg["extra"] = {**top.get("extra", {}), "group_count": len(members)}
+        grouped.append(agg)
+    return grouped
+
+
+def operator_priorities(
+    db: Session,
+    lookback_days: int = 7,
+    attention_budget: int = OPERATOR_ATTENTION_BUDGET,
+) -> dict:
+    """Build the operator attention queue from all upstream layers and
+    persist it to operator_priority_history.
+
+    The DB-backed history replaces Pass A's in-memory snapshot:
+      * lifecycle survives restarts
+      * digests / escalation timelines become queryable
+      * acknowledgement state can be joined per row
+
+    On each call:
+      1. Compute current items from upstream layers
+      2. UPSERT into history (track first_seen / last_seen / peak)
+      3. For each material change, append an event row
+      4. Items that disappeared from this run → mark resolved
+      5. Join acknowledgements for the response
+    """
+    import json as _json
+    from kazus_db.models import (
+        OperatorPriorityHistory,
+        OperatorPriorityEvent,
+        OperatorAcknowledgement,
+    )
+    now_ms = int(time.time() * 1000)
+
+    # Collect upstream surfaces (all cached).
+    sanity_r = sanity_audit(db)
+    genesis_r = crisis_genesis(db, lookback_days=lookback_days)
+    transitions_r = market_state_transitions(db, lookback_days=lookback_days)
+    causal_r = causal_propagation(db, lookback_days=lookback_days)
+    structural_r = structural_dependencies(db, lookback_days=lookback_days)
+    adapt_r = adaptation_state(db, lookback_days=lookback_days)
+    narrative_r = narrative_causality(db, lookback_days=lookback_days)
+
+    # Extract per-source items.
+    items: List[dict] = []
+    items += _operator_extract_sanity(sanity_r)
+    items += _operator_extract_genesis(genesis_r)
+    items += _operator_extract_transitions(transitions_r)
+    items += _operator_extract_causal(causal_r)
+    items += _operator_extract_structural(structural_r)
+    items += _operator_extract_adaptation(adapt_r)
+
+    # Group + sort by priority_score desc.
+    grouped = _operator_group_related(items)
+    grouped.sort(key=lambda i: -i["priority_score"])
+
+    # ── Lifecycle diff via operator_priority_history ─────────────────
+    current_keys: set = {item["key"] for item in grouped}
+
+    # Load all currently-active history rows + every row for our current
+    # keys (some may be 'resolved' and are reappearing).
+    existing_rows = (
+        db.query(OperatorPriorityHistory)
+        .filter(
+            (OperatorPriorityHistory.current_status == "active")
+            | (OperatorPriorityHistory.priority_key.in_(list(current_keys)) if current_keys else False)
+        )
+        .all()
+    )
+    existing_by_key: Dict[str, OperatorPriorityHistory] = {
+        r.priority_key: r for r in existing_rows
+    }
+
+    events_to_log: List[OperatorPriorityEvent] = []
+
+    for item in grouped:
+        key = item["key"]
+        score = item["priority_score"]
+        escalation = item["escalation_state"]
+        row = existing_by_key.get(key)
+
+        if row is None:
+            # First time we see this key — INSERT row + log first_seen.
+            members_json = _json.dumps(item.get("members") or []) if item.get("members") else None
+            extra_json = _json.dumps(item.get("extra") or {}) if item.get("extra") else None
+            row = OperatorPriorityHistory(
+                priority_key=key,
+                source_layer=item["source_layer"],
+                kind=item["kind"],
+                headline=item["headline"],
+                detail=item["detail"],
+                rationale=item["rationale"],
+                priority_score=score,
+                current_escalation=escalation,
+                severity_raw=item["severity_raw"],
+                confidence=item["confidence"],
+                source_weight=item["source_weight"],
+                current_lifecycle="NEW",
+                current_status="active",
+                first_seen_at_ms=now_ms,
+                last_seen_at_ms=now_ms,
+                resolved_at_ms=None,
+                occurrence_count=1,
+                peak_priority_score=score,
+                peak_escalation=escalation,
+                members_json=members_json,
+                extra_json=extra_json,
+            )
+            db.add(row)
+            events_to_log.append(OperatorPriorityEvent(
+                ts_ms=now_ms, priority_key=key,
+                source_layer=item["source_layer"], event_type="first_seen",
+                priority_after=score, escalation_after=escalation,
+                note=item["headline"][:240],
+            ))
+            item["lifecycle"] = "NEW"
+            item["priority_delta"] = None
+            item["first_seen_at_ms"] = now_ms
+            item["occurrence_count"] = 1
+        else:
+            prev_score = row.priority_score
+            prev_escalation = row.current_escalation
+            prev_status = row.current_status
+            delta = score - prev_score
+
+            # Resolved row coming back?
+            if prev_status == "resolved":
+                events_to_log.append(OperatorPriorityEvent(
+                    ts_ms=now_ms, priority_key=key,
+                    source_layer=item["source_layer"], event_type="reappeared",
+                    priority_after=score, escalation_after=escalation,
+                    note=f"reappeared after resolved_at {row.resolved_at_ms}",
+                ))
+                row.resolved_at_ms = None
+                row.current_status = "active"
+                row.first_seen_at_ms = now_ms   # reset NEW window
+                row.occurrence_count = (row.occurrence_count or 0) + 1
+                lifecycle = "NEW"
+            else:
+                row.occurrence_count = (row.occurrence_count or 0) + 1
+                # Lifecycle: NEW if first_seen recent; else delta-based.
+                age_ms = now_ms - (row.first_seen_at_ms or now_ms)
+                if age_ms < OPERATOR_NEW_WINDOW_MS:
+                    lifecycle = "NEW"
+                elif delta >= OPERATOR_DELTA_THRESHOLD:
+                    lifecycle = "WORSENING"
+                elif delta <= -OPERATOR_DELTA_THRESHOLD:
+                    lifecycle = "STABILIZING"
+                else:
+                    lifecycle = "PERSISTENT"
+
+            # Log escalation changes + large priority jumps as events.
+            if escalation != prev_escalation:
+                rank = {"NORMAL": 0, "WATCH": 1, "IMPORTANT": 2, "CRITICAL": 3}
+                going_up = rank.get(escalation, 0) > rank.get(prev_escalation or "NORMAL", 0)
+                events_to_log.append(OperatorPriorityEvent(
+                    ts_ms=now_ms, priority_key=key,
+                    source_layer=item["source_layer"],
+                    event_type="escalation_up" if going_up else "escalation_down",
+                    priority_before=prev_score, priority_after=score,
+                    escalation_before=prev_escalation, escalation_after=escalation,
+                    note=f"escalation {prev_escalation} → {escalation}",
+                ))
+            elif abs(delta) >= OPERATOR_PRIORITY_JUMP_LOG_THRESHOLD:
+                events_to_log.append(OperatorPriorityEvent(
+                    ts_ms=now_ms, priority_key=key,
+                    source_layer=item["source_layer"], event_type="priority_jump",
+                    priority_before=prev_score, priority_after=score,
+                    escalation_before=prev_escalation, escalation_after=escalation,
+                    note=f"score {prev_score:.0f} → {score:.0f} (Δ {delta:+.0f})",
+                ))
+
+            # Update the row to current.
+            row.priority_score = score
+            row.current_escalation = escalation
+            row.severity_raw = item["severity_raw"]
+            row.confidence = item["confidence"]
+            row.source_weight = item["source_weight"]
+            row.headline = item["headline"]
+            row.detail = item["detail"]
+            row.rationale = item["rationale"]
+            row.last_seen_at_ms = now_ms
+            row.current_lifecycle = lifecycle
+            if score > (row.peak_priority_score or 0):
+                row.peak_priority_score = score
+            rank = {"NORMAL": 0, "WATCH": 1, "IMPORTANT": 2, "CRITICAL": 3}
+            if rank.get(escalation, 0) > rank.get(row.peak_escalation or "NORMAL", 0):
+                row.peak_escalation = escalation
+
+            item["lifecycle"] = lifecycle
+            item["priority_delta"] = delta
+            item["first_seen_at_ms"] = row.first_seen_at_ms
+            item["occurrence_count"] = row.occurrence_count
+
+    # Resolve rows that were active before but not in current run.
+    resolved_rows: List[OperatorPriorityHistory] = []
+    for key, row in existing_by_key.items():
+        if key in current_keys or row.current_status != "active":
+            continue
+        row.current_status = "resolved"
+        row.resolved_at_ms = now_ms
+        row.current_lifecycle = "RESOLVED"
+        resolved_rows.append(row)
+        events_to_log.append(OperatorPriorityEvent(
+            ts_ms=now_ms, priority_key=key,
+            source_layer=row.source_layer, event_type="resolved",
+            priority_before=row.priority_score, priority_after=0.0,
+            escalation_before=row.current_escalation, escalation_after="NORMAL",
+            note=f"key disappeared from current run (last priority {row.priority_score:.0f})",
+        ))
+
+    if events_to_log:
+        db.add_all(events_to_log)
+    db.commit()
+
+    resolved: List[dict] = []
+    for row in resolved_rows:
+        resolved.append({
+            "key": row.priority_key,
+            "source_layer": row.source_layer,
+            "kind": row.kind,
+            "headline": row.headline,
+            "detail": row.detail,
+            "rationale": row.rationale,
+            "severity_raw": row.severity_raw,
+            "confidence": row.confidence,
+            "recency": 1.0,
+            "source_weight": row.source_weight,
+            "priority_score": 0.0,
+            "escalation_state": "NORMAL",
+            "lifecycle": "RESOLVED",
+            "priority_delta": -row.priority_score,
+            "members": [],
+            "extra": {"resolved_at_ms": row.resolved_at_ms},
+        })
+    resolved.sort(key=lambda r: -(r.get("extra", {}).get("resolved_at_ms") or 0))
+    resolved = resolved[:5]
+
+    # Load acknowledgements for visible items so the UI can show ack state.
+    ack_keys = [item["key"] for item in grouped]
+    ack_rows = []
+    if ack_keys:
+        ack_rows = (
+            db.query(OperatorAcknowledgement)
+            .filter(OperatorAcknowledgement.active == True)  # noqa: E712
+            .filter(OperatorAcknowledgement.priority_key.in_(ack_keys))
+            .all()
+        )
+    ack_by_key: Dict[str, OperatorAcknowledgement] = {a.priority_key: a for a in ack_rows}
+    for item in grouped:
+        a = ack_by_key.get(item["key"])
+        if a is None:
+            item["ack"] = None
+        else:
+            # Mute expiry: if mute and expired, treat as no ack.
+            if a.action == "mute" and a.expires_at_ms is not None and a.expires_at_ms < now_ms:
+                item["ack"] = None
+            else:
+                item["ack"] = {
+                    "action": a.action,
+                    "created_at_ms": a.created_at_ms,
+                    "expires_at_ms": a.expires_at_ms,
+                    "note": a.note,
+                }
+    snapshot_fresh = True  # DB-backed, always fresh now (was a Pass-A in-memory artifact)
+
+    # ── Attention budget ─────────────────────────────────────────────
+    visible = grouped[:attention_budget]
+    filtered_count = max(0, len(grouped) - len(visible))
+
+    # Escalation counts (overall queue, not just visible).
+    esc_counts: Dict[str, int] = defaultdict(int)
+    for item in grouped:
+        esc_counts[item["escalation_state"]] += 1
+
+    # Top-level summary.
+    n_critical = esc_counts.get("CRITICAL", 0)
+    n_important = esc_counts.get("IMPORTANT", 0)
+    n_watch = esc_counts.get("WATCH", 0)
+    if n_critical:
+        summary = f"{n_critical} CRITICAL + {n_important} IMPORTANT + {n_watch} WATCH item(s) for attention."
+    elif n_important:
+        summary = f"{n_important} IMPORTANT + {n_watch} WATCH item(s) for attention."
+    elif n_watch:
+        summary = f"{n_watch} WATCH item(s) — nothing critical."
+    elif grouped:
+        summary = f"{len(grouped)} item(s), all NORMAL — system stable."
+    else:
+        summary = "Operator queue empty — no signals above the priority floor."
+
+    return {
+        "fetched_at_ms": now_ms,
+        "lookback_days": lookback_days,
+        "attention_budget": attention_budget,
+        "snapshot_fresh": snapshot_fresh,
+        "items": visible,
+        "resolved": resolved,
+        "filtered_count": filtered_count,
+        "total_items": len(grouped),
+        "escalation_counts": dict(esc_counts),
+        "summary": summary,
+        "narrative_headline": narrative_r.get("headline"),
+    }
+
+
+# ── Phase 17 Pass B — actions, digest, escalation history ────────────────
+
+
+def operator_priority_ack(
+    db: Session,
+    priority_key: str,
+    action: str,
+    user_id: Optional[int] = None,
+    note: Optional[str] = None,
+    mute_minutes: Optional[int] = None,
+) -> dict:
+    """Apply an acknowledgement action to a priority_key. Supersedes any
+    existing active ack on the same key (sets it to active=False)."""
+    from kazus_db.models import OperatorAcknowledgement, OperatorPriorityHistory
+    if action not in ("ack", "ignore", "resolve", "mute"):
+        raise ValueError(f"unknown action: {action}")
+    now_ms = int(time.time() * 1000)
+
+    # Deactivate any existing active ack on this key.
+    db.query(OperatorAcknowledgement).filter(
+        OperatorAcknowledgement.priority_key == priority_key,
+        OperatorAcknowledgement.active == True,  # noqa: E712
+    ).update({"active": False}, synchronize_session=False)
+
+    expires = None
+    if action == "mute":
+        minutes = mute_minutes or 60
+        expires = now_ms + minutes * 60_000
+
+    new_ack = OperatorAcknowledgement(
+        priority_key=priority_key,
+        action=action,
+        created_at_ms=now_ms,
+        expires_at_ms=expires,
+        user_id=user_id,
+        note=note,
+        active=True,
+    )
+    db.add(new_ack)
+
+    # If RESOLVE: also flip the history row to resolved status.
+    if action == "resolve":
+        row = (
+            db.query(OperatorPriorityHistory)
+            .filter(OperatorPriorityHistory.priority_key == priority_key)
+            .first()
+        )
+        if row is not None and row.current_status == "active":
+            row.current_status = "resolved"
+            row.resolved_at_ms = now_ms
+            row.current_lifecycle = "RESOLVED"
+
+    db.commit()
+    return {
+        "priority_key": priority_key,
+        "action": action,
+        "created_at_ms": now_ms,
+        "expires_at_ms": expires,
+        "note": note,
+    }
+
+
+def operator_escalation_history(
+    db: Session,
+    priority_key: str,
+    limit: int = 50,
+) -> dict:
+    """All events ever logged for a single priority_key, plus its current
+    history row. Used by the UI escalation-history drawer."""
+    from kazus_db.models import OperatorPriorityHistory, OperatorPriorityEvent, OperatorAcknowledgement
+    row = (
+        db.query(OperatorPriorityHistory)
+        .filter(OperatorPriorityHistory.priority_key == priority_key)
+        .first()
+    )
+    events = (
+        db.query(OperatorPriorityEvent)
+        .filter(OperatorPriorityEvent.priority_key == priority_key)
+        .order_by(OperatorPriorityEvent.ts_ms.desc())
+        .limit(limit)
+        .all()
+    )
+    acks = (
+        db.query(OperatorAcknowledgement)
+        .filter(OperatorAcknowledgement.priority_key == priority_key)
+        .order_by(OperatorAcknowledgement.created_at_ms.desc())
+        .limit(20)
+        .all()
+    )
+
+    if row is None:
+        return {
+            "priority_key": priority_key,
+            "found": False,
+            "history": None,
+            "events": [],
+            "acknowledgements": [],
+        }
+    return {
+        "priority_key": priority_key,
+        "found": True,
+        "history": {
+            "source_layer": row.source_layer,
+            "kind": row.kind,
+            "headline": row.headline,
+            "current_status": row.current_status,
+            "current_escalation": row.current_escalation,
+            "current_lifecycle": row.current_lifecycle,
+            "priority_score": row.priority_score,
+            "peak_priority_score": row.peak_priority_score,
+            "peak_escalation": row.peak_escalation,
+            "first_seen_at_ms": row.first_seen_at_ms,
+            "last_seen_at_ms": row.last_seen_at_ms,
+            "resolved_at_ms": row.resolved_at_ms,
+            "occurrence_count": row.occurrence_count,
+        },
+        "events": [
+            {
+                "ts_ms": e.ts_ms,
+                "event_type": e.event_type,
+                "priority_before": e.priority_before,
+                "priority_after": e.priority_after,
+                "escalation_before": e.escalation_before,
+                "escalation_after": e.escalation_after,
+                "note": e.note,
+            }
+            for e in events
+        ],
+        "acknowledgements": [
+            {
+                "action": a.action,
+                "created_at_ms": a.created_at_ms,
+                "expires_at_ms": a.expires_at_ms,
+                "note": a.note,
+                "active": a.active,
+            }
+            for a in acks
+        ],
+    }
+
+
+def operator_digest(db: Session, window_hours: int = 24) -> dict:
+    """Summarize what materially changed for the operator over a window.
+    "What's new, what got worse, what stabilized, what resolved, who's
+    still active." Purely read; aggregates events table.
+    """
+    from kazus_db.models import OperatorPriorityHistory, OperatorPriorityEvent
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - window_hours * 3600 * 1000
+
+    events = (
+        db.query(OperatorPriorityEvent)
+        .filter(OperatorPriorityEvent.ts_ms >= since_ms)
+        .order_by(OperatorPriorityEvent.ts_ms.asc())
+        .all()
+    )
+
+    # Newest event per key (so a key that escalated then resolved gets
+    # categorized by its final state in the window).
+    last_event_by_key: Dict[str, OperatorPriorityEvent] = {}
+    for e in events:
+        last_event_by_key[e.priority_key] = e
+
+    new_keys: List[dict] = []
+    worsened: List[dict] = []
+    stabilized: List[dict] = []
+    resolved_keys: List[dict] = []
+    reappeared: List[dict] = []
+
+    # Index history rows we'll need
+    keys = list(last_event_by_key.keys())
+    history_by_key: Dict[str, OperatorPriorityHistory] = {}
+    if keys:
+        for r in (
+            db.query(OperatorPriorityHistory)
+            .filter(OperatorPriorityHistory.priority_key.in_(keys))
+            .all()
+        ):
+            history_by_key[r.priority_key] = r
+
+    for key, last_e in last_event_by_key.items():
+        row = history_by_key.get(key)
+        head = row.headline if row else key
+        bucket = {
+            "priority_key": key,
+            "headline": head,
+            "source_layer": last_e.source_layer,
+            "event_type": last_e.event_type,
+            "ts_ms": last_e.ts_ms,
+            "priority_before": last_e.priority_before,
+            "priority_after": last_e.priority_after,
+            "escalation_before": last_e.escalation_before,
+            "escalation_after": last_e.escalation_after,
+            "note": last_e.note,
+        }
+        if last_e.event_type == "first_seen":
+            new_keys.append(bucket)
+        elif last_e.event_type == "escalation_up" or (
+            last_e.event_type == "priority_jump"
+            and (last_e.priority_after or 0) > (last_e.priority_before or 0)
+        ):
+            worsened.append(bucket)
+        elif last_e.event_type == "escalation_down" or (
+            last_e.event_type == "priority_jump"
+            and (last_e.priority_after or 0) < (last_e.priority_before or 0)
+        ):
+            stabilized.append(bucket)
+        elif last_e.event_type == "resolved":
+            resolved_keys.append(bucket)
+        elif last_e.event_type == "reappeared":
+            reappeared.append(bucket)
+
+    # Currently active rows + escalation distribution.
+    active_rows = (
+        db.query(OperatorPriorityHistory)
+        .filter(OperatorPriorityHistory.current_status == "active")
+        .order_by(OperatorPriorityHistory.priority_score.desc())
+        .all()
+    )
+    active_critical = [r for r in active_rows if r.current_escalation == "CRITICAL"]
+    active_important = [r for r in active_rows if r.current_escalation == "IMPORTANT"]
+    contributing_layers: Dict[str, int] = defaultdict(int)
+    for e in events:
+        contributing_layers[e.source_layer] += 1
+
+    return {
+        "window_hours": window_hours,
+        "since_ms": since_ms,
+        "fetched_at_ms": now_ms,
+        "new": new_keys[:20],
+        "worsened": worsened[:20],
+        "stabilized": stabilized[:20],
+        "resolved": resolved_keys[:20],
+        "reappeared": reappeared[:20],
+        "active_critical": [
+            {
+                "priority_key": r.priority_key,
+                "headline": r.headline,
+                "priority_score": r.priority_score,
+                "source_layer": r.source_layer,
+                "first_seen_at_ms": r.first_seen_at_ms,
+            }
+            for r in active_critical[:10]
+        ],
+        "active_important": [
+            {
+                "priority_key": r.priority_key,
+                "headline": r.headline,
+                "priority_score": r.priority_score,
+                "source_layer": r.source_layer,
+                "first_seen_at_ms": r.first_seen_at_ms,
+            }
+            for r in active_important[:10]
+        ],
+        "contributing_layers": dict(contributing_layers),
+        "summary": (
+            f"Last {window_hours}h: {len(new_keys)} new, {len(worsened)} worsened, "
+            f"{len(stabilized)} stabilized, {len(resolved_keys)} resolved. "
+            f"Active: {len(active_critical)} CRITICAL + {len(active_important)} IMPORTANT."
+        ),
+    }
+
+
 def sanity_audit(db: Session) -> dict:
     """Integrity-monitoring engine for the discovery layer.
 
@@ -7556,5 +8435,13 @@ market_state_transitions = _ttl_cached(300.0)(market_state_transitions)
 crisis_genesis = _ttl_cached(120.0)(crisis_genesis)  # tighter TTL — meant for early-warning
 narrative_causality = _ttl_cached(120.0)(narrative_causality)
 adaptation_state = _ttl_cached(120.0)(adaptation_state)
+# operator_priorities is NOT TTL-cached in Pass B — it writes to
+# operator_priority_history on each call and reads acknowledgement
+# state. Cache would make ACK actions invisible until TTL expiry.
+# All its expensive upstream reads ARE cached, so the function itself
+# is cheap (mostly DB upserts + a few selects).
+# operator_digest also reads fresh state to reflect the most recent
+# events; cache would make digest stale by up to TTL after the system
+# stabilizes from a critical period.
 # Note: adapted_recommendations is NOT cached separately — it's a thin
 # wrapper composed of two cached calls.

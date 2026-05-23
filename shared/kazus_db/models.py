@@ -434,3 +434,104 @@ class UserTDAState(Base):
     coins_json: Mapped[Optional[str]] = mapped_column(Text)
     data_json: Mapped[Optional[str]] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# ── Phase 17 Pass B — Operator persistence ────────────────────────────
+
+
+class OperatorPriorityHistory(Base):
+    """Persistent record of every operator-priority item the engine has
+    ever emitted. One row per priority_key (deduped fingerprint). On
+    each operator_priorities run the row is upserted: last_seen_at_ms
+    advances, occurrence_count increments, current scoring is overwritten.
+    When the key disappears from a run, status flips to 'resolved' and
+    resolved_at_ms is recorded.
+
+    This replaces the in-memory snapshot diff with durable history so
+    lifecycle survives restarts and the operator can query by time
+    window (digest, escalation timeline)."""
+
+    __tablename__ = "operator_priority_history"
+    __table_args__ = (
+        UniqueConstraint("priority_key", name="uq_operator_priority_history_key"),
+        Index("ix_operator_priority_history_last_seen", "last_seen_at_ms"),
+        Index("ix_operator_priority_history_status_escalation", "current_status", "current_escalation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    priority_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    source_layer: Mapped[str] = mapped_column(String(24), nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    headline: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    # Current scoring (overwritten on each run).
+    priority_score: Mapped[float] = mapped_column(Float, nullable=False)
+    current_escalation: Mapped[str] = mapped_column(String(12), nullable=False)
+    severity_raw: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    source_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    # Lifecycle from the last computed run.
+    current_lifecycle: Mapped[str] = mapped_column(String(16), default="NEW")
+    current_status: Mapped[str] = mapped_column(String(12), default="active")  # active | resolved
+    # Timing.
+    first_seen_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_seen_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    resolved_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    # Highest priority/severity this key has ever reached.
+    peak_priority_score: Mapped[float] = mapped_column(Float, default=0.0)
+    peak_escalation: Mapped[str] = mapped_column(String(12), default="NORMAL")
+    members_json: Mapped[Optional[str]] = mapped_column(Text)
+    extra_json: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class OperatorPriorityEvent(Base):
+    """Append-only log of materially-interesting changes to a priority
+    row: first appearance, escalation transitions, large priority jumps,
+    resolutions. Used to render the escalation history drawer and to
+    answer "what changed in the last 1h/6h/24h"."""
+
+    __tablename__ = "operator_priority_events"
+    __table_args__ = (
+        Index("ix_operator_priority_events_key_ts", "priority_key", "ts_ms"),
+        Index("ix_operator_priority_events_ts_type", "ts_ms", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    priority_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    source_layer: Mapped[str] = mapped_column(String(24), nullable=False)
+    # first_seen | escalation_up | escalation_down | priority_jump |
+    # resolved | reappeared
+    event_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    priority_before: Mapped[Optional[float]] = mapped_column(Float)
+    priority_after: Mapped[Optional[float]] = mapped_column(Float)
+    escalation_before: Mapped[Optional[str]] = mapped_column(String(12))
+    escalation_after: Mapped[Optional[str]] = mapped_column(String(12))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class OperatorAcknowledgement(Base):
+    """Operator workflow state per priority_key. NOT a trading action —
+    these are read-only intent markers ("I've seen this", "mute for X
+    minutes"). The engine never acts on them autonomously."""
+
+    __tablename__ = "operator_acknowledgements"
+    __table_args__ = (
+        Index("ix_operator_ack_key_active", "priority_key", "active"),
+        Index("ix_operator_ack_created", "created_at_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    priority_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    # ack | ignore | resolve | mute
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # For 'mute' only. NULL for the others.
+    expires_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    # Only one row per priority_key has active=True at a time. New ack
+    # supersedes the previous (which gets active=False).
+    active: Mapped[bool] = mapped_column(Boolean, default=True)

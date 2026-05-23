@@ -197,6 +197,12 @@ ALERT_HISTORY_RETENTION_DAYS = 90
 INTELLIGENCE_HISTORY_RETENTION_DAYS = 90
 ANOMALY_RETENTION_DAYS = 180
 CROSSEX_RETENTION_DAYS = 90
+# Phase-17 operator persistence: keep detailed history for 90d, ack
+# log longer because operators sometimes look back to recall workflow
+# context months later.
+OPERATOR_HISTORY_RETENTION_DAYS = 90
+OPERATOR_EVENTS_RETENTION_DAYS = 90
+OPERATOR_ACK_RETENTION_DAYS = 180
 
 
 async def prune_research_tables(db_factory) -> Dict[str, int]:
@@ -208,6 +214,9 @@ async def prune_research_tables(db_factory) -> Dict[str, int]:
         LiquidityIntelligenceHistory,
         LiquidityAnomalyMemory,
         LiquidityCrossExHistory,
+        OperatorPriorityHistory,
+        OperatorPriorityEvent,
+        OperatorAcknowledgement,
     )
 
     now_ms = int(time.time() * 1000)
@@ -217,6 +226,11 @@ async def prune_research_tables(db_factory) -> Dict[str, int]:
         "intelligence_history": (LiquidityIntelligenceHistory, "ts_ms",          now_ms - INTELLIGENCE_HISTORY_RETENTION_DAYS * H),
         "anomaly_memory":       (LiquidityAnomalyMemory,       "occurred_at_ms", now_ms - ANOMALY_RETENTION_DAYS * H),
         "crossex_history":      (LiquidityCrossExHistory,      "ts_ms",          now_ms - CROSSEX_RETENTION_DAYS * H),
+        # Phase-17 operator tables. Resolved rows + their events drop
+        # after the retention horizon. Active rows are protected: they
+        # update last_seen_at_ms on every operator_priorities run.
+        "operator_priority_events":    (OperatorPriorityEvent, "ts_ms",       now_ms - OPERATOR_EVENTS_RETENTION_DAYS * H),
+        "operator_acknowledgements":   (OperatorAcknowledgement, "created_at_ms", now_ms - OPERATOR_ACK_RETENTION_DAYS * H),
     }
     deleted: Dict[str, int] = {}
     with db_factory() as db:  # type: Session
@@ -231,6 +245,22 @@ async def prune_research_tables(db_factory) -> Dict[str, int]:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("prune %s failed: %s", label, exc)
                 deleted[label] = -1
+        # operator_priority_history: drop only RESOLVED rows past horizon.
+        # Active rows are protected — they update last_seen_at_ms on every
+        # operator_priorities run.
+        try:
+            cutoff = now_ms - OPERATOR_HISTORY_RETENTION_DAYS * H
+            n = (
+                db.query(OperatorPriorityHistory)
+                .filter(OperatorPriorityHistory.current_status == "resolved")
+                .filter(OperatorPriorityHistory.resolved_at_ms < cutoff)
+                .delete(synchronize_session=False)
+            )
+            deleted["operator_priority_history"] = int(n or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("prune operator_priority_history failed: %s", exc)
+            deleted["operator_priority_history"] = -1
+
         # anomaly_edges: prune edges pointing to records that no longer
         # exist (FK-equivalent cleanup, since we delete anomaly_memory
         # above without ON DELETE CASCADE).

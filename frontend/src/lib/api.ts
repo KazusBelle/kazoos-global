@@ -1976,6 +1976,165 @@ export async function getAdaptedRecommendations(opts: { lookback_days?: number }
   return request<AdaptedRecsOut>(`/liquidity/research/adapted-recommendations${usp.toString() ? `?${usp}` : ""}`);
 }
 
+export type OperatorEscalation = "NORMAL" | "WATCH" | "IMPORTANT" | "CRITICAL";
+export type OperatorLifecycle =
+  | "NEW"
+  | "WORSENING"
+  | "STABILIZING"
+  | "PERSISTENT"
+  | "RESOLVED";
+
+export type OperatorAckAction = "ack" | "ignore" | "resolve" | "mute";
+
+export type OperatorAck = {
+  action: OperatorAckAction;
+  created_at_ms: number;
+  expires_at_ms: number | null;
+  note: string | null;
+};
+
+export type OperatorPriorityItem = {
+  key: string;
+  source_layer: "sanity" | "genesis" | "transitions" | "causal" | "structural" | "adaptation";
+  kind: string;
+  headline: string;
+  detail: string;
+  rationale: string;
+  severity_raw: number;
+  confidence: number;
+  recency: number;
+  source_weight: number;
+  priority_score: number;
+  escalation_state: OperatorEscalation;
+  lifecycle: OperatorLifecycle;
+  priority_delta: number | null;
+  members: string[];
+  extra: Record<string, unknown>;
+  // Pass-B fields:
+  first_seen_at_ms?: number | null;
+  occurrence_count?: number | null;
+  ack?: OperatorAck | null;
+};
+
+export type OperatorPriorities = {
+  fetched_at_ms: number;
+  lookback_days: number;
+  attention_budget: number;
+  snapshot_fresh: boolean;
+  items: OperatorPriorityItem[];
+  resolved: OperatorPriorityItem[];
+  filtered_count: number;
+  total_items: number;
+  escalation_counts: Record<OperatorEscalation, number>;
+  summary: string;
+  narrative_headline: string | null;
+};
+
+export async function getOperatorPriorities(opts: { lookback_days?: number; attention_budget?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.attention_budget != null) usp.set("attention_budget", String(opts.attention_budget));
+  return request<OperatorPriorities>(`/liquidity/research/operator-priorities${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export async function postOperatorAck(
+  priority_key: string,
+  payload: { action: OperatorAckAction; note?: string; mute_minutes?: number },
+) {
+  return request<{ priority_key: string; action: OperatorAckAction; created_at_ms: number; expires_at_ms: number | null; note: string | null }>(
+    `/liquidity/research/operator-priorities/${encodeURIComponent(priority_key)}/ack`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export type OperatorPriorityEventOut = {
+  ts_ms: number;
+  event_type: string;
+  priority_before: number | null;
+  priority_after: number | null;
+  escalation_before: string | null;
+  escalation_after: string | null;
+  note: string | null;
+};
+
+export type OperatorPriorityHistoryRow = {
+  source_layer: string;
+  kind: string;
+  headline: string;
+  current_status: string;
+  current_escalation: OperatorEscalation;
+  current_lifecycle: OperatorLifecycle;
+  priority_score: number;
+  peak_priority_score: number;
+  peak_escalation: OperatorEscalation;
+  first_seen_at_ms: number;
+  last_seen_at_ms: number;
+  resolved_at_ms: number | null;
+  occurrence_count: number;
+};
+
+export type OperatorAckHistoryEntry = {
+  action: OperatorAckAction;
+  created_at_ms: number;
+  expires_at_ms: number | null;
+  note: string | null;
+  active: boolean;
+};
+
+export type OperatorEscalationHistory = {
+  priority_key: string;
+  found: boolean;
+  history: OperatorPriorityHistoryRow | null;
+  events: OperatorPriorityEventOut[];
+  acknowledgements: OperatorAckHistoryEntry[];
+};
+
+export async function getOperatorEscalationHistory(priority_key: string, limit = 50) {
+  return request<OperatorEscalationHistory>(
+    `/liquidity/research/operator-priorities/${encodeURIComponent(priority_key)}/history?limit=${limit}`,
+  );
+}
+
+export type OperatorDigestEntry = {
+  priority_key: string;
+  headline: string;
+  source_layer: string;
+  event_type: string;
+  ts_ms: number;
+  priority_before: number | null;
+  priority_after: number | null;
+  escalation_before: string | null;
+  escalation_after: string | null;
+  note: string | null;
+};
+
+export type OperatorDigestActiveRow = {
+  priority_key: string;
+  headline: string;
+  priority_score: number;
+  source_layer: string;
+  first_seen_at_ms: number;
+};
+
+export type OperatorDigest = {
+  window_hours: number;
+  since_ms: number;
+  fetched_at_ms: number;
+  new: OperatorDigestEntry[];
+  worsened: OperatorDigestEntry[];
+  stabilized: OperatorDigestEntry[];
+  resolved: OperatorDigestEntry[];
+  reappeared: OperatorDigestEntry[];
+  active_critical: OperatorDigestActiveRow[];
+  active_important: OperatorDigestActiveRow[];
+  contributing_layers: Record<string, number>;
+  summary: string;
+};
+
+export async function getOperatorDigest(window_hours = 24) {
+  return request<OperatorDigest>(`/liquidity/research/operator-digest?window_hours=${window_hours}`);
+}
+
 export type SanityFinding = {
   kind: string;
   category: SanityCategory;
