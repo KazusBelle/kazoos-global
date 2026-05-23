@@ -5148,6 +5148,59 @@ def adaptation_recommendations(db: Session) -> dict:
     }
 
 
+def adapted_recommendations(db: Session, lookback_days: int = 7) -> dict:
+    """Wrap adaptation_recommendations with the Phase-16 feedback loop.
+
+    Reads adaptation_state's `discovery_suppression_modifier` and scales
+    every recommendation's importance_shift by it. The wrapper is the
+    only thing that touches the modifier — the underlying function stays
+    pure. To disable the loop, callers go back to adaptation_recommendations
+    directly (the function is unmodified)."""
+    base = adaptation_recommendations(db)
+    state = adaptation_state(db, lookback_days=lookback_days)
+    mod = state["modifiers"].get("discovery_suppression_modifier", 1.0)
+
+    if abs(mod - 1.0) < 1e-9:
+        # No suppression — pass through with explicit indicator.
+        return {
+            **base,
+            "discovery_suppression_modifier": mod,
+            "modifier_applied": False,
+            "modifier_reason": None,
+        }
+
+    # Apply the modifier multiplicatively to every importance_shift,
+    # preserving sign. Adaptation_score is rebuilt from the scaled
+    # values so the two stay consistent.
+    scaled: List[dict] = []
+    for r in base["recommendations"]:
+        new_shift = r["importance_shift"] * mod
+        scaled_r = dict(r)
+        scaled_r["importance_shift"] = new_shift
+        scaled_r["raw_importance_shift"] = r["importance_shift"]
+        scaled.append(scaled_r)
+
+    total_pos = sum(max(0.0, r["importance_shift"]) for r in scaled)
+    total_neg = sum(max(0.0, -r["importance_shift"]) for r in scaled)
+    adaptation_score = max(0.0, min(100.0, 50.0 + (total_pos - total_neg) * 10.0))
+
+    # Find the audit-trail entry for this modifier so the consumer can
+    # show why suppression happened.
+    audit_entry = next(
+        (a for a in state["audit_trail"] if a["layer"] == "discovery_suppression_modifier"),
+        None,
+    )
+
+    return {
+        **base,
+        "recommendations": scaled,
+        "adaptation_score": adaptation_score,
+        "discovery_suppression_modifier": mod,
+        "modifier_applied": True,
+        "modifier_reason": audit_entry["reason"] if audit_entry else None,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Stabilization sprint — sanity audit + discovery_quality helper
 # ══════════════════════════════════════════════════════════════════════════
@@ -6912,6 +6965,225 @@ def narrative_causality(db: Session, lookback_days: int = 7) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 16 — Feedback & Adaptation Layer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# This layer closes the intelligence loop. It reads from every previous
+# Phase 15 surface AND from meta_confidence / structural_break_score,
+# and emits bounded modifier coefficients that downstream consumers
+# (adaptation_recommendations, alert engine, UI rendering) MAY apply.
+#
+# Design constraints:
+#
+#   1. Bounded — every modifier is clipped to a documented range.
+#      No coefficient can ever exceed [0.5, 1.5] in either direction.
+#
+#   2. Explainable — every modifier write goes into the audit trail
+#      with: layer, reason, input_value, trigger_threshold, old, new,
+#      input_confidence, timestamp. The trail is what gets shown to
+#      the operator; no "the model decided" black boxes.
+#
+#   3. Reversible — adaptation_state is a pure function called fresh on
+#      every request. There is no persistent state, no in-place
+#      mutation of any upstream layer. To "disable" the loop, downstream
+#      consumers stop reading the modifiers and behavior reverts.
+#
+#   4. Read-only — adaptation_state does NOT write back to any layer
+#      it observes. Cycles are structurally impossible.
+#
+# Each modifier has a documented application target. We wire ONE for
+# real in this commit (discovery_suppression_modifier into
+# adaptation_recommendations); the others are exposed for future wiring
+# at points outside this codebase (e.g. the alerts engine).
+
+
+# Modifier ranges. Above 1.0 means "be more sensitive / stricter".
+# Below 1.0 means "be more conservative / suppress". 1.0 = no change.
+ADAPTATION_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "narrative_confidence_modifier":  (0.50, 1.00),
+    "alert_sensitivity_modifier":     (1.00, 1.50),
+    "causal_strictness_modifier":     (1.00, 1.50),
+    "discovery_suppression_modifier": (0.50, 1.00),
+    "global_trust_modifier":          (0.50, 1.00),
+}
+
+
+def _clip_mod(name: str, value: float) -> float:
+    lo, hi = ADAPTATION_BOUNDS[name]
+    return max(lo, min(hi, value))
+
+
+def adaptation_state(db: Session, lookback_days: int = 7) -> dict:
+    """Compute bounded modifier coefficients + audit trail by reading
+    Phase 15 surfaces and the latest intelligence snapshot.
+
+    Pure read-only. Cached at 120s alongside the upstream layers it
+    composes."""
+    now_ms = int(time.time() * 1000)
+
+    # Read upstream surfaces (all cached).
+    narrative = narrative_causality(db, lookback_days=lookback_days)
+    genesis = crisis_genesis(db, lookback_days=lookback_days)
+    transitions = market_state_transitions(db, lookback_days=lookback_days)
+    sanity = sanity_audit(db)
+
+    # Direct read for meta_confidence + structural_break (latest snapshot).
+    latest = db.execute(
+        text(
+            "SELECT meta_confidence_score, structural_break_score "
+            "FROM liquidity_intelligence_history "
+            "ORDER BY ts_ms DESC LIMIT 1"
+        )
+    ).first()
+    meta_conf = float(latest.meta_confidence_score) if latest and latest.meta_confidence_score is not None else None
+    structural_break = float(latest.structural_break_score) if latest and latest.structural_break_score is not None else None
+
+    audit_trail: List[dict] = []
+    modifiers: Dict[str, float] = {}
+
+    def _record(name: str, raw: float, reason: str, input_value, threshold, input_confidence: float):
+        new_val = _clip_mod(name, raw)
+        modifiers[name] = new_val
+        audit_trail.append({
+            "layer": name,
+            "reason": reason,
+            "old_value": 1.0,
+            "new_value": new_val,
+            "raw_unclipped": raw,
+            "input_value": input_value,
+            "trigger_threshold": threshold,
+            "input_confidence": input_confidence,
+            "ts_ms": now_ms,
+            "applied_at": None,   # set by downstream consumers when they use it
+        })
+
+    # ── 1) narrative_confidence_modifier ─────────────────────────────
+    nc = float(narrative.get("overall_confidence", 0.0))
+    if nc < 0.70:
+        # Linear ramp: nc=0.70 → 1.00, nc=0.30 → 0.50, clipped.
+        raw = 0.50 + (max(0.0, nc - 0.30) / 0.40) * 0.50
+        _record(
+            "narrative_confidence_modifier", raw,
+            reason=f"narrative overall_confidence {nc * 100:.0f}% below 70% threshold",
+            input_value=nc, threshold=0.70, input_confidence=nc,
+        )
+    else:
+        modifiers["narrative_confidence_modifier"] = 1.0
+
+    # ── 2) alert_sensitivity_modifier ────────────────────────────────
+    gs = float(genesis.get("genesis_score", 0.0))
+    gc = float(genesis.get("confidence", 0.0))
+    if gs >= 30 and genesis.get("verdict") != "INSUFFICIENT":
+        # gs=30 → 1.00, gs=80 → 1.50.
+        raw = 1.00 + min(1.0, max(0.0, gs - 30) / 50.0) * 0.50
+        # Apply input_confidence as a damper: low confidence in the input
+        # halves the move toward 1.5.
+        raw = 1.00 + (raw - 1.00) * max(0.3, gc)
+        _record(
+            "alert_sensitivity_modifier", raw,
+            reason=f"crisis genesis score {gs:.0f}/100 ≥ 30 (verdict {genesis.get('verdict')})",
+            input_value=gs, threshold=30.0, input_confidence=gc,
+        )
+    else:
+        modifiers["alert_sensitivity_modifier"] = 1.0
+
+    # ── 3) causal_strictness_modifier ────────────────────────────────
+    flicker = float(transitions.get("flicker_ratio") or 0.0)
+    oscillating = bool(transitions.get("oscillation_periods"))
+    transitions_quality = transitions.get("data_quality", "INSUFFICIENT")
+    if (flicker > 0.25 or oscillating) and not transitions.get("exploratory"):
+        raw = 1.00
+        if flicker > 0.25:
+            raw += min(0.30, (flicker - 0.25) * 1.0)
+        if oscillating:
+            raw += 0.20
+        input_conf = 1.0 if transitions_quality == "HIGH" else (0.7 if transitions_quality == "MEDIUM" else 0.4)
+        _record(
+            "causal_strictness_modifier", raw,
+            reason=(
+                f"transition layer noisy (flicker {flicker * 100:.0f}%"
+                f"{', oscillating' if oscillating else ''}); "
+                f"tighten causal verdicts"
+            ),
+            input_value=flicker, threshold=0.25, input_confidence=input_conf,
+        )
+    else:
+        modifiers["causal_strictness_modifier"] = 1.0
+
+    # ── 4) discovery_suppression_modifier ────────────────────────────
+    sanity_overall = sanity.get("overall_state", "CLEAN")
+    sanity_score = float(sanity.get("overall_score", 0.0))
+    sanity_map = {"CRITICAL": 0.50, "WARN": 0.70, "INFO": 0.90, "CLEAN": 1.00}
+    raw = sanity_map.get(sanity_overall, 1.0)
+    if raw < 1.0:
+        _record(
+            "discovery_suppression_modifier", raw,
+            reason=(
+                f"sanity_audit overall_state={sanity_overall} "
+                f"(worst severity {sanity_score:.0f}/100, "
+                f"{len(sanity.get('findings') or [])} finding(s))"
+            ),
+            input_value=sanity_overall, threshold="WARN", input_confidence=1.0,
+        )
+    else:
+        modifiers["discovery_suppression_modifier"] = 1.0
+
+    # ── 5) global_trust_modifier ─────────────────────────────────────
+    raw = 1.0
+    reasons: List[str] = []
+    inputs: List[Tuple[str, Optional[float]]] = []
+    if meta_conf is not None and meta_conf < 50:
+        # 50 → 1.00, 0 → 0.70.
+        factor = 0.70 + (meta_conf / 50.0) * 0.30
+        raw *= factor
+        reasons.append(f"meta_confidence {meta_conf:.0f}<50")
+    if structural_break is not None and structural_break >= 60:
+        # 60 → 0.85, 100 → 0.70.
+        factor = 0.85 - max(0.0, (structural_break - 60) / 40.0) * 0.15
+        raw *= factor
+        reasons.append(f"structural_break {structural_break:.0f}≥60")
+    inputs.append(("meta_conf", meta_conf))
+    inputs.append(("structural_break", structural_break))
+    if raw < 1.0:
+        _record(
+            "global_trust_modifier", raw,
+            reason="; ".join(reasons),
+            input_value=dict(inputs), threshold="meta<50 OR break≥60",
+            input_confidence=1.0 if latest is not None else 0.0,
+        )
+    else:
+        modifiers["global_trust_modifier"] = 1.0
+
+    # ── Summary ──────────────────────────────────────────────────────
+    n_changed = sum(1 for v in modifiers.values() if abs(v - 1.0) > 1e-9)
+    if n_changed == 0:
+        summary = "All modifiers at neutral (1.00) — no upstream signal warrants adaptation."
+    else:
+        deltas = [f"{k.replace('_modifier', '')} {v:.2f}" for k, v in modifiers.items() if abs(v - 1.0) > 1e-9]
+        summary = f"{n_changed} modifier(s) adapted: {'; '.join(deltas)}."
+
+    return {
+        "fetched_at_ms": now_ms,
+        "lookback_days": lookback_days,
+        "modifiers": modifiers,
+        "audit_trail": audit_trail,
+        "summary": summary,
+        # Expose upstream snapshot for the UI to anchor each modifier.
+        "upstream_snapshot": {
+            "narrative_overall_confidence": nc,
+            "genesis_score": gs,
+            "genesis_verdict": genesis.get("verdict"),
+            "transitions_flicker_ratio": flicker,
+            "transitions_oscillating": oscillating,
+            "sanity_overall_state": sanity_overall,
+            "sanity_overall_score": sanity_score,
+            "meta_confidence_score": meta_conf,
+            "structural_break_score": structural_break,
+        },
+    }
+
+
 def sanity_audit(db: Session) -> dict:
     """Integrity-monitoring engine for the discovery layer.
 
@@ -7283,3 +7555,6 @@ structural_dependencies = _ttl_cached(300.0)(structural_dependencies)
 market_state_transitions = _ttl_cached(300.0)(market_state_transitions)
 crisis_genesis = _ttl_cached(120.0)(crisis_genesis)  # tighter TTL — meant for early-warning
 narrative_causality = _ttl_cached(120.0)(narrative_causality)
+adaptation_state = _ttl_cached(120.0)(adaptation_state)
+# Note: adapted_recommendations is NOT cached separately — it's a thin
+# wrapper composed of two cached calls.

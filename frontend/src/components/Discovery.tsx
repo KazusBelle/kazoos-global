@@ -12,6 +12,8 @@
 import { useEffect, useState } from "react";
 import {
   getAdaptationRecommendations,
+  getAdaptationState,
+  getAdaptedRecommendations,
   getCausalPropagation,
   getCrisisArchetypes,
   getCrisisGenesis,
@@ -26,6 +28,7 @@ import {
   getPropagation,
   getSanityAudit,
   type AdaptationOut,
+  type AdaptationState,
   type CausalEdge,
   type CausalPropagation,
   type CausalRole,
@@ -61,6 +64,7 @@ export function Discovery() {
       </div>
 
       <SanityBanner />
+      <AdaptationStatePanel />
       <CrisisGenesisPanel />
       <NarrativeCausalityPanel />
       <PatternDiscoveryPanel />
@@ -320,6 +324,121 @@ function SanityBanner() {
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+// ── Adaptation State (Phase 16) ─────────────────────────────────────────
+
+const MODIFIER_LABEL: Record<string, string> = {
+  narrative_confidence_modifier:  "narrative confidence",
+  alert_sensitivity_modifier:     "alert sensitivity",
+  causal_strictness_modifier:     "causal strictness",
+  discovery_suppression_modifier: "discovery suppression",
+  global_trust_modifier:          "global trust",
+};
+
+function modifierColor(value: number): string {
+  if (Math.abs(value - 1.0) < 0.01) return "rgba(140, 140, 140, 0.75)";
+  // Below 1.0 = suppression (cooler / yellow), above 1.0 = amplification (red)
+  if (value < 1.0) return "rgba(227, 180, 87, 0.95)";
+  return "rgba(214, 105, 105, 0.95)";
+}
+
+function AdaptationStatePanel() {
+  const [data, setData] = useState<AdaptationState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getAdaptationState()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  if (error) return null;
+  if (!data) return null;
+
+  const anyChanged = Object.values(data.modifiers).some((v) => Math.abs(v - 1.0) > 1e-9);
+
+  return (
+    <div
+      className="rounded-lg border bg-panel/60 px-3 py-2.5"
+      style={{
+        borderColor: anyChanged ? "rgba(227, 180, 87, 0.45)" : "rgba(82, 185, 122, 0.35)",
+      }}
+    >
+      <div className="flex items-baseline gap-3 mb-2">
+        <span className="text-[11px] uppercase tracking-[0.22em]"
+              style={{ color: anyChanged ? "rgba(227, 180, 87, 0.95)" : "rgba(82, 185, 122, 0.95)" }}>
+          ● adaptation loop · {anyChanged ? "active" : "neutral"}
+        </span>
+        <span className="text-[10px] uppercase tracking-[0.18em] text-muted">
+          {data.summary}
+        </span>
+      </div>
+
+      <div className="text-[10px] text-muted leading-snug mb-2.5">
+        Bounded modifier coefficients fed back into downstream layers. Every
+        modifier is clipped to a documented range, every change is logged with
+        its trigger reason, and downstream consumers apply them externally —
+        the loop is reversible by simply ignoring the modifier.
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-[11px]">
+        {Object.entries(data.modifiers).map(([name, value]) => {
+          const audit = data.audit_trail.find((a) => a.layer === name);
+          const color = modifierColor(value);
+          return (
+            <div key={name} className="flex items-baseline gap-2" title={audit?.reason ?? "no change"}>
+              <span
+                className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
+                style={{
+                  color,
+                  borderColor: color.replace(/0\.95\)$|0\.75\)$/, "0.5)"),
+                  background: color.replace(/0\.95\)$|0\.75\)$/, "0.10)"),
+                  minWidth: "3.4rem",
+                  textAlign: "center",
+                }}
+              >
+                ×{value.toFixed(2)}
+              </span>
+              <span className="text-muted shrink-0 w-44">{MODIFIER_LABEL[name] ?? name}</span>
+              <span className="text-zinc-300 flex-1 truncate text-[10px]">
+                {audit ? audit.reason : "no trigger"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Upstream anchors */}
+      <div className="mt-3 pt-2.5 border-t border-border/40 text-[10px] text-muted font-mono">
+        <span className="uppercase tracking-[0.18em] mr-2">upstream</span>
+        narrative {(data.upstream_snapshot.narrative_overall_confidence * 100).toFixed(0)}%
+        <span className="mx-1.5 text-muted/60">·</span>
+        genesis {data.upstream_snapshot.genesis_score.toFixed(0)} ({(data.upstream_snapshot.genesis_verdict ?? "—").toLowerCase().replace(/_/g, " ")})
+        <span className="mx-1.5 text-muted/60">·</span>
+        flicker {(data.upstream_snapshot.transitions_flicker_ratio * 100).toFixed(0)}%{data.upstream_snapshot.transitions_oscillating ? " ⤧" : ""}
+        <span className="mx-1.5 text-muted/60">·</span>
+        sanity {data.upstream_snapshot.sanity_overall_state.toLowerCase()}
+        {data.upstream_snapshot.meta_confidence_score != null && (
+          <>
+            <span className="mx-1.5 text-muted/60">·</span>
+            meta-conf {data.upstream_snapshot.meta_confidence_score.toFixed(0)}
+          </>
+        )}
+        {data.upstream_snapshot.structural_break_score != null && (
+          <>
+            <span className="mx-1.5 text-muted/60">·</span>
+            structural-break {data.upstream_snapshot.structural_break_score.toFixed(0)}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -1750,14 +1869,17 @@ const ACTION_COLOR: Record<string, string> = {
 };
 
 function AdaptationPanel() {
-  const [data, setData] = useState<AdaptationOut | null>(null);
+  // Use the Phase-16 adapted endpoint so the discovery_suppression_modifier
+  // affects what the operator sees. The raw endpoint is still available
+  // for callers that want pre-modifier values.
+  const [data, setData] = useState<Awaited<ReturnType<typeof getAdaptedRecommendations>> | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
-        const d = await getAdaptationRecommendations();
+        const d = await getAdaptedRecommendations();
         if (!cancelled) setData(d);
       } catch (e: any) {
         if (!cancelled) setError(e?.message ?? "failed");
@@ -1771,10 +1893,20 @@ function AdaptationPanel() {
   return (
     <Panel
       title="Adaptation Recommendations"
-      subtitle={data ? `adaptation score ${data.adaptation_score.toFixed(0)} · ${data.recommendations.length} suggestions` : "what to up-weight / tighten — read-only"}
+      subtitle={
+        data
+          ? `adaptation score ${data.adaptation_score.toFixed(0)} · ${data.recommendations.length} suggestions${data.modifier_applied ? ` · ×${data.discovery_suppression_modifier.toFixed(2)} suppression applied` : ""}`
+          : "what to up-weight / tighten — read-only"
+      }
     >
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
+      {data && data.modifier_applied && data.modifier_reason && (
+        <div className="text-[10px] text-[#e3b457] leading-snug mb-2.5 px-2 py-1.5 rounded border border-[#e3b457]/40 bg-[#e3b457]/10">
+          <span className="uppercase tracking-[0.16em] mr-2">feedback loop active</span>
+          all importance shifts scaled ×{data.discovery_suppression_modifier.toFixed(2)} — {data.modifier_reason}
+        </div>
+      )}
       {data && data.recommendations.length === 0 && (
         <div className="text-xs text-muted">Engine has no actionable suggestions right now — calibration is balanced.</div>
       )}
@@ -1796,8 +1928,11 @@ function AdaptationPanel() {
                     {r.action.replace(/_/g, " ")}
                   </span>
                   <span className="font-mono text-zinc-200">{r.target.replace(/_/g, " ")}</span>
-                  <span className="text-[9px] text-muted ml-auto">
+                  <span className="text-[9px] text-muted ml-auto tabular-nums">
                     Δ {r.importance_shift > 0 ? "+" : ""}{r.importance_shift.toFixed(2)}
+                    {r.raw_importance_shift != null && Math.abs(r.raw_importance_shift - r.importance_shift) > 1e-9 && (
+                      <span className="text-muted/70"> (raw {r.raw_importance_shift > 0 ? "+" : ""}{r.raw_importance_shift.toFixed(2)})</span>
+                    )}
                   </span>
                 </div>
                 <div className="text-[11px] text-zinc-300">{r.rationale}</div>

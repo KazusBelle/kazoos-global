@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
@@ -2957,6 +2957,10 @@ class AdaptationRec(BaseModel):
     target: str
     rationale: str
     importance_shift: float
+    # Present only when the adapted_recommendations wrapper applied a
+    # Phase-16 modifier. Carries the pre-modifier value so the operator
+    # can see exactly what was scaled.
+    raw_importance_shift: Optional[float] = None
 
 
 class AdaptationOut(BaseModel):
@@ -3238,6 +3242,67 @@ async def narrative_causality_endpoint(
     _user: User = Depends(get_current_user),
 ) -> NarrativeCausalityOut:
     return NarrativeCausalityOut(**_research.narrative_causality(db, lookback_days=lookback_days))
+
+
+class AdaptationAuditEntry(BaseModel):
+    layer: str
+    reason: str
+    old_value: float
+    new_value: float
+    raw_unclipped: float
+    input_value: Any = None
+    trigger_threshold: Any = None
+    input_confidence: float
+    ts_ms: int
+    applied_at: Optional[str] = None
+
+
+class AdaptationUpstreamSnapshot(BaseModel):
+    narrative_overall_confidence: float
+    genesis_score: float
+    genesis_verdict: Optional[str] = None
+    transitions_flicker_ratio: float
+    transitions_oscillating: bool
+    sanity_overall_state: str
+    sanity_overall_score: float
+    meta_confidence_score: Optional[float] = None
+    structural_break_score: Optional[float] = None
+
+
+class AdaptationStateOut(BaseModel):
+    fetched_at_ms: int
+    lookback_days: int
+    modifiers: dict
+    audit_trail: List[AdaptationAuditEntry]
+    summary: str
+    upstream_snapshot: AdaptationUpstreamSnapshot
+
+
+@router.get("/research/adaptation-state", response_model=AdaptationStateOut)
+async def adaptation_state_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AdaptationStateOut:
+    return AdaptationStateOut(**_research.adaptation_state(db, lookback_days=lookback_days))
+
+
+class AdaptedRecsOut(BaseModel):
+    fetched_at_ms: int
+    recommendations: List[AdaptationRec]
+    adaptation_score: float
+    discovery_suppression_modifier: float
+    modifier_applied: bool
+    modifier_reason: Optional[str] = None
+
+
+@router.get("/research/adapted-recommendations", response_model=AdaptedRecsOut)
+async def adapted_recommendations_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> AdaptedRecsOut:
+    return AdaptedRecsOut(**_research.adapted_recommendations(db, lookback_days=lookback_days))
 
 
 class WorkerHeartbeat(BaseModel):

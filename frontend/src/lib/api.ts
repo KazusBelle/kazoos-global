@@ -1649,6 +1649,8 @@ export type AdaptationRec = {
   target: string;
   rationale: string;
   importance_shift: number;
+  // Present only when the Phase-16 adaptation loop scaled this row.
+  raw_importance_shift?: number | null;
 };
 
 export type AdaptationOut = {
@@ -1920,6 +1922,58 @@ export async function getNarrativeCausality(opts: { lookback_days?: number } = {
   const usp = new URLSearchParams();
   if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
   return request<NarrativeCausality>(`/liquidity/research/narrative-causality${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type AdaptationAuditEntry = {
+  layer: string;
+  reason: string;
+  old_value: number;
+  new_value: number;
+  raw_unclipped: number;
+  input_value: unknown;
+  trigger_threshold: unknown;
+  input_confidence: number;
+  ts_ms: number;
+  applied_at: string | null;
+};
+
+export type AdaptationUpstreamSnapshot = {
+  narrative_overall_confidence: number;
+  genesis_score: number;
+  genesis_verdict: string | null;
+  transitions_flicker_ratio: number;
+  transitions_oscillating: boolean;
+  sanity_overall_state: string;
+  sanity_overall_score: number;
+  meta_confidence_score: number | null;
+  structural_break_score: number | null;
+};
+
+export type AdaptationState = {
+  fetched_at_ms: number;
+  lookback_days: number;
+  modifiers: Record<string, number>;
+  audit_trail: AdaptationAuditEntry[];
+  summary: string;
+  upstream_snapshot: AdaptationUpstreamSnapshot;
+};
+
+export async function getAdaptationState(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<AdaptationState>(`/liquidity/research/adaptation-state${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type AdaptedRecsOut = AdaptationOut & {
+  discovery_suppression_modifier: number;
+  modifier_applied: boolean;
+  modifier_reason: string | null;
+};
+
+export async function getAdaptedRecommendations(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<AdaptedRecsOut>(`/liquidity/research/adapted-recommendations${usp.toString() ? `?${usp}` : ""}`);
 }
 
 export type SanityFinding = {
