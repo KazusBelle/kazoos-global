@@ -111,6 +111,13 @@ const DATA_QUALITY_COLOR: Record<DataQuality, string> = {
   INSUFFICIENT: "rgba(140, 140, 140, 0.85)",
 };
 
+const DATA_QUALITY_EXPLAIN: Record<DataQuality, string> = {
+  HIGH: "Enough data to trust outputs.",
+  MEDIUM: "Borderline — treat conclusions as provisional.",
+  LOW: "Sparse data — outputs are candidates, not findings.",
+  INSUFFICIENT: "Not enough data — accumulating.",
+};
+
 function DataQualityChip({ q }: { q: DataQuality | undefined }) {
   if (!q) return null;
   const color = DATA_QUALITY_COLOR[q];
@@ -122,12 +129,45 @@ function DataQualityChip({ q }: { q: DataQuality | undefined }) {
         borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
         background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
       }}
-      title="Sample-adequacy gate. INSUFFICIENT/LOW = treat as exploratory; HIGH = enough data to trust."
+      title={`Sample-adequacy gate. ${DATA_QUALITY_EXPLAIN[q]}`}
     >
       {q}
     </span>
   );
 }
+
+// Diminished outer ring when data quality is poor — panel still works,
+// but visually signals "don't trust this surface yet".
+function dataQualityClass(q: DataQuality | undefined): string {
+  if (q === "INSUFFICIENT") return "opacity-60";
+  if (q === "LOW") return "opacity-80";
+  return "";
+}
+
+// Short human-readable copy keyed by finding.kind — lets the banner say
+// what the diagnostic actually means in one sentence, with all the
+// thresholds/numbers staying in the tooltip.
+const FINDING_HUMAN: Record<string, string> = {
+  validation_collapse: "Alert outcomes are all marked as noise. Validation thresholds likely mis-set.",
+  anomaly_inflation: "Anomaly recorder is writing more rows than usual — cooldowns may be too loose.",
+  propagation_loop: "Symbol pairs lead each other equally — these are coincidence, not lead-lag relationships.",
+  propagation_instability: "Propagation graph is dominated by weak edges; few connections are statistically meaningful.",
+  forecast_overshoot: "Forecast pinned at boundary (0 or 100). Slope was extrapolated past what data supports.",
+  pattern_explosion: "Too many patterns at current support threshold — likely artifacts of bucket density.",
+  confidence_collapse: "Aggregate confidence across discovery surfaces is low. Treat outputs as exploratory.",
+  regime_fragmentation_spike: "Engine state is jumping between more coordinated_states than usual.",
+  unstable_clustering: "Hidden-regime clusters are mostly micro-clusters — not enough snapshots for stable structure.",
+  adaptation_oscillation: "Adaptation recommender is producing conflicting actions on the same target.",
+};
+
+const FINDING_TREND_LABEL: Record<string, string> = {
+  WORSENING: "getting worse",
+  STABILIZING: "settling",
+  CHRONIC: "long-standing",
+  RECURRING: "persistent",
+  TRANSIENT: "one-shot",
+  NEW: "new",
+};
 
 const PROPAGATION_CONF_COLOR: Record<"HIGH" | "MEDIUM" | "LOW", string> = {
   HIGH: "rgba(82, 185, 122, 0.95)",
@@ -183,32 +223,35 @@ function SanityBanner() {
 
   if (error) return null;
   if (!data) return null;
+
   if (data.overall_state === "CLEAN") {
     return (
-      <div className="rounded-lg border border-border/60 bg-panel/60 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-muted flex items-center gap-3">
-        <span style={{ color: "rgba(82, 185, 122, 0.95)" }}>● clean</span>
-        <span>{data.check_count} integrity checks · {SANITY_OVERALL_LABEL[data.overall_state]}</span>
+      <div className="rounded-lg border border-border/40 bg-panel/40 px-3 py-1.5 text-[10px] uppercase tracking-[0.16em] text-muted flex items-center gap-2">
+        <span style={{ color: "rgba(82, 185, 122, 0.85)" }}>●</span>
+        <span>all {data.check_count} integrity checks clean</span>
       </div>
     );
   }
+
   const overallColor =
     data.overall_state === "CRITICAL" ? "rgba(214, 75, 75, 0.95)" :
     data.overall_state === "WARN" ? "rgba(227, 180, 87, 0.95)" :
     "rgba(140, 170, 235, 0.95)";
+
   return (
     <div
       className="rounded-lg border bg-panel/60 px-3 py-2.5"
       style={{ borderColor: overallColor.replace(/0\.95\)$/, "0.55)") }}
     >
-      <div className="flex items-baseline gap-3 mb-2">
+      <div className="flex items-baseline gap-3 mb-2.5">
         <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: overallColor }}>
           ● {data.overall_state}
         </span>
         <span className="text-[10px] uppercase tracking-[0.2em] text-muted">
-          {SANITY_OVERALL_LABEL[data.overall_state]} · {data.findings.length}/{data.check_count} · score {data.overall_score.toFixed(0)}
+          {data.findings.length} of {data.check_count} checks tripped · worst severity {data.overall_score.toFixed(0)}/100
         </span>
       </div>
-      <ul className="space-y-1.5 font-mono text-[11px]">
+      <ul className="space-y-2">
         {data.findings.map((f, i) => {
           const sc = SANITY_SEVERITY_COLOR[f.severity];
           const trendColor =
@@ -217,32 +260,41 @@ function SanityBanner() {
                 : f.trend === "CHRONIC" ? "text-[#e3b457]"
                   : f.trend === "RECURRING" ? "text-[#8caaeb]"
                     : "text-muted";
+          const human = FINDING_HUMAN[f.kind] ?? f.kind.replace(/_/g, " ");
+          const trendLabel = FINDING_TREND_LABEL[f.trend] ?? f.trend.toLowerCase();
           const tip = [
             `category    ${f.category}`,
+            `kind        ${f.kind}`,
             `value       ${f.metric_value.toFixed(1)} ${f.threshold_unit}`,
             `thresholds  info≥${f.info_threshold} warn≥${f.warn_threshold} crit≥${f.critical_threshold}`,
             `severity    ${f.severity_score.toFixed(0)}/100`,
             `trend       ${f.trend}`,
+            ``,
+            f.detail,
           ].join("\n");
           return (
-            <li key={i} className="flex items-start gap-2" title={tip}>
-              <span
-                className="mt-0.5 inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0"
-                style={{
-                  color: sc,
-                  borderColor: sc.replace(/0\.95\)$/, "0.5)"),
-                  background: sc.replace(/0\.95\)$/, "0.10)"),
-                }}
-              >
-                {f.severity} {f.severity_score.toFixed(0)}
-              </span>
-              <span className={`mt-0.5 inline-block text-[9px] uppercase tracking-[0.12em] shrink-0 ${trendColor}`}>
-                {f.trend}
-              </span>
-              <span className="text-muted shrink-0 w-40 truncate">
-                {f.kind.replace(/_/g, " ")}
-              </span>
-              <span className="text-zinc-300 flex-1">{f.detail}</span>
+            <li key={i} title={tip}>
+              <div className="flex items-baseline gap-2 text-[11px]">
+                <span
+                  className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
+                  style={{
+                    color: sc,
+                    borderColor: sc.replace(/0\.95\)$/, "0.5)"),
+                    background: sc.replace(/0\.95\)$/, "0.10)"),
+                    minWidth: "3.4rem",
+                    textAlign: "center",
+                  }}
+                >
+                  {f.severity_score.toFixed(0)}
+                </span>
+                <span className="text-zinc-200 flex-1">{human}</span>
+                <span className={`text-[9px] uppercase tracking-[0.14em] ${trendColor} shrink-0`}>
+                  {trendLabel}
+                </span>
+              </div>
+              <div className="text-[10px] text-muted font-mono pl-[3.9rem] mt-0.5 truncate">
+                {f.detail}
+              </div>
             </li>
           );
         })}
@@ -297,7 +349,18 @@ function PatternDiscoveryPanel() {
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
       {data && data.patterns.length === 0 && (
-        <div className="text-xs text-muted">No patterns at this support level. Try a lower threshold.</div>
+        <div className="text-xs text-muted space-y-1">
+          <div>No patterns at min_support={data.min_support}.</div>
+          {data.data_quality === "INSUFFICIENT" && (
+            <div className="text-[11px]">
+              Engine has {data.total_buckets} qualifying buckets. Need ≥20 for patterns to
+              be statistically meaningful — accumulating sample data.
+            </div>
+          )}
+          {data.data_quality !== "INSUFFICIENT" && (
+            <div className="text-[11px]">Try a lower support threshold, or accumulate more history.</div>
+          )}
+        </div>
       )}
       {data && data.patterns.length > 0 && (
         <div className="overflow-x-auto">
@@ -310,9 +373,8 @@ function PatternDiscoveryPanel() {
                 ))}
                 <th className="text-right py-2">N</th>
                 <th className="text-right py-2">RATE</th>
-                <th className="text-right py-2" title="effective lift = raw lift × stability">EFF.LIFT</th>
-                <th className="text-right py-2" title="stability score (window balance, recurrence, flag penalties)">STAB</th>
-                <th className="text-right py-2" title="pattern confidence (stability × scarcity factor)">CONF</th>
+                <th className="text-right py-2" title="effective lift = raw lift × stability">LIFT</th>
+                <th className="text-right py-2" title="stability score; pattern_confidence = stability × scarcity">STAB · CONF</th>
                 <th className="text-left py-2">FLAGS</th>
                 <th className="text-left py-2">DOM KIND</th>
               </tr>
@@ -326,45 +388,59 @@ function PatternDiscoveryPanel() {
                       : eff > 0 ? "text-[#d68b8b]" : "text-muted";
                 const stab = p.stability_score;
                 const stabColor = stab >= 0.6 ? "text-[#52b97a]" : stab >= 0.3 ? "text-[#e3b457]" : "text-[#d68b8b]";
-                const rowOpacity = p.suppressed_reason ? "opacity-50" : "";
+                const rowClass = p.suppressed_reason ? "opacity-40" : "";
                 const tip = [
                   `raw_lift     ${p.lift != null ? p.lift.toFixed(2) + "×" : "—"}`,
-                  `stability    ${(p.stability_score * 100).toFixed(0)}`,
-                  `confidence   ${p.pattern_confidence.toFixed(0)}`,
-                  `day_span     ${p.day_span}`,
+                  `effective    ${eff.toFixed(2)}×  (raw × stability)`,
+                  `stability    ${(p.stability_score * 100).toFixed(0)}/100`,
+                  `confidence   ${p.pattern_confidence.toFixed(0)}/100`,
+                  `day_span     ${p.day_span} days`,
                   `half balance ${p.first_half_support}/${p.second_half_support}`,
                   p.suppressed_reason ? `suppressed: ${p.suppressed_reason}` : "",
                 ].filter(Boolean).join("\n");
+                const flagAbbr: Record<string, string> = {
+                  LOW_SUPPORT: "thin",
+                  HIGH_LIFT_LOW_SUPPORT: "lift/N",
+                  SINGLE_WINDOW: "1 window",
+                  LOW_RECURRENCE: "burst",
+                  REGIME_FRAGILE: "1 regime",
+                  BUCKET_SENSITIVE: "dense",
+                };
                 return (
-                  <tr key={p.discovered_pattern_id} className={`border-t border-border/40 ${rowOpacity}`} title={tip}>
+                  <tr key={p.discovered_pattern_id} className={`border-t border-border/40 ${rowClass}`} title={tip}>
                     <td className="py-1 text-muted text-[10px]">{p.discovered_pattern_id}</td>
                     {data.metrics.map((m) => (
                       <td key={m} className="py-1 px-1"><TertileChip v={p.signature[m] as "low" | "mid" | "high" | "na"} /></td>
                     ))}
                     <td className="py-1 text-right text-zinc-200">{p.support}</td>
                     <td className="py-1 text-right text-zinc-200">{(p.outcome_rate * 100).toFixed(0)}%</td>
-                    <td className={`py-1 text-right ${effColor}`}>{eff > 0 ? `${eff.toFixed(2)}×` : "—"}</td>
-                    <td className={`py-1 text-right ${stabColor}`}>{(stab * 100).toFixed(0)}</td>
-                    <td className="py-1 text-right text-muted">{p.pattern_confidence.toFixed(0)}</td>
-                    <td className="py-1 text-[9px] uppercase tracking-[0.08em]">
+                    <td className={`py-1 text-right ${effColor}`}>
+                      <div className="leading-tight">
+                        <div>{eff > 0 ? `${eff.toFixed(2)}×` : "—"}</div>
+                        {p.lift != null && Math.abs(p.lift - eff) > 0.02 && (
+                          <div className="text-[9px] text-muted/70">raw {p.lift.toFixed(2)}×</div>
+                        )}
+                      </div>
+                    </td>
+                    <td className={`py-1 text-right tabular-nums ${stabColor}`}>
+                      {(stab * 100).toFixed(0)}<span className="text-muted/60"> · </span>
+                      <span className="text-muted">{p.pattern_confidence.toFixed(0)}</span>
+                    </td>
+                    <td className="py-1 text-[9px]">
                       {p.robustness_flags.length === 0 ? (
                         <span className="text-muted">—</span>
                       ) : (
-                        p.robustness_flags.map((f) => {
-                          const abbr: Record<string, string> = {
-                            LOW_SUPPORT: "lo-sup",
-                            HIGH_LIFT_LOW_SUPPORT: "lift-sup",
-                            SINGLE_WINDOW: "1-win",
-                            LOW_RECURRENCE: "lo-rec",
-                            REGIME_FRAGILE: "rg-frag",
-                            BUCKET_SENSITIVE: "buk-sen",
-                          };
-                          return (
-                            <span key={f} className="inline-block mr-1 text-[#d68b8b]" title={f}>
-                              {abbr[f] ?? f}
+                        <div className="flex flex-wrap gap-1">
+                          {p.robustness_flags.map((f) => (
+                            <span
+                              key={f}
+                              className="inline-block rounded-sm border border-[#d68b8b]/40 bg-[#d68b8b]/10 text-[#d68b8b] px-1 py-0.5 uppercase tracking-[0.08em]"
+                              title={f}
+                            >
+                              {flagAbbr[f] ?? f.toLowerCase()}
                             </span>
-                          );
-                        })
+                          ))}
+                        </div>
                       )}
                     </td>
                     <td className="py-1 text-[10px] text-zinc-300">{p.dominant_alert_kind ? `${p.dominant_alert_kind.replace(/_/g, " ")} (${p.dominant_alert_count})` : "—"}</td>
@@ -413,7 +489,10 @@ function CrisisArchetypesPanel() {
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
       {data && data.archetypes.length === 0 && (
-        <div className="text-xs text-muted">No archetypes yet — populate anomaly memory first.</div>
+        <div className="text-xs text-muted">
+          No archetypes yet — anomaly memory has {data.anomaly_count} record(s).
+          {data.data_quality === "INSUFFICIENT" && " Need ≥5 anomalies for clustering to be meaningful."}
+        </div>
       )}
       {data && data.archetypes.length > 0 && (
         <table className="w-full text-sm font-mono">
@@ -484,7 +563,11 @@ function HiddenRegimesPanel() {
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
       {data && data.clusters.length === 0 && (
-        <div className="text-xs text-muted">Not enough intelligence history yet — worker snapshots every 5 min.</div>
+        <div className="text-xs text-muted">
+          {data.snapshot_count} intelligence snapshots so far.
+          {data.data_quality === "INSUFFICIENT" && " Need ≥20 for clusters to be statistically meaningful."}
+          {" "}Worker snapshots every 5 min.
+        </div>
       )}
       {data && data.clusters.length > 0 && (
         <table className="w-full text-sm font-mono">
@@ -544,25 +627,43 @@ function PropagationPanel() {
     return () => { cancelled = true; };
   }, []);
 
+  const validatedCount = data ? data.edges.filter((e) => e.confidence === "HIGH").length : 0;
+  const mediumCount = data ? data.edges.filter((e) => e.confidence === "MEDIUM").length : 0;
+  const candidateCount = data ? data.edges.filter((e) => e.confidence === "LOW").length : 0;
+  const integrityState =
+    data == null ? "" :
+    data.integrity_score >= 70 ? "trustworthy" :
+    data.integrity_score >= 50 ? "borderline" :
+    data.integrity_score >= 30 ? "weak" : "near-noise";
+  const integrityColor =
+    data == null ? "rgba(140, 140, 140, 0.85)" :
+    data.integrity_score >= 70 ? "rgba(82, 185, 122, 0.95)" :
+    data.integrity_score >= 50 ? "rgba(140, 170, 235, 0.95)" :
+    data.integrity_score >= 30 ? "rgba(227, 180, 87, 0.95)" : "rgba(214, 105, 105, 0.95)";
+
   return (
     <Panel
       title="Structural Propagation"
       subtitle={
         data
-          ? `${data.total_alerts} alerts · contagion ${data.systemic_contagion_score.toFixed(0)} · integrity ${data.integrity_score.toFixed(0)}`
+          ? `${validatedCount} validated · ${mediumCount} provisional · ${candidateCount} candidate edges`
           : "symbol→symbol lead-lag"
       }
       toolbar={
-        data && data.integrity_components ? (
-          <div
-            className="text-[9px] uppercase tracking-[0.18em] text-muted flex items-center gap-2"
-            title={`avg_confidence ${(data.integrity_components.avg_confidence * 100).toFixed(0)} · symmetric ${(data.integrity_components.symmetric_share * 100).toFixed(0)}% · weak ${(data.integrity_components.weak_share * 100).toFixed(0)}% · coverage ${(data.integrity_components.coverage * 100).toFixed(0)}%`}
-          >
-            <span>avg-cnf {(data.integrity_components.avg_confidence * 100).toFixed(0)}</span>
-            <span className="text-muted/60">·</span>
-            <span>sym {(data.integrity_components.symmetric_share * 100).toFixed(0)}%</span>
-            <span className="text-muted/60">·</span>
-            <span>weak {(data.integrity_components.weak_share * 100).toFixed(0)}%</span>
+        data ? (
+          <div className="flex items-center gap-2 text-[9px] uppercase tracking-[0.18em]">
+            <span
+              className="rounded-sm border px-1.5 py-0.5"
+              style={{
+                color: integrityColor,
+                borderColor: integrityColor.replace(/0\.95\)$/, "0.5)"),
+                background: integrityColor.replace(/0\.95\)$/, "0.10)"),
+              }}
+              title={`Graph-level integrity score combines avg edge confidence, symmetric-pair share, weak-edge share and coverage. ${integrityState}.`}
+            >
+              integrity {data.integrity_score.toFixed(0)}/100
+            </span>
+            <span className="text-muted">{integrityState}</span>
           </div>
         ) : null
       }
@@ -570,9 +671,25 @@ function PropagationPanel() {
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
       {data && data.edges.length === 0 && (
-        <div className="text-xs text-muted">No propagation edges yet — needs alert history with multiple symbols.</div>
+        <div className="text-xs text-muted">No propagation edges yet — needs alert history across multiple symbols.</div>
       )}
       {data && data.edges.length > 0 && (
+        <>
+        <div className="text-[10px] text-muted mb-3">
+          {validatedCount === 0 ? (
+            <>
+              <span className="text-[#e3b457]">Zero validated edges.</span>{" "}
+              All {data.edges.length} are candidates only — symbol pairs with too little independent recurrence,
+              dominated by single-burst days, or with symmetric reverse edges (coincidence rather than lead-lag).
+              Don't act on these as alpha.
+            </>
+          ) : (
+            <>
+              <span className="text-[#52b97a]">{validatedCount} edge(s) reached HIGH confidence</span>
+              {" "}— stable across the lookback window with clean lead times. Candidates below are exploratory.
+            </>
+          )}
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">top edges</div>
@@ -652,6 +769,7 @@ function PropagationPanel() {
             </table>
           </div>
         </div>
+        </>
       )}
       {data?.average_propagation_velocity_s != null && (
         <div className="text-[10px] uppercase tracking-[0.16em] text-muted pt-3 border-t border-border/40 mt-3">
