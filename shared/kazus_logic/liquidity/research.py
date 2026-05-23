@@ -4665,10 +4665,36 @@ def memory_abstraction(db: Session) -> dict:
 
 def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
     """Linear extrapolation of recent intelligence_history trends, with
-    confidence based on the residual variance. NOT a price forecast —
+    a conservative confidence framework that resists short history,
+    runaway slopes, and direction reversals. NOT a price forecast —
     only "where is the engine itself drifting toward?".
+
+    Reliability framework (each per-forecast field is explainable in UI):
+
+      * data_quality gate — INSUFFICIENT (<24 snapshots, ~2h @ 5-min
+        cadence) returns empty forecasts + UNKNOWN trajectory. Below
+        72 (~6h) all individual forecasts are stamped LOW.
+      * slope_capped — raw slope clipped to ±SLOPE_CAP_PER_DAY (25 units)
+        so a single intra-hour spike can't paint a 7-day apocalypse.
+      * extrapolation_capped — true when the *uncapped* OLS forecast
+        would have left the metric's natural [0, 100] band, i.e. the
+        slope can't physically extend that far. Confidence is halved.
+      * slope_consistency — slope is fit independently on the first and
+        last half of the window; if signs disagree the trend is
+        reversing → consistency=0 → confidence is halved.
+      * horizon decay — confidence *= data_span_days / (data_span_days
+        + horizon_days), i.e. the fraction of the total considered time
+        window that is actual data. Symmetric and interpretable: 7d
+        forecast off 7d data → 0.5×; off 1d data → 0.125×.
+      * trajectory gate — only labelled when stress has data_quality
+        MEDIUM+ AND confidence ≥ 30. Otherwise UNKNOWN.
     """
     from kazus_db.models import LiquidityIntelligenceHistory
+
+    SLOPE_CAP_PER_DAY = 25.0          # any metric is 0..100; ±25/day already aggressive
+    MIN_SNAPSHOTS_HARD = 24            # below this → no forecasts at all
+    MIN_SNAPSHOTS_PER_METRIC = 12
+    TRAJECTORY_MIN_CONFIDENCE = 30.0
 
     since_ms = int(time.time() * 1000) - 21 * 24 * 3600 * 1000
     rows = (
@@ -4681,65 +4707,113 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
         .all()
     )
-    # Require at least 12 snapshots so the OLS slope isn't a curve-fit
-    # over a handful of contiguous observations. With the 5-min cadence
-    # that's about an hour of accumulation — enough for the slope to mean
-    # something rather than amplify intra-hour noise into a 7-day
-    # extrapolation that lands in fantasyland.
-    if len(rows) < 12:
+    n_snapshots = len(rows)
+    overall_quality = _discovery_quality(n_snapshots, low=24, medium=72, high=288)
+
+    if n_snapshots < MIN_SNAPSHOTS_HARD:
         return {
             "horizon_days": horizon_days,
             "forecasts": [],
-            "snapshot_count": len(rows),
-            "data_quality": _discovery_quality(len(rows), low=12, medium=50, high=200),
+            "trajectory": "UNKNOWN",
+            "snapshot_count": n_snapshots,
+            "data_quality": overall_quality,
         }
 
-    def _fit(key: str) -> Optional[dict]:
-        pts = [(r.ts_ms, getattr(r, key)) for r in rows if getattr(r, key) is not None]
-        if len(pts) < 12:
+    def _ols(xs: List[float], ys: List[float]) -> Optional[Tuple[float, float]]:
+        m = len(xs)
+        if m < 2:
             return None
-        # Normalize x to days from first point.
-        t0 = pts[0][0]
-        xs = [(t - t0) / (24 * 3600_000) for t, _ in pts]
-        ys = [v for _, v in pts]
-        n = len(xs)
-        mx = sum(xs) / n
-        my = sum(ys) / n
+        mx = sum(xs) / m
+        my = sum(ys) / m
         num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
         den = sum((x - mx) ** 2 for x in xs)
         if den <= 0:
             return None
         slope = num / den
         intercept = my - slope * mx
+        return slope, intercept
+
+    def _fit(key: str) -> Optional[dict]:
+        pts = [(r.ts_ms, getattr(r, key)) for r in rows if getattr(r, key) is not None]
+        if len(pts) < MIN_SNAPSHOTS_PER_METRIC:
+            return None
+        t0 = pts[0][0]
+        xs = [(t - t0) / (24 * 3600_000) for t, _ in pts]
+        ys = [v for _, v in pts]
+
+        fit = _ols(xs, ys)
+        if fit is None:
+            return None
+        raw_slope, intercept = fit
+
+        # Slope cap — runaway extrapolation guard.
+        slope = max(-SLOPE_CAP_PER_DAY, min(SLOPE_CAP_PER_DAY, raw_slope))
+        slope_capped = (raw_slope != slope)
+
+        # Half-window slope consistency. If first-half and second-half
+        # disagree on sign, trend is reversing — confidence will get
+        # halved later. If signs agree but magnitudes differ wildly,
+        # smoothly attenuate.
+        mid = len(xs) // 2
+        slope_consistency = 0.5  # default when halves can't be fit
+        first = _ols(xs[:mid], ys[:mid]) if mid >= 2 else None
+        second = _ols(xs[mid:], ys[mid:]) if len(xs) - mid >= 2 else None
+        if first is not None and second is not None:
+            s1, s2 = first[0], second[0]
+            if s1 == 0 and s2 == 0:
+                slope_consistency = 1.0
+            elif (s1 > 0) != (s2 > 0) and not (s1 == 0 or s2 == 0):
+                slope_consistency = 0.0
+            else:
+                slope_consistency = 1.0 - abs(s1 - s2) / (abs(s1) + abs(s2) + 1e-9)
+                slope_consistency = max(0.0, min(1.0, slope_consistency))
+
         residuals = [(y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys)]
-        rmse = math.sqrt(sum(residuals) / n)
+        rmse = math.sqrt(sum(residuals) / len(xs))
+
+        # Forecast using capped slope; check if the *raw* slope would have
+        # blown past [0, 100] — that's the runaway signal we surface.
         latest_x = xs[-1]
-        forecast_x = latest_x + horizon_days
-        forecast_y = slope * forecast_x + intercept
-        # All these metrics are bounded 0..100 by construction, so a
-        # raw extrapolation outside that range is the formula screaming
-        # "this slope can't extend this far". Clip to the band so the UI
-        # stays interpretable.
-        forecast_y = max(0.0, min(100.0, forecast_y))
-        # Confidence: combine RMSE with extrapolation distance — a low-
-        # RMSE fit that nevertheless extrapolates far past the data span
-        # shouldn't read as high confidence.
+        current = ys[-1]
+        raw_forecast = raw_slope * horizon_days + current
+        extrapolation_capped = raw_forecast < 0.0 or raw_forecast > 100.0
+        forecast_y = max(0.0, min(100.0, slope * horizon_days + current))
+
+        # Confidence pipeline.
         data_span_days = max(1e-6, xs[-1] - xs[0])
-        extrapolation_ratio = horizon_days / data_span_days
+        horizon_decay = data_span_days / (data_span_days + horizon_days)
+        rmse_factor = max(0.0, 1.0 - rmse / 50.0)        # rmse=50 already kills confidence
+        consistency_factor = 0.5 + 0.5 * slope_consistency
+        # Halve confidence when the slope had to be physically clipped.
+        cap_factor = 0.5 if (slope_capped or extrapolation_capped) else 1.0
+
+        confidence = 100.0 * rmse_factor * horizon_decay * consistency_factor * cap_factor
+
+        # Per-forecast quality bucket: cannot exceed overall quality, and
+        # gets pulled down by structural problems detected above.
+        if overall_quality == "INSUFFICIENT":
+            per_quality = "INSUFFICIENT"
+        elif overall_quality == "LOW" or slope_capped or extrapolation_capped or slope_consistency < 0.3:
+            per_quality = "LOW"
+        elif overall_quality == "MEDIUM" or slope_consistency < 0.7:
+            per_quality = "MEDIUM"
+        else:
+            per_quality = "HIGH"
+
         return {
             "metric": key,
-            "current": ys[-1],
+            "current": current,
             "slope_per_day": slope,
+            "raw_slope_per_day": raw_slope,
+            "slope_capped": slope_capped,
+            "extrapolation_capped": extrapolation_capped,
+            "slope_consistency": slope_consistency,
             "forecast_in_days": horizon_days,
             "forecast_value": forecast_y,
             "rmse": rmse,
-            "confidence": max(
-                0.0,
-                min(
-                    100.0,
-                    (100.0 - rmse * 2.0) / max(1.0, extrapolation_ratio),
-                ),
-            ),
+            "horizon_decay": horizon_decay,
+            "confidence": max(0.0, min(100.0, confidence)),
+            "data_quality": per_quality,
         }
 
     forecasts: List[dict] = []
@@ -4748,9 +4822,14 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         if f is not None:
             forecasts.append(f)
 
-    # Inferred trajectory label.
+    # Trajectory label: only commit to a direction when the stress
+    # forecast itself is trustworthy enough.
     stress_f = next((f for f in forecasts if f["metric"] == "synthesized_stress"), None)
-    if stress_f is None:
+    if (
+        stress_f is None
+        or stress_f["data_quality"] in ("INSUFFICIENT", "LOW")
+        or stress_f["confidence"] < TRAJECTORY_MIN_CONFIDENCE
+    ):
         trajectory = "UNKNOWN"
     elif stress_f["slope_per_day"] > 1.5:
         trajectory = "ESCALATING"
@@ -4765,10 +4844,8 @@ def intelligence_evolution_forecast(db: Session, horizon_days: int = 7) -> dict:
         "horizon_days": horizon_days,
         "forecasts": forecasts,
         "trajectory": trajectory,
-        "snapshot_count": len(rows),
-        # OLS slope on <50 snapshots is hostage to recent noise — treat
-        # anything below as exploratory at best.
-        "data_quality": _discovery_quality(len(rows), low=12, medium=50, high=200),
+        "snapshot_count": n_snapshots,
+        "data_quality": overall_quality,
     }
 
 

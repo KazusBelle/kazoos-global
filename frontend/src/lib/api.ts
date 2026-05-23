@@ -1602,10 +1602,16 @@ export type ForecastEntry = {
   metric: string;
   current: number;
   slope_per_day: number;
+  raw_slope_per_day: number;
+  slope_capped: boolean;
+  extrapolation_capped: boolean;
+  slope_consistency: number;
   forecast_in_days: number;
   forecast_value: number;
   rmse: number;
+  horizon_decay: number;
   confidence: number;
+  data_quality: DataQuality;
 };
 
 export type IntelligenceForecast = {

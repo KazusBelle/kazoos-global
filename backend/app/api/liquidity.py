@@ -2908,10 +2908,16 @@ class ForecastEntry(BaseModel):
     metric: str
     current: float
     slope_per_day: float
+    raw_slope_per_day: float = 0.0
+    slope_capped: bool = False
+    extrapolation_capped: bool = False
+    slope_consistency: float = 0.0
     forecast_in_days: int
     forecast_value: float
     rmse: float
+    horizon_decay: float = 1.0
     confidence: float
+    data_quality: str = "INSUFFICIENT"
 
 
 class IntelligenceForecastOut(BaseModel):

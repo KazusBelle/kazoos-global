@@ -772,7 +772,11 @@ function IntelligenceForecastPanel() {
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
       {data && data.forecasts.length === 0 && (
-        <div className="text-xs text-muted">Need ≥5 intelligence snapshots — accumulating.</div>
+        <div className="text-xs text-muted">
+          {data.data_quality === "INSUFFICIENT"
+            ? `Need ≥24 intelligence snapshots — have ${data.snapshot_count}. Forecast suppressed.`
+            : "No metrics with enough non-null history yet."}
+        </div>
       )}
       {data && data.forecasts.length > 0 && (
         <div className="space-y-3">
@@ -792,21 +796,39 @@ function IntelligenceForecastPanel() {
                 <th className="text-right py-2">NOW</th>
                 <th className="text-right py-2">+{data.horizon_days}D</th>
                 <th className="text-right py-2">SLOPE/D</th>
+                <th className="text-right py-2">FLAGS</th>
                 <th className="text-right py-2">CONF</th>
+                <th className="text-right py-2">Q</th>
               </tr>
             </thead>
             <tbody>
-              {data.forecasts.map((f) => (
-                <tr key={f.metric} className="border-t border-border/40">
-                  <td className="py-1.5 text-zinc-200">{f.metric.replace(/_/g, " ")}</td>
-                  <td className="py-1.5 text-right text-muted">{f.current.toFixed(1)}</td>
-                  <td className="py-1.5 text-right text-zinc-200 font-semibold">{f.forecast_value.toFixed(1)}</td>
-                  <td className={`py-1.5 text-right ${f.slope_per_day > 0.1 ? "text-[#e3b457]" : f.slope_per_day < -0.1 ? "text-[#52b97a]" : "text-muted"}`}>
-                    {f.slope_per_day > 0 ? "+" : ""}{f.slope_per_day.toFixed(2)}
-                  </td>
-                  <td className="py-1.5 text-right text-muted">{f.confidence.toFixed(0)}</td>
-                </tr>
-              ))}
+              {data.forecasts.map((f) => {
+                const tip = [
+                  `raw slope     ${f.raw_slope_per_day.toFixed(2)}/d`,
+                  `slope_capped  ${f.slope_capped ? "yes" : "no"}`,
+                  `extrap_capped ${f.extrapolation_capped ? "yes" : "no"}`,
+                  `consistency   ${(f.slope_consistency * 100).toFixed(0)}`,
+                  `horizon decay ${f.horizon_decay.toFixed(2)}×`,
+                  `rmse          ${f.rmse.toFixed(2)}`,
+                ].join("\n");
+                return (
+                  <tr key={f.metric} className="border-t border-border/40" title={tip}>
+                    <td className="py-1.5 text-zinc-200">{f.metric.replace(/_/g, " ")}</td>
+                    <td className="py-1.5 text-right text-muted">{f.current.toFixed(1)}</td>
+                    <td className="py-1.5 text-right text-zinc-200 font-semibold">{f.forecast_value.toFixed(1)}</td>
+                    <td className={`py-1.5 text-right ${f.slope_per_day > 0.1 ? "text-[#e3b457]" : f.slope_per_day < -0.1 ? "text-[#52b97a]" : "text-muted"}`}>
+                      {f.slope_per_day > 0 ? "+" : ""}{f.slope_per_day.toFixed(2)}
+                    </td>
+                    <td className="py-1.5 text-right text-[9px]">
+                      {f.slope_capped && <span className="text-[#e3b457] mr-1" title="slope capped at ±25/day">⌛</span>}
+                      {f.extrapolation_capped && <span className="text-[#d68b8b] mr-1" title="raw forecast left [0,100] band">⚠</span>}
+                      {f.slope_consistency < 0.3 && <span className="text-[#d68b8b]" title="trend reversing between halves">↯</span>}
+                    </td>
+                    <td className="py-1.5 text-right text-muted">{f.confidence.toFixed(0)}</td>
+                    <td className="py-1.5 text-right"><DataQualityChip q={f.data_quality} /></td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
