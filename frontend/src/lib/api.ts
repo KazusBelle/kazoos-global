@@ -1511,10 +1511,34 @@ export type PropagationEdge = {
   count: number;
   avg_lead_ms: number;
   avg_lead_s: number;
+  lead_std_s: number;
   confidence: "HIGH" | "MEDIUM" | "LOW";
+  confidence_score: number;
+  volume_strength: number;
+  lead_clarity: number;
+  lead_consistency: number;
+  temporal_consistency: number;
+  recurrence_stability: number;
+  symmetry_penalty: number;
+  leader_stability: number;
+  base_confidence: number;
 };
 
-export type PropagationNode = { symbol: string; out_count: number; in_count: number; net_lead: number };
+export type PropagationNode = {
+  symbol: string;
+  out_count: number;
+  in_count: number;
+  net_lead: number;
+  leader_stability: number;
+  follower_stability: number;
+};
+
+export type PropagationIntegrityComponents = {
+  avg_confidence: number;
+  symmetric_share: number;
+  weak_share: number;
+  coverage: number;
+};
 
 export type Propagation = {
   since_ms: number;
@@ -1524,6 +1548,8 @@ export type Propagation = {
   systemic_contagion_score: number;
   average_propagation_velocity_s: number | null;
   total_alerts: number;
+  integrity_score: number;
+  integrity_components: PropagationIntegrityComponents | null;
 };
 
 export async function getPropagation(opts: { lookback_days?: number; lead_window_minutes?: number; min_lead_seconds?: number } = {}) {

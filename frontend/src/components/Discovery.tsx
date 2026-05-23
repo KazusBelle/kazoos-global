@@ -492,7 +492,25 @@ function PropagationPanel() {
   return (
     <Panel
       title="Structural Propagation"
-      subtitle={data ? `${data.total_alerts} alerts · contagion ${data.systemic_contagion_score.toFixed(0)}` : "symbol→symbol lead-lag"}
+      subtitle={
+        data
+          ? `${data.total_alerts} alerts · contagion ${data.systemic_contagion_score.toFixed(0)} · integrity ${data.integrity_score.toFixed(0)}`
+          : "symbol→symbol lead-lag"
+      }
+      toolbar={
+        data && data.integrity_components ? (
+          <div
+            className="text-[9px] uppercase tracking-[0.18em] text-muted flex items-center gap-2"
+            title={`avg_confidence ${(data.integrity_components.avg_confidence * 100).toFixed(0)} · symmetric ${(data.integrity_components.symmetric_share * 100).toFixed(0)}% · weak ${(data.integrity_components.weak_share * 100).toFixed(0)}% · coverage ${(data.integrity_components.coverage * 100).toFixed(0)}%`}
+          >
+            <span>avg-cnf {(data.integrity_components.avg_confidence * 100).toFixed(0)}</span>
+            <span className="text-muted/60">·</span>
+            <span>sym {(data.integrity_components.symmetric_share * 100).toFixed(0)}%</span>
+            <span className="text-muted/60">·</span>
+            <span>weak {(data.integrity_components.weak_share * 100).toFixed(0)}%</span>
+          </div>
+        ) : null
+      }
     >
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
@@ -508,23 +526,42 @@ function PropagationPanel() {
                 <tr className="text-[10px] uppercase tracking-[0.18em] text-muted border-b border-border/60">
                   <th className="text-left py-2">A → B</th>
                   <th className="text-right py-2">N</th>
-                  <th className="text-right py-2">LEAD</th>
+                  <th className="text-right py-2">LEAD±σ</th>
+                  <th className="text-right py-2">SCORE</th>
                   <th className="text-right py-2">CONF</th>
                 </tr>
               </thead>
               <tbody>
-                {data.edges.slice(0, 12).map((e, i) => (
-                  <tr key={i} className="border-t border-border/40">
-                    <td className="py-1 text-[10px]">
-                      <span className="text-zinc-200">{e.from_symbol}</span>
-                      <span className="text-muted"> → </span>
-                      <span className="text-zinc-200">{e.to_symbol}</span>
-                    </td>
-                    <td className="py-1 text-right text-zinc-200">{e.count}</td>
-                    <td className="py-1 text-right text-muted">{e.avg_lead_s.toFixed(0)}s</td>
-                    <td className="py-1 text-right"><EdgeConfidenceChip c={e.confidence} /></td>
-                  </tr>
-                ))}
+                {data.edges.slice(0, 12).map((e, i) => {
+                  const tip = [
+                    `volume      ${(e.volume_strength * 100).toFixed(0)}`,
+                    `lead clarity ${(e.lead_clarity * 100).toFixed(0)}`,
+                    `lead consist ${(e.lead_consistency * 100).toFixed(0)}`,
+                    `temporal     ${(e.temporal_consistency * 100).toFixed(0)}`,
+                    `recurrence   ${(e.recurrence_stability * 100).toFixed(0)}`,
+                    `leader stab  ${(e.leader_stability * 100).toFixed(0)}`,
+                    `symmetry pen ${(e.symmetry_penalty * 100).toFixed(0)}`,
+                    `base → final ${(e.base_confidence * 100).toFixed(0)} → ${(e.confidence_score * 100).toFixed(0)}`,
+                  ].join("\n");
+                  return (
+                    <tr key={i} className="border-t border-border/40" title={tip}>
+                      <td className="py-1 text-[10px]">
+                        <span className="text-zinc-200">{e.from_symbol}</span>
+                        <span className="text-muted"> → </span>
+                        <span className="text-zinc-200">{e.to_symbol}</span>
+                        {e.symmetry_penalty >= 0.5 && (
+                          <span className="ml-1 text-[#e3b457]" title="symmetric reverse edge — likely coincidence">⇄</span>
+                        )}
+                      </td>
+                      <td className="py-1 text-right text-zinc-200">{e.count}</td>
+                      <td className="py-1 text-right text-muted">
+                        {e.avg_lead_s.toFixed(0)}±{e.lead_std_s.toFixed(0)}s
+                      </td>
+                      <td className="py-1 text-right text-zinc-300">{(e.confidence_score * 100).toFixed(0)}</td>
+                      <td className="py-1 text-right"><EdgeConfidenceChip c={e.confidence} /></td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -537,19 +574,25 @@ function PropagationPanel() {
                   <th className="text-right py-2">OUT</th>
                   <th className="text-right py-2">IN</th>
                   <th className="text-right py-2">NET</th>
+                  <th className="text-right py-2">STAB</th>
                 </tr>
               </thead>
               <tbody>
-                {data.nodes.slice(0, 12).map((n) => (
-                  <tr key={n.symbol} className="border-t border-border/40">
-                    <td className="py-1 text-zinc-200">{n.symbol}</td>
-                    <td className="py-1 text-right text-muted">{n.out_count}</td>
-                    <td className="py-1 text-right text-muted">{n.in_count}</td>
-                    <td className={`py-1 text-right ${n.net_lead > 0 ? "text-[#d68b8b]" : n.net_lead < 0 ? "text-[#52b97a]" : "text-zinc-300"}`}>
-                      {n.net_lead > 0 ? "+" : ""}{n.net_lead}
-                    </td>
-                  </tr>
-                ))}
+                {data.nodes.slice(0, 12).map((n) => {
+                  const stabPct = n.leader_stability * 100;
+                  const stabColor = stabPct >= 70 ? "text-[#52b97a]" : stabPct >= 45 ? "text-[#8caaeb]" : "text-[#e3b457]";
+                  return (
+                    <tr key={n.symbol} className="border-t border-border/40" title={`leader_stability ${stabPct.toFixed(0)} · follower_stability ${(n.follower_stability * 100).toFixed(0)}`}>
+                      <td className="py-1 text-zinc-200">{n.symbol}</td>
+                      <td className="py-1 text-right text-muted">{n.out_count}</td>
+                      <td className="py-1 text-right text-muted">{n.in_count}</td>
+                      <td className={`py-1 text-right ${n.net_lead > 0 ? "text-[#d68b8b]" : n.net_lead < 0 ? "text-[#52b97a]" : "text-zinc-300"}`}>
+                        {n.net_lead > 0 ? "+" : ""}{n.net_lead}
+                      </td>
+                      <td className={`py-1 text-right ${stabColor}`}>{stabPct.toFixed(0)}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

@@ -4319,21 +4319,26 @@ def propagation_graph(
     of times an alert on A was followed by an alert on B for the same
     alert kind, with lead time in [`min_lead_ms`, `lead_window_ms`].
 
-    Two integrity guards added in the Phase-14 stabilization pass:
+    Edge weight is the *deduplicated* lead-pair count: each source event
+    on A contributes at most +1 to (A, B), and same-instant co-occurrences
+    (lead < `min_lead_ms`) are dropped to avoid market-wide-burst inflation.
 
-      * `min_lead_ms` (default 5s) rejects "simultaneous" co-occurrences.
-        Without it, market-wide bursts where N symbols fire the same kind
-        in the same minute inflate every (A, B) pair by N², giving us
-        edges with 1000+ count when the real lead-pair count was ~40.
+    Per-edge confidence is a weighted blend of six semantic signals (each
+    bounded in [0, 1] before composition), so HIGH/MEDIUM/LOW thresholds
+    stay stable as the graph grows — they're not percentile-based against
+    the current edge population:
 
-      * source-event dedup: each (source_alert, target_symbol) pair can
-        only contribute +1 to its edge. The original loop counted every
-        target alert in-window, so a single A→B "real" propagation could
-        be charged multiple times when B fired repeatedly.
+      * volume_strength      — `1 - exp(-count/15)` (saturates around 40)
+      * lead_clarity         — distance of avg lead above `min_lead_ms`
+      * lead_consistency     — 1 − coefficient of variation of leads
+      * temporal_consistency — fraction of days the edge actually fired
+      * recurrence_stability — penalty when events bunch into one day
+      * symmetry_penalty     — applied multiplicatively when B → A exists
+                               with comparable weight (coincidence guard)
 
-    The reported `count` is now the number of distinct source events on
-    A that were followed by ANY target event on B within window —
-    proper lead-pair counting.
+    Plus a node-level `leader_stability` (weighted mean of an edge's
+    base-confidence across its outgoing edges) attenuates final confidence,
+    so an edge from a flaky leader can't be HIGH on its own merit alone.
     """
     since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
     rows = db.execute(
@@ -4352,78 +4357,192 @@ def propagation_graph(
     for r in rows:
         by_kind[r.kind].append((int(r.started_at_ms), r.symbol))
 
+    DAY_MS = 24 * 3600 * 1000
     edges: Dict[Tuple[str, str], int] = defaultdict(int)
     lead_sums: Dict[Tuple[str, str], int] = defaultdict(int)
+    lead_sq_sums: Dict[Tuple[str, str], float] = defaultdict(float)
     lead_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    daily_counts: Dict[Tuple[str, str], Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
     for kind, lst in by_kind.items():
         lst.sort()
         for i, (ts_a, sym_a) in enumerate(lst):
             charged_targets_for_a = set()
+            day_a = (ts_a - since_ms) // DAY_MS
             for j in range(i + 1, len(lst)):
                 ts_b, sym_b = lst[j]
                 lead = ts_b - ts_a
                 if lead > lead_window_ms:
                     break
                 if lead < min_lead_ms:
-                    # simultaneous-or-near burst → not a propagation
                     continue
                 if sym_a == sym_b:
                     continue
                 if sym_b in charged_targets_for_a:
                     continue
                 charged_targets_for_a.add(sym_b)
-                edges[(sym_a, sym_b)] += 1
-                lead_sums[(sym_a, sym_b)] += lead
-                lead_counts[(sym_a, sym_b)] += 1
+                key = (sym_a, sym_b)
+                edges[key] += 1
+                lead_sums[key] += lead
+                lead_sq_sums[key] += lead * lead
+                lead_counts[key] += 1
+                daily_counts[key][int(day_a)] += 1
 
-    edges_out: List[dict] = []
+    # ── Pass 1: per-edge semantic signals (independent of other edges) ─
+
+    raw_edges: List[dict] = []
     for (a, b), c in edges.items():
         if c < 3:
             continue
-        avg_lead_ms = lead_sums[(a, b)] / lead_counts[(a, b)]
-        # Edge confidence: scales with both volume and how clean the lead
-        # is (close to min_lead = ambiguous, deep in the window = real).
-        # Cheap heuristic — count > 10 AND avg lead > 30s = high.
-        if c >= 10 and avg_lead_ms >= 30_000:
-            confidence = "HIGH"
-        elif c >= 5:
-            confidence = "MEDIUM"
+        n = lead_counts[(a, b)]
+        avg_lead_ms = lead_sums[(a, b)] / n
+        # variance via E[X²] − E[X]² (clip negatives from float error)
+        var_lead = max(0.0, lead_sq_sums[(a, b)] / n - avg_lead_ms * avg_lead_ms)
+        std_lead = var_lead ** 0.5
+
+        volume_strength = 1.0 - math.exp(-c / 15.0)
+        lead_clarity = max(0.0, min(1.0, (avg_lead_ms - min_lead_ms) / 60_000.0))
+        # Coefficient of variation inverted; tight leads → ~1, scattered → ~0.
+        cv = std_lead / avg_lead_ms if avg_lead_ms > 0 else 1.0
+        lead_consistency = max(0.0, min(1.0, 1.0 - cv))
+
+        days = daily_counts[(a, b)]
+        temporal_consistency = min(1.0, len(days) / float(lookback_days))
+        if c > 1:
+            max_day = max(days.values())
+            recurrence_stability = max(0.0, 1.0 - (max_day - 1) / float(c - 1))
         else:
-            confidence = "LOW"
-        edges_out.append({
+            recurrence_stability = 0.0
+
+        # Base confidence (0..1) before symmetry & leader attenuation.
+        base_confidence = (
+            0.30 * volume_strength
+            + 0.20 * lead_clarity
+            + 0.15 * lead_consistency
+            + 0.20 * temporal_consistency
+            + 0.15 * recurrence_stability
+        )
+
+        raw_edges.append({
             "from_symbol": a,
             "to_symbol": b,
             "count": c,
             "avg_lead_ms": avg_lead_ms,
             "avg_lead_s": avg_lead_ms / 1000.0,
-            "confidence": confidence,
+            "lead_std_s": std_lead / 1000.0,
+            "volume_strength": volume_strength,
+            "lead_clarity": lead_clarity,
+            "lead_consistency": lead_consistency,
+            "temporal_consistency": temporal_consistency,
+            "recurrence_stability": recurrence_stability,
+            "base_confidence": base_confidence,
         })
-    edges_out.sort(key=lambda e: -e["count"])
-    edges_out = edges_out[:50]
 
-    # Node centrality = sum of out-edges (how often A precedes others).
+    # ── Pass 2: symmetry penalty (needs reverse-edge lookup) ──────────
+
+    edge_by_pair = {(e["from_symbol"], e["to_symbol"]): e for e in raw_edges}
+    for e in raw_edges:
+        rev = edge_by_pair.get((e["to_symbol"], e["from_symbol"]))
+        if rev is None:
+            e["symmetry_penalty"] = 0.0
+        else:
+            ratio = min(e["count"], rev["count"]) / max(e["count"], rev["count"])
+            # Quadratic so near-equal pairs (ratio ≥ 0.7) get heavy penalty
+            # but a weak reverse (ratio ≤ 0.3) barely registers.
+            e["symmetry_penalty"] = ratio * ratio
+
+    # ── Pass 3: node leader_stability from base confidence ────────────
+
+    node_out_weighted: Dict[str, Tuple[float, int]] = defaultdict(lambda: (0.0, 0))
+    for e in raw_edges:
+        s = e["from_symbol"]
+        wsum, csum = node_out_weighted[s]
+        node_out_weighted[s] = (wsum + e["base_confidence"] * e["count"], csum + e["count"])
+    leader_stability: Dict[str, float] = {
+        s: (wsum / csum if csum else 0.0) for s, (wsum, csum) in node_out_weighted.items()
+    }
+
+    # ── Pass 4: final confidence + bucket ─────────────────────────────
+
+    for e in raw_edges:
+        ls = leader_stability.get(e["from_symbol"], 0.0)
+        # Attenuate by leader: a flaky leader caps the edge at ~0.5×base
+        # even if the per-edge signals look great in isolation.
+        leader_pull = 0.5 + 0.5 * ls
+        score = e["base_confidence"] * (1.0 - e["symmetry_penalty"]) * leader_pull
+        e["confidence_score"] = max(0.0, min(1.0, score))
+        e["leader_stability"] = ls
+        # Absolute thresholds (NOT percentile-based against the current
+        # 50-edge population — keep them stable as the graph grows).
+        if e["confidence_score"] >= 0.70:
+            e["confidence"] = "HIGH"
+        elif e["confidence_score"] >= 0.45:
+            e["confidence"] = "MEDIUM"
+        else:
+            e["confidence"] = "LOW"
+
+    # Rank by confidence_score so the top of the UI surfaces the strongest
+    # edges, not the densest-by-count (which conflated volume with truth).
+    raw_edges.sort(key=lambda e: -e["confidence_score"])
+    edges_out = raw_edges[:50]
+
+    # ── Node aggregates (counts + leader/follower stability) ──────────
+
     out_deg: Dict[str, int] = defaultdict(int)
     in_deg: Dict[str, int] = defaultdict(int)
+    in_weighted: Dict[str, Tuple[float, int]] = defaultdict(lambda: (0.0, 0))
     for e in edges_out:
         out_deg[e["from_symbol"]] += e["count"]
         in_deg[e["to_symbol"]] += e["count"]
+        wsum, csum = in_weighted[e["to_symbol"]]
+        in_weighted[e["to_symbol"]] = (
+            wsum + e["confidence_score"] * e["count"],
+            csum + e["count"],
+        )
+    follower_stability: Dict[str, float] = {
+        s: (wsum / csum if csum else 0.0) for s, (wsum, csum) in in_weighted.items()
+    }
 
     nodes = sorted(
         set(out_deg) | set(in_deg),
         key=lambda s: -(out_deg.get(s, 0)),
     )
     node_rows = [
-        {"symbol": s, "out_count": out_deg.get(s, 0), "in_count": in_deg.get(s, 0),
-         "net_lead": out_deg.get(s, 0) - in_deg.get(s, 0)}
+        {
+            "symbol": s,
+            "out_count": out_deg.get(s, 0),
+            "in_count": in_deg.get(s, 0),
+            "net_lead": out_deg.get(s, 0) - in_deg.get(s, 0),
+            "leader_stability": leader_stability.get(s, 0.0),
+            "follower_stability": follower_stability.get(s, 0.0),
+        }
         for s in nodes
     ]
 
-    # Systemic contagion: pairwise co-occurrences vs max possible pairs.
-    # Co-occurrence is O(N²) in the worst case, so the denominator has to
-    # be O(N²) too — otherwise the score scales to nonsense (we had a
-    # 6000% reading on real data because the original denominator was N,
-    # not N choose 2). Cap at 100 so the UI band stays readable.
+    # ── Graph-level integrity score ───────────────────────────────────
+
+    if edges_out:
+        avg_confidence = sum(e["confidence_score"] for e in edges_out) / len(edges_out)
+        symmetric_share = sum(1 for e in edges_out if e["symmetry_penalty"] >= 0.5) / len(edges_out)
+        weak_share = sum(1 for e in edges_out if e["confidence_score"] < 0.45) / len(edges_out)
+        coverage = sum(e["temporal_consistency"] for e in edges_out) / len(edges_out)
+    else:
+        avg_confidence = symmetric_share = weak_share = coverage = 0.0
+
+    integrity_components = {
+        "avg_confidence": avg_confidence,
+        "symmetric_share": symmetric_share,
+        "weak_share": weak_share,
+        "coverage": coverage,
+    }
+    integrity_score = 100.0 * max(0.0, min(1.0,
+        0.45 * avg_confidence
+        + 0.25 * (1.0 - symmetric_share)
+        + 0.20 * (1.0 - weak_share)
+        + 0.10 * coverage
+    ))
+
+    # Systemic contagion (existing): pairwise co-occurrences vs max possible.
     total_alerts = sum(len(v) for v in by_kind.values())
     max_pairs = max(1, total_alerts * (total_alerts - 1) // 2)
     raw_total = sum(e["count"] for e in edges_out)
@@ -4438,6 +4557,8 @@ def propagation_graph(
         "systemic_contagion_score": contagion_score,
         "average_propagation_velocity_s": avg_velocity_s,
         "total_alerts": total_alerts,
+        "integrity_score": integrity_score,
+        "integrity_components": integrity_components,
     }
 
 

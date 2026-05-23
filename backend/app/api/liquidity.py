@@ -2799,7 +2799,18 @@ class PropagationEdge(BaseModel):
     count: int
     avg_lead_ms: float
     avg_lead_s: float
+    lead_std_s: float = 0.0
     confidence: str    # HIGH | MEDIUM | LOW
+    confidence_score: float = 0.0
+    # Explainable sub-signals (all in [0, 1]).
+    volume_strength: float = 0.0
+    lead_clarity: float = 0.0
+    lead_consistency: float = 0.0
+    temporal_consistency: float = 0.0
+    recurrence_stability: float = 0.0
+    symmetry_penalty: float = 0.0
+    leader_stability: float = 0.0
+    base_confidence: float = 0.0
 
 
 class PropagationNode(BaseModel):
@@ -2807,6 +2818,15 @@ class PropagationNode(BaseModel):
     out_count: int
     in_count: int
     net_lead: int
+    leader_stability: float = 0.0
+    follower_stability: float = 0.0
+
+
+class PropagationIntegrityComponents(BaseModel):
+    avg_confidence: float
+    symmetric_share: float
+    weak_share: float
+    coverage: float
 
 
 class PropagationOut(BaseModel):
@@ -2817,6 +2837,8 @@ class PropagationOut(BaseModel):
     systemic_contagion_score: float
     average_propagation_velocity_s: Optional[float]
     total_alerts: int
+    integrity_score: float = 0.0
+    integrity_components: Optional[PropagationIntegrityComponents] = None
 
 
 @router.get("/research/propagation", response_model=PropagationOut)
