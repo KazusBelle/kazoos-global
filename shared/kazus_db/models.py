@@ -140,9 +140,19 @@ class LiquiditySample(Base):
 
     __tablename__ = "liquidity_samples"
     __table_args__ = (
+        # (symbol, metric, ts) — for symbol-scoped reads (chart, replay).
         Index(
             "ix_liq_samples_symbol_metric_ts",
             "symbol",
+            "metric",
+            "ts",
+        ),
+        # (metric, ts) — for cross-symbol aggregations (pattern_discovery,
+        # any "all symbols at metric X over time range" reads). Without
+        # this, the planner falls back to a parallel seq scan on the 1M+
+        # rows/day samples table and spills to disk on sort.
+        Index(
+            "ix_liq_samples_metric_ts",
             "metric",
             "ts",
         ),
