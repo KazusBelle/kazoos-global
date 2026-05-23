@@ -254,7 +254,11 @@ function PatternDiscoveryPanel() {
   return (
     <Panel
       title="Pattern Discovery"
-      subtitle={data ? `base rate ${(data.base_rate * 100).toFixed(2)}% · ${data.total_buckets} buckets · ${data.patterns.length} patterns` : "recurring metric combos → downstream alert rates"}
+      subtitle={
+        data
+          ? `base rate ${(data.base_rate * 100).toFixed(2)}% · ${data.total_buckets} buckets · ${data.patterns.length} patterns${data.suppressed_count ? ` (${data.suppressed_count} suppressed)` : ""}`
+          : "recurring metric combos → downstream alert rates"
+      }
       toolbar={
         <div className="flex items-center gap-3">
           <DataQualityChip q={data?.data_quality} />
@@ -290,28 +294,63 @@ function PatternDiscoveryPanel() {
                 ))}
                 <th className="text-right py-2">N</th>
                 <th className="text-right py-2">RATE</th>
-                <th className="text-right py-2">LIFT</th>
-                <th className="text-right py-2">NOV</th>
+                <th className="text-right py-2" title="effective lift = raw lift × stability">EFF.LIFT</th>
+                <th className="text-right py-2" title="stability score (window balance, recurrence, flag penalties)">STAB</th>
+                <th className="text-right py-2" title="pattern confidence (stability × scarcity factor)">CONF</th>
+                <th className="text-left py-2">FLAGS</th>
                 <th className="text-left py-2">DOM KIND</th>
               </tr>
             </thead>
             <tbody>
               {data.patterns.map((p) => {
-                const liftColor =
-                  p.lift == null ? "text-muted"
-                    : p.lift >= 2 ? "text-[#52b97a]"
-                      : p.lift >= 1.3 ? "text-[#e3b457]"
-                        : p.lift < 0.7 ? "text-[#d68b8b]" : "text-zinc-300";
+                const eff = p.effective_lift;
+                const effColor =
+                  eff >= 1.5 ? "text-[#52b97a]"
+                    : eff >= 1.0 ? "text-[#e3b457]"
+                      : eff > 0 ? "text-[#d68b8b]" : "text-muted";
+                const stab = p.stability_score;
+                const stabColor = stab >= 0.6 ? "text-[#52b97a]" : stab >= 0.3 ? "text-[#e3b457]" : "text-[#d68b8b]";
+                const rowOpacity = p.suppressed_reason ? "opacity-50" : "";
+                const tip = [
+                  `raw_lift     ${p.lift != null ? p.lift.toFixed(2) + "×" : "—"}`,
+                  `stability    ${(p.stability_score * 100).toFixed(0)}`,
+                  `confidence   ${p.pattern_confidence.toFixed(0)}`,
+                  `day_span     ${p.day_span}`,
+                  `half balance ${p.first_half_support}/${p.second_half_support}`,
+                  p.suppressed_reason ? `suppressed: ${p.suppressed_reason}` : "",
+                ].filter(Boolean).join("\n");
                 return (
-                  <tr key={p.discovered_pattern_id} className="border-t border-border/40">
+                  <tr key={p.discovered_pattern_id} className={`border-t border-border/40 ${rowOpacity}`} title={tip}>
                     <td className="py-1 text-muted text-[10px]">{p.discovered_pattern_id}</td>
                     {data.metrics.map((m) => (
                       <td key={m} className="py-1 px-1"><TertileChip v={p.signature[m] as "low" | "mid" | "high" | "na"} /></td>
                     ))}
                     <td className="py-1 text-right text-zinc-200">{p.support}</td>
                     <td className="py-1 text-right text-zinc-200">{(p.outcome_rate * 100).toFixed(0)}%</td>
-                    <td className={`py-1 text-right ${liftColor}`}>{p.lift != null ? `${p.lift.toFixed(2)}×` : "—"}</td>
-                    <td className="py-1 text-right text-muted">{p.novelty_score.toFixed(0)}</td>
+                    <td className={`py-1 text-right ${effColor}`}>{eff > 0 ? `${eff.toFixed(2)}×` : "—"}</td>
+                    <td className={`py-1 text-right ${stabColor}`}>{(stab * 100).toFixed(0)}</td>
+                    <td className="py-1 text-right text-muted">{p.pattern_confidence.toFixed(0)}</td>
+                    <td className="py-1 text-[9px] uppercase tracking-[0.08em]">
+                      {p.robustness_flags.length === 0 ? (
+                        <span className="text-muted">—</span>
+                      ) : (
+                        p.robustness_flags.map((f) => {
+                          const abbr: Record<string, string> = {
+                            LOW_SUPPORT: "lo-sup",
+                            HIGH_LIFT_LOW_SUPPORT: "lift-sup",
+                            SINGLE_WINDOW: "1-win",
+                            LOW_RECURRENCE: "lo-rec",
+                            REGIME_FRAGILE: "rg-frag",
+                            BUCKET_SENSITIVE: "buk-sen",
+                          };
+                          return (
+                            <span key={f} className="inline-block mr-1 text-[#d68b8b]" title={f}>
+                              {abbr[f] ?? f}
+                            </span>
+                          );
+                        })
+                      )}
+                    </td>
                     <td className="py-1 text-[10px] text-zinc-300">{p.dominant_alert_kind ? `${p.dominant_alert_kind.replace(/_/g, " ")} (${p.dominant_alert_count})` : "—"}</td>
                   </tr>
                 );

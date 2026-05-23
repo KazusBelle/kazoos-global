@@ -1428,6 +1428,14 @@ export async function getNarrativeChronicle(lookback_days = 21) {
 
 // ── Phase-14 discovery ────────────────────────────────────────────────────
 
+export type RobustnessFlag =
+  | "LOW_SUPPORT"
+  | "HIGH_LIFT_LOW_SUPPORT"
+  | "SINGLE_WINDOW"
+  | "LOW_RECURRENCE"
+  | "REGIME_FRAGILE"
+  | "BUCKET_SENSITIVE";
+
 export type DiscoveredPattern = {
   discovered_pattern_id: string;
   // tertile per metric; "na" when a metric wasn't populated in the
@@ -1436,9 +1444,17 @@ export type DiscoveredPattern = {
   support: number;
   outcome_rate: number;
   lift: number | null;
+  effective_lift: number;
   dominant_alert_kind: string | null;
   dominant_alert_count: number;
   novelty_score: number;
+  stability_score: number;
+  pattern_confidence: number;
+  robustness_flags: RobustnessFlag[];
+  suppressed_reason: string | null;
+  day_span: number;
+  first_half_support: number;
+  second_half_support: number;
 };
 
 export type DataQuality = "HIGH" | "MEDIUM" | "LOW" | "INSUFFICIENT";
@@ -1452,6 +1468,8 @@ export type PatternDiscovery = {
   total_buckets: number;
   patterns: DiscoveredPattern[];
   data_quality: DataQuality;
+  suppressed_count: number;
+  scarcity_factor: number;
 };
 
 export async function getPatternDiscovery(opts: { since_ms?: number; min_support?: number; bucket_minutes?: number } = {}) {

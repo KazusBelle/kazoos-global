@@ -4050,6 +4050,9 @@ def discover_patterns(
 
     patterns: Dict[Tuple[str, ...], dict] = {}
     total_buckets = 0
+    now_ms = int(time.time() * 1000)
+    mid_ms = (since_ms + now_ms) // 2
+    DAY_MS = 24 * 3600 * 1000
     # Soft gate: any (symbol, bucket) with at least min_metrics populated
     # contributes. Missing metrics get a "?" tertile so the signature
     # still hashes consistently. The strict gate ("all 7 present") starved
@@ -4064,33 +4067,126 @@ def discover_patterns(
             for m in PATTERN_METRICS
         )
         outcome = _outcome(sym, bts)
-        rec = patterns.setdefault(sig, {"count": 0, "outcomes": 0, "kinds": defaultdict(int)})
+        rec = patterns.setdefault(sig, {
+            "count": 0, "outcomes": 0, "kinds": defaultdict(int),
+            "first_half": 0, "second_half": 0,
+            "days": defaultdict(int),  # day_index → bucket_count
+        })
         rec["count"] += 1
+        if bts < mid_ms:
+            rec["first_half"] += 1
+        else:
+            rec["second_half"] += 1
+        rec["days"][bts // DAY_MS] += 1
         if outcome:
             rec["outcomes"] += 1
             rec["kinds"][outcome] += 1
         total_buckets += 1
 
+    overall_quality = _discovery_quality(total_buckets, low=20, medium=100, high=500)
+    # Scarcity multiplier on pattern_confidence — when there's not enough
+    # data to mine, every "discovered" pattern is a candidate at best.
+    SCARCITY_FACTOR = {"INSUFFICIENT": 0.15, "LOW": 0.40, "MEDIUM": 0.75, "HIGH": 1.0}
+    scarcity_factor = SCARCITY_FACTOR.get(overall_quality, 0.15)
+
     out: List[dict] = []
+    suppressed_count = 0
     base_rate = sum(p["outcomes"] for p in patterns.values()) / max(1, total_buckets)
-    for i, (sig, agg) in enumerate(patterns.items(), start=1):
+    for sig, agg in patterns.items():
         if agg["count"] < min_support:
             continue
         rate = agg["outcomes"] / agg["count"] if agg["count"] > 0 else 0.0
         lift = rate / base_rate if base_rate > 0 else None
         dom_kind, dom_n = max(agg["kinds"].items(), key=lambda kv: kv[1]) if agg["kinds"] else (None, 0)
         novelty = max(0.0, 100.0 * (1.0 - agg["count"] / total_buckets))
+
+        # ── Robustness flags ──────────────────────────────────────────
+        flags: List[str] = []
+        c = agg["count"]
+        if c < min_support * 1.5:
+            flags.append("LOW_SUPPORT")
+        if lift is not None and lift >= 2.0 and c < 20:
+            flags.append("HIGH_LIFT_LOW_SUPPORT")
+        # SINGLE_WINDOW: pattern appears entirely in one half of the
+        # lookback (or one half holds <15% of total) — could not survive
+        # window re-anchoring.
+        fh, sh = agg["first_half"], agg["second_half"]
+        minority_share = min(fh, sh) / c if c else 0.0
+        if minority_share < 0.15:
+            flags.append("SINGLE_WINDOW")
+        # LOW_RECURRENCE: pattern's buckets bunch into one day (or fewer
+        # than 2 distinct days) — won't survive re-bucketing or any
+        # robustness test.
+        day_span = len(agg["days"])
+        max_day_share = (max(agg["days"].values()) / c) if c else 1.0
+        if day_span < 2 or max_day_share > 0.70:
+            flags.append("LOW_RECURRENCE")
+        # REGIME_FRAGILE: pattern's follow-through alerts cluster on a
+        # single alert kind (>80%) — pattern "works" only when one kind
+        # of regime is active, fragile to regime shifts.
+        if agg["outcomes"] >= 5 and dom_kind is not None and (dom_n / agg["outcomes"]) > 0.80:
+            flags.append("REGIME_FRAGILE")
+        # BUCKET_SENSITIVE: the pattern dominates a sizable chunk of
+        # any active day's bucket-space (>50% of the 24h / bucket_minutes
+        # slots). Means the pattern fires hours in a row — its support
+        # would collapse if the bucket size were re-anchored.
+        buckets_per_day = (24 * 60) / max(1, bucket_minutes)
+        if day_span >= 1 and (c / day_span) > buckets_per_day * 0.50:
+            flags.append("BUCKET_SENSITIVE")
+
+        # ── Stability score ──────────────────────────────────────────
+        # Multiplicative penalties — a pattern with multiple flags
+        # degrades quickly. Half-balance also contributes positively.
+        stability = 1.0
+        if "SINGLE_WINDOW" in flags:
+            stability *= 0.30
+        if "LOW_RECURRENCE" in flags:
+            stability *= 0.35
+        if "HIGH_LIFT_LOW_SUPPORT" in flags:
+            stability *= 0.50
+        if "REGIME_FRAGILE" in flags:
+            stability *= 0.65
+        if "BUCKET_SENSITIVE" in flags:
+            stability *= 0.65
+        if "LOW_SUPPORT" in flags:
+            stability *= 0.75
+        # Smooth bonus for half-balance (already captured by SINGLE_WINDOW
+        # at the extreme, but reward even split additionally).
+        stability *= 0.6 + 0.4 * (minority_share * 2)  # minority_share in [0, 0.5]
+
+        effective_lift = (lift or 0.0) * stability
+        pattern_confidence = 100.0 * stability * scarcity_factor
+
+        suppressed_reason: Optional[str] = None
+        if overall_quality == "INSUFFICIENT":
+            suppressed_reason = f"INSUFFICIENT data ({total_buckets} buckets)"
+        elif pattern_confidence < 15:
+            suppressed_reason = "below display threshold: " + ", ".join(flags) if flags else "scarcity"
+        if suppressed_reason:
+            suppressed_count += 1
+
         out.append({
             "discovered_pattern_id": f"P{abs(hash(sig)) % 10**8:08d}",
             "signature": dict(zip(PATTERN_METRICS, sig)),
-            "support": agg["count"],
+            "support": c,
             "outcome_rate": rate,
             "lift": lift,
+            "effective_lift": effective_lift,
             "dominant_alert_kind": dom_kind,
             "dominant_alert_count": dom_n,
             "novelty_score": novelty,
+            "stability_score": stability,
+            "pattern_confidence": pattern_confidence,
+            "robustness_flags": flags,
+            "suppressed_reason": suppressed_reason,
+            "day_span": day_span,
+            "first_half_support": fh,
+            "second_half_support": sh,
         })
-    out.sort(key=lambda r: -(r["lift"] or 0))
+
+    # Sort by effective_lift (stability-discounted) so unstable high-lift
+    # patterns can't dominate the top of the UI.
+    out.sort(key=lambda r: -r["effective_lift"])
     return {
         "since_ms": since_ms,
         "min_support": min_support,
@@ -4099,10 +4195,9 @@ def discover_patterns(
         "base_rate": base_rate,
         "total_buckets": total_buckets,
         "patterns": out[:40],
-        # Sample adequacy gate: with <50 buckets the base_rate is too
-        # noisy and lifts shouldn't be trusted; HIGH only when there's
-        # really a population to mine.
-        "data_quality": _discovery_quality(total_buckets, low=20, medium=100, high=500),
+        "data_quality": overall_quality,
+        "suppressed_count": suppressed_count,
+        "scarcity_factor": scarcity_factor,
     }
 
 

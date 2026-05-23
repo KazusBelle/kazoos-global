@@ -2701,9 +2701,17 @@ class DiscoveredPattern(BaseModel):
     support: int
     outcome_rate: float
     lift: Optional[float]
+    effective_lift: float = 0.0
     dominant_alert_kind: Optional[str]
     dominant_alert_count: int
     novelty_score: float
+    stability_score: float = 0.0
+    pattern_confidence: float = 0.0
+    robustness_flags: List[str] = []
+    suppressed_reason: Optional[str] = None
+    day_span: int = 0
+    first_half_support: int = 0
+    second_half_support: int = 0
 
 
 class PatternDiscoveryOut(BaseModel):
@@ -2715,6 +2723,8 @@ class PatternDiscoveryOut(BaseModel):
     total_buckets: int
     patterns: List[DiscoveredPattern]
     data_quality: str = "INSUFFICIENT"
+    suppressed_count: int = 0
+    scarcity_factor: float = 0.0
 
 
 @router.get("/research/pattern-discovery", response_model=PatternDiscoveryOut)
