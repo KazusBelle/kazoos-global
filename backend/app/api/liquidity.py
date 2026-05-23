@@ -3003,6 +3003,243 @@ async def sanity_audit_endpoint(
     return SanityAuditOut(**_research.sanity_audit(db))
 
 
+class CausalFactors(BaseModel):
+    volume: float
+    asymmetry: float
+    evidence: float
+    common_driver_penalty: float
+    symmetry: float
+    scarcity: float
+
+
+class CausalEdge(BaseModel):
+    from_symbol: str
+    to_symbol: str
+    count: int
+    reverse_count: int
+    asymmetry: float
+    evidence_count: int
+    n_windows: int
+    symmetry_penalty: float
+    common_driver: Optional[str] = None
+    common_driver_strength: int = 0
+    causal_confidence: float
+    verdict: str        # DIRECTIONAL | COMMON_DRIVEN | COINCIDENCE | UNDER_EVIDENCED | AMBIGUOUS | EXPLORATORY
+    rationale: str
+    factors: CausalFactors
+
+
+class CausalNode(BaseModel):
+    symbol: str
+    out_count: int
+    in_count: int
+    avg_out_confidence: float
+    avg_in_confidence: float
+    stability: float
+    role: str           # LEADER | AMPLIFIER | FOLLOWER | INSTABILITY_HUB | ISOLATED
+    role_rationale: str
+
+
+class CausalPropagationOut(BaseModel):
+    since_ms: int
+    lookback_days: int
+    n_windows: int
+    total_alerts: int
+    edges: List[CausalEdge]
+    nodes: List[CausalNode]
+    verdict_counts: dict
+    role_counts: dict
+    data_quality: str
+
+
+@router.get("/research/causal-propagation", response_model=CausalPropagationOut)
+async def causal_propagation_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    n_windows: int = Query(3, ge=2, le=5),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> CausalPropagationOut:
+    return CausalPropagationOut(**_research.causal_propagation(
+        db, lookback_days=lookback_days, n_windows=n_windows,
+    ))
+
+
+class InfluenceChain(BaseModel):
+    path: List[str]
+    min_confidence: float
+    step_confidences: List[float]
+    rationale: str
+
+
+class DependencyCluster(BaseModel):
+    cluster_id: int
+    cluster_type: str    # "common_driver"
+    driver: str
+    members: List[str]
+    size: int
+    min_driver_strength: int
+    rationale: str
+
+
+class DominantDriver(BaseModel):
+    symbol: str
+    reach_depth: int
+    reach_size: int
+    direct_out_count: int
+    avg_out_confidence: float
+    influence_score: float
+    reachable_sample: List[str]
+    rationale: str
+
+
+class SynchronizedGroup(BaseModel):
+    group_id: int
+    members: List[str]
+    size: int
+    coincidence_edges: int
+    rationale: str
+
+
+class StructuralDependenciesOut(BaseModel):
+    since_ms: int
+    lookback_days: int
+    data_quality: str
+    exploratory: bool
+    directional_edge_count: int
+    common_driven_edge_count: int
+    coincidence_edge_count: int
+    influence_chains: List[InfluenceChain]
+    dependency_clusters: List[DependencyCluster]
+    dominant_drivers: List[DominantDriver]
+    synchronized_groups: List[SynchronizedGroup]
+    summary: str
+
+
+@router.get("/research/structural-dependencies", response_model=StructuralDependenciesOut)
+async def structural_dependencies_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> StructuralDependenciesOut:
+    return StructuralDependenciesOut(**_research.structural_dependencies(
+        db, lookback_days=lookback_days,
+    ))
+
+
+class MarketTransition(BaseModel):
+    ts_ms: int
+    from_state: str
+    to_state: str
+    persistence_snapshots: int
+    persistence_seconds: int
+    was_reverted: bool
+    pre_stress_slope: Optional[float] = None
+    post_stress_slope: Optional[float] = None
+    acceleration: Optional[float] = None
+    meta_confidence_at: float
+    verdict: str   # PERSISTENT | ACCELERATING | FLICKER | REVERSED
+    confidence: float
+    rationale: str
+
+
+class OscillationPeriod(BaseModel):
+    start_ms: int
+    end_ms: int
+    transition_count: int
+    rationale: str
+
+
+class MarketStateTransitionsOut(BaseModel):
+    since_ms: int
+    lookback_days: int
+    data_quality: str
+    exploratory: bool
+    snapshot_count: int
+    state_vocabulary: List[str]
+    state_counts: dict
+    current_state: Optional[str] = None
+    current_state_duration_snapshots: int
+    current_state_duration_seconds: int
+    transition_count: int
+    flicker_count: int
+    flicker_ratio: float
+    transition_rate_per_day: float
+    transitions: List[MarketTransition]
+    oscillation_periods: List[OscillationPeriod]
+    summary: str
+
+
+@router.get("/research/state-transitions", response_model=MarketStateTransitionsOut)
+async def market_state_transitions_endpoint(
+    lookback_days: int = Query(14, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> MarketStateTransitionsOut:
+    return MarketStateTransitionsOut(**_research.market_state_transitions(
+        db, lookback_days=lookback_days,
+    ))
+
+
+class CrisisGenesisProbe(BaseModel):
+    kind: str
+    name: str
+    score: float
+    status: str    # calm | elevated | hot | insufficient
+    rationale: str
+    metric_value: Optional[float] = None
+    contributes: bool
+
+
+class CrisisGenesisOut(BaseModel):
+    fetched_at_ms: int
+    lookback_days: int
+    genesis_score: float
+    verdict: str   # CALM | EARLY_DISTORTION | ELEVATED_RISK | PRE_CASCADE | INSUFFICIENT
+    confidence: float   # fraction of probes that had data
+    probe_count: int
+    hot_count: int
+    elevated_count: int
+    calm_count: int
+    insufficient_count: int
+    probes: List[CrisisGenesisProbe]
+    summary: str
+
+
+@router.get("/research/crisis-genesis", response_model=CrisisGenesisOut)
+async def crisis_genesis_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> CrisisGenesisOut:
+    return CrisisGenesisOut(**_research.crisis_genesis(db, lookback_days=lookback_days))
+
+
+class NarrativeSection(BaseModel):
+    kind: str       # state | propagation | structural | genesis | uncertainty
+    title: str
+    text: str
+    confidence: Optional[float] = None
+
+
+class NarrativeCausalityOut(BaseModel):
+    fetched_at_ms: int
+    lookback_days: int
+    headline: str
+    verdict: str   # passthrough of crisis-genesis verdict
+    overall_confidence: float
+    sections: List[NarrativeSection]
+    paragraph: str
+
+
+@router.get("/research/narrative-causality", response_model=NarrativeCausalityOut)
+async def narrative_causality_endpoint(
+    lookback_days: int = Query(7, ge=3, le=30),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> NarrativeCausalityOut:
+    return NarrativeCausalityOut(**_research.narrative_causality(db, lookback_days=lookback_days))
+
+
 class WorkerHeartbeat(BaseModel):
     task: str
     last_tick_ms: Optional[int] = None

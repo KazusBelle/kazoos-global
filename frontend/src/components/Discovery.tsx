@@ -12,7 +12,12 @@
 import { useEffect, useState } from "react";
 import {
   getAdaptationRecommendations,
+  getCausalPropagation,
   getCrisisArchetypes,
+  getCrisisGenesis,
+  getMarketStateTransitions,
+  getNarrativeCausality,
+  getStructuralDependencies,
   getEvolutionaryBehavior,
   getHiddenRegimes,
   getIntelligenceForecast,
@@ -21,7 +26,18 @@ import {
   getPropagation,
   getSanityAudit,
   type AdaptationOut,
+  type CausalEdge,
+  type CausalPropagation,
+  type CausalRole,
+  type CausalVerdict,
   type CrisisArchetypes,
+  type CrisisGenesis,
+  type CrisisGenesisStatus,
+  type CrisisGenesisVerdict,
+  type MarketStateTransitions,
+  type NarrativeCausality,
+  type TransitionVerdict,
+  type StructuralDependencies,
   type DataQuality,
   type EvolutionaryBehavior,
   type HiddenRegimes,
@@ -45,12 +61,17 @@ export function Discovery() {
       </div>
 
       <SanityBanner />
+      <CrisisGenesisPanel />
+      <NarrativeCausalityPanel />
       <PatternDiscoveryPanel />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <CrisisArchetypesPanel />
         <HiddenRegimesPanel />
       </div>
       <PropagationPanel />
+      <CausalPropagationPanel />
+      <StructuralDependenciesPanel />
+      <MarketStateTransitionsPanel />
       <EvolutionaryPanel />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <MemoryAbstractionPanel />
@@ -300,6 +321,187 @@ function SanityBanner() {
         })}
       </ul>
     </div>
+  );
+}
+
+// ── Crisis Genesis Detection (Phase 15 #4) ──────────────────────────────
+
+const GENESIS_VERDICT_COLOR: Record<CrisisGenesisVerdict, string> = {
+  CALM:             "rgba(82, 185, 122, 0.95)",
+  EARLY_DISTORTION: "rgba(140, 170, 235, 0.95)",
+  ELEVATED_RISK:    "rgba(227, 180, 87, 0.95)",
+  PRE_CASCADE:      "rgba(214, 75, 75, 0.95)",
+  INSUFFICIENT:     "rgba(140, 140, 140, 0.85)",
+};
+
+const GENESIS_VERDICT_LABEL: Record<CrisisGenesisVerdict, string> = {
+  CALM:             "calm — no precursor signals materially elevated",
+  EARLY_DISTORTION: "early distortion — one or two precursor signals firing",
+  ELEVATED_RISK:    "elevated risk — multiple precursor signals firing",
+  PRE_CASCADE:      "pre-cascade — most precursor signals firing",
+  INSUFFICIENT:     "insufficient — not enough data to score",
+};
+
+const PROBE_STATUS_COLOR: Record<CrisisGenesisStatus, string> = {
+  calm:         "rgba(82, 185, 122, 0.95)",
+  elevated:     "rgba(227, 180, 87, 0.95)",
+  hot:          "rgba(214, 75, 75, 0.95)",
+  insufficient: "rgba(140, 140, 140, 0.75)",
+};
+
+function CrisisGenesisPanel() {
+  const [data, setData] = useState<CrisisGenesis | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getCrisisGenesis()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  if (error) return null;
+  if (!data) return null;
+
+  const verdictColor = GENESIS_VERDICT_COLOR[data.verdict];
+  const verdictLabel = GENESIS_VERDICT_LABEL[data.verdict];
+
+  return (
+    <div
+      className="rounded-lg border bg-panel/60 px-3 py-2.5"
+      style={{ borderColor: verdictColor.replace(/0\.95\)$|0\.85\)$/, "0.55)") }}
+    >
+      <div className="flex items-baseline gap-3 mb-2.5">
+        <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: verdictColor }}>
+          ● crisis genesis · {data.verdict.toLowerCase().replace(/_/g, " ")}
+        </span>
+        <span className="text-[10px] uppercase tracking-[0.18em] text-muted">
+          score {data.genesis_score.toFixed(0)}/100 · confidence {(data.confidence * 100).toFixed(0)}% · {data.probe_count - data.insufficient_count}/{data.probe_count} probes contributing
+        </span>
+      </div>
+
+      <div className="text-[11px] text-muted mb-3 leading-snug">
+        {verdictLabel}. {data.verdict === "PRE_CASCADE" ? (
+          <span className="text-[#d68b8b]">Take action before propagation widens further.</span>
+        ) : data.verdict === "ELEVATED_RISK" ? (
+          <span className="text-[#e3b457]">Watch for the next hot probe to confirm.</span>
+        ) : data.verdict === "EARLY_DISTORTION" ? (
+          <span>Treat as exploratory — could resolve or escalate.</span>
+        ) : data.verdict === "INSUFFICIENT" ? (
+          <span>The system is silent because data is missing, not because the market is calm.</span>
+        ) : (
+          <span>Precursor probes are quiet.</span>
+        )}
+      </div>
+
+      <ul className="space-y-1.5 font-mono text-[11px]">
+        {data.probes.map((p) => {
+          const sc = PROBE_STATUS_COLOR[p.status];
+          return (
+            <li key={p.kind} className="flex items-baseline gap-2" title={p.rationale}>
+              <span
+                className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
+                style={{
+                  color: sc,
+                  borderColor: sc.replace(/0\.95\)$|0\.85\)$|0\.75\)$/, "0.5)"),
+                  background: sc.replace(/0\.95\)$|0\.85\)$|0\.75\)$/, "0.10)"),
+                  minWidth: "3.4rem",
+                  textAlign: "center",
+                }}
+              >
+                {p.status === "insufficient" ? "—" : p.score.toFixed(0)}
+              </span>
+              <span className="text-muted shrink-0 w-44 truncate">{p.name}</span>
+              <span className="text-zinc-300 flex-1 truncate">{p.rationale}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+// ── Narrative Causality (Phase 15 #6) ───────────────────────────────────
+
+const NARRATIVE_SECTION_ICON: Record<string, string> = {
+  state:        "●",
+  propagation:  "▸",
+  structural:   "◆",
+  genesis:      "⚠",
+  uncertainty:  "?",
+};
+
+function NarrativeCausalityPanel() {
+  const [data, setData] = useState<NarrativeCausality | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getNarrativeCausality()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, 60_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  return (
+    <Panel
+      title="Narrative Causality"
+      subtitle={data ? data.headline : "deterministic narrative over Phase 15 layers"}
+      toolbar={
+        data ? (
+          <span className="text-[9px] uppercase tracking-[0.18em] text-muted">
+            confidence {(data.overall_confidence * 100).toFixed(0)}%
+          </span>
+        ) : null
+      }
+    >
+      {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
+      {!error && !data && <div className="text-xs text-muted">Loading…</div>}
+      {data && (
+        <div className="space-y-3">
+          <div className="text-[10px] text-muted leading-snug">
+            Composed deterministically from causal_propagation +
+            structural_dependencies + market_state_transitions +
+            crisis_genesis. Every claim is template-built from
+            upstream numbers — no model generation, no opaque scoring.
+          </div>
+          <ul className="space-y-2.5">
+            {data.sections.map((s) => {
+              const icon = NARRATIVE_SECTION_ICON[s.kind] ?? "·";
+              const confColor =
+                s.confidence == null ? "text-muted" :
+                s.confidence >= 0.7 ? "text-[#52b97a]" :
+                s.confidence >= 0.4 ? "text-[#8caaeb]" :
+                "text-[#e3b457]";
+              return (
+                <li key={s.kind} className="leading-relaxed">
+                  <div className="flex items-baseline gap-2 mb-0.5">
+                    <span className="text-[11px] uppercase tracking-[0.18em] text-muted shrink-0">
+                      {icon} {s.title}
+                    </span>
+                    {s.confidence != null && (
+                      <span className={`text-[9px] uppercase tracking-[0.12em] ${confColor}`}>
+                        conf {(s.confidence * 100).toFixed(0)}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[12px] text-zinc-300 pl-5">
+                    {s.text}
+                  </p>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </Panel>
   );
 }
 
@@ -774,6 +976,532 @@ function PropagationPanel() {
       {data?.average_propagation_velocity_s != null && (
         <div className="text-[10px] uppercase tracking-[0.16em] text-muted pt-3 border-t border-border/40 mt-3">
           avg propagation velocity: <span className="text-zinc-300">{data.average_propagation_velocity_s.toFixed(0)}s</span>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Causal Propagation (Phase 15) ───────────────────────────────────────
+
+const VERDICT_COLOR: Record<CausalVerdict, string> = {
+  DIRECTIONAL:     "rgba(82, 185, 122, 0.95)",
+  COMMON_DRIVEN:   "rgba(227, 180, 87, 0.95)",
+  AMBIGUOUS:       "rgba(140, 170, 235, 0.95)",
+  UNDER_EVIDENCED: "rgba(140, 140, 140, 0.85)",
+  COINCIDENCE:     "rgba(214, 105, 105, 0.95)",
+  EXPLORATORY:     "rgba(120, 120, 120, 0.85)",
+};
+
+const VERDICT_LABEL: Record<CausalVerdict, string> = {
+  DIRECTIONAL:     "directional",
+  COMMON_DRIVEN:   "common-driven",
+  AMBIGUOUS:       "ambiguous",
+  UNDER_EVIDENCED: "under-evidenced",
+  COINCIDENCE:     "coincidence",
+  EXPLORATORY:     "exploratory",
+};
+
+const ROLE_COLOR: Record<CausalRole, string> = {
+  LEADER:          "rgba(82, 185, 122, 0.95)",
+  AMPLIFIER:       "rgba(140, 170, 235, 0.95)",
+  FOLLOWER:        "rgba(170, 170, 180, 0.85)",
+  INSTABILITY_HUB: "rgba(227, 180, 87, 0.95)",
+  ISOLATED:        "rgba(120, 120, 120, 0.75)",
+};
+
+function VerdictChip({ v }: { v: CausalVerdict }) {
+  const color = VERDICT_COLOR[v];
+  return (
+    <span
+      className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+      }}
+    >
+      {VERDICT_LABEL[v]}
+    </span>
+  );
+}
+
+function RoleChip({ r }: { r: CausalRole }) {
+  const color = ROLE_COLOR[r];
+  return (
+    <span
+      className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+      }}
+    >
+      {r.replace(/_/g, " ").toLowerCase()}
+    </span>
+  );
+}
+
+function CausalPropagationPanel() {
+  const [data, setData] = useState<CausalPropagation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getCausalPropagation()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  const directional = data?.verdict_counts.DIRECTIONAL ?? 0;
+  const commonDriven = data?.verdict_counts.COMMON_DRIVEN ?? 0;
+  const coincidence = data?.verdict_counts.COINCIDENCE ?? 0;
+  const underEvidenced = data?.verdict_counts.UNDER_EVIDENCED ?? 0;
+  const exploratory = data?.verdict_counts.EXPLORATORY ?? 0;
+
+  return (
+    <Panel
+      title="Causal Propagation"
+      subtitle={
+        data
+          ? `${directional} directional · ${commonDriven} common-driven · ${coincidence} coincidence · ${exploratory + underEvidenced} not-evidenced`
+          : "lead-lag pairs with verdicts (probabilistic, not deterministic)"
+      }
+      toolbar={
+        data ? (
+          <div className="flex items-center gap-2">
+            <DataQualityChip q={data.data_quality} />
+            <span className="text-[9px] uppercase tracking-[0.18em] text-muted">
+              {data.lookback_days}d · {data.n_windows} sub-windows
+            </span>
+          </div>
+        ) : null
+      }
+    >
+      {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
+      {!error && !data && <div className="text-xs text-muted">Loading…</div>}
+      {data && data.edges.length === 0 && (
+        <div className="text-xs text-muted">
+          No edges above the count threshold. Need alert history across multiple symbols.
+        </div>
+      )}
+      {data && data.edges.length > 0 && (
+        <div className="space-y-3">
+          <div className="text-[10px] text-muted leading-snug">
+            {data.data_quality === "INSUFFICIENT" || data.data_quality === "LOW" ? (
+              <>
+                <span className="text-[#e3b457]">All pairs labeled EXPLORATORY</span> — too few alerts
+                ({data.total_alerts}) for causal claims. The verdicts below reflect statistical signals
+                only and should not be treated as evidence of influence.
+              </>
+            ) : directional > 0 ? (
+              <>
+                <span className="text-[#52b97a]">{directional} edge(s) survived all four tests</span>
+                {" "}(asymmetric direction, present in ≥ 2 sub-windows, no common-driver, sufficient
+                data). Other edges fail at least one — they are not claims of influence, only
+                surfaced for context.
+              </>
+            ) : (
+              <>
+                <span className="text-[#e3b457]">Zero directional edges.</span> Pairs are either
+                coincidence, common-driven, or have only one sub-window of support. Do not treat
+                lead-lag here as influence.
+              </>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">edges by verdict</div>
+              <table className="w-full text-sm font-mono">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-[0.18em] text-muted border-b border-border/60">
+                    <th className="text-left py-2">A → B</th>
+                    <th className="text-right py-2">N/REV</th>
+                    <th className="text-right py-2">CONF</th>
+                    <th className="text-left py-2">VERDICT</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.edges.slice(0, 15).map((e: CausalEdge, i) => {
+                    const tip = [
+                      `verdict      ${e.verdict}`,
+                      `count A→B    ${e.count}    B→A: ${e.reverse_count}`,
+                      `asymmetry    ${(e.asymmetry * 100).toFixed(0)}%`,
+                      `evidence     ${e.evidence_count}/${e.n_windows} sub-windows`,
+                      `symmetry     ${(e.symmetry_penalty * 100).toFixed(0)}%`,
+                      e.common_driver ? `common driver ${e.common_driver} (strength ${e.common_driver_strength})` : "no common driver detected",
+                      ``,
+                      `confidence decomposition:`,
+                      `  volume    ${(e.factors.volume * 100).toFixed(0)}`,
+                      `  asym      ${(e.factors.asymmetry * 100).toFixed(0)}`,
+                      `  evidence  ${(e.factors.evidence * 100).toFixed(0)}`,
+                      `  cd pen    ${(e.factors.common_driver_penalty * 100).toFixed(0)}`,
+                      `  symmetry  ${(e.factors.symmetry * 100).toFixed(0)}`,
+                      `  scarcity  ${(e.factors.scarcity * 100).toFixed(0)}`,
+                      ``,
+                      `rationale: ${e.rationale}`,
+                    ].join("\n");
+                    const isCert = e.verdict === "DIRECTIONAL";
+                    return (
+                      <tr
+                        key={i}
+                        className={`border-t border-border/40 ${isCert ? "" : "opacity-70"}`}
+                        title={tip}
+                      >
+                        <td className="py-1 text-[10px]">
+                          <span className="text-zinc-200">{e.from_symbol}</span>
+                          <span className="text-muted"> → </span>
+                          <span className="text-zinc-200">{e.to_symbol}</span>
+                          {e.common_driver && (
+                            <span className="ml-1 text-[#e3b457]" title={`common driver ${e.common_driver}`}>↶</span>
+                          )}
+                        </td>
+                        <td className="py-1 text-right text-muted tabular-nums">{e.count}/{e.reverse_count}</td>
+                        <td className="py-1 text-right text-zinc-300 tabular-nums">{(e.causal_confidence * 100).toFixed(0)}</td>
+                        <td className="py-1"><VerdictChip v={e.verdict} /></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">influence hierarchy</div>
+              <table className="w-full text-sm font-mono">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-[0.18em] text-muted border-b border-border/60">
+                    <th className="text-left py-2">SYMBOL</th>
+                    <th className="text-right py-2">OUT/IN</th>
+                    <th className="text-right py-2">STAB</th>
+                    <th className="text-left py-2">ROLE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.nodes.slice(0, 15).map((n) => {
+                    const stabPct = n.stability * 100;
+                    const stabColor = stabPct >= 60 ? "text-[#52b97a]" : stabPct >= 30 ? "text-[#e3b457]" : "text-[#d68b8b]";
+                    return (
+                      <tr key={n.symbol} className="border-t border-border/40" title={n.role_rationale}>
+                        <td className="py-1 text-zinc-200">{n.symbol}</td>
+                        <td className="py-1 text-right text-muted tabular-nums">{n.out_count}/{n.in_count}</td>
+                        <td className={`py-1 text-right tabular-nums ${stabColor}`}>{stabPct.toFixed(0)}</td>
+                        <td className="py-1"><RoleChip r={n.role} /></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Structural Dependencies (Phase 15 #2) ───────────────────────────────
+
+function StructuralDependenciesPanel() {
+  const [data, setData] = useState<StructuralDependencies | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getStructuralDependencies()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  return (
+    <Panel
+      title="Structural Dependencies"
+      subtitle={data ? data.summary : "influence chains · co-driver clusters · dominant drivers · synchronized groups"}
+      toolbar={data ? <DataQualityChip q={data.data_quality} /> : null}
+    >
+      {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
+      {!error && !data && <div className="text-xs text-muted">Loading…</div>}
+      {data && data.exploratory && (
+        <div className="text-[10px] text-muted leading-snug mb-3">
+          <span className="text-[#e3b457]">All findings are candidates only.</span>{" "}
+          Data quality is {data.data_quality} — the layer below shows the structural
+          patterns the engine sees, but they are not committed claims of dependency.
+        </div>
+      )}
+      {data && !data.exploratory && (
+        <div className="text-[10px] text-muted leading-snug mb-3">
+          Composed from {data.directional_edge_count} directional,{" "}
+          {data.common_driven_edge_count} common-driven, and{" "}
+          {data.coincidence_edge_count} coincidence edges. Each finding inherits the
+          causal_confidence of the edges it composes — a chain is only as strong
+          as its weakest link.
+        </div>
+      )}
+      {data && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">
+              influence chains ({data.influence_chains.length})
+            </div>
+            {data.influence_chains.length === 0 ? (
+              <div className="text-[11px] text-muted">
+                {data.exploratory ? "No multi-hop chains — no DIRECTIONAL edges available yet." : "No multi-hop chains detected."}
+              </div>
+            ) : (
+              <ul className="space-y-1.5 font-mono text-[11px]">
+                {data.influence_chains.slice(0, 8).map((c, i) => (
+                  <li key={i} className="flex items-baseline gap-2" title={c.rationale}>
+                    <span className="text-zinc-300 tabular-nums w-10 text-right">
+                      {(c.min_confidence * 100).toFixed(0)}
+                    </span>
+                    <span className="text-zinc-200">
+                      {c.path.join(" → ")}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">
+              dominant drivers ({data.dominant_drivers.length})
+            </div>
+            {data.dominant_drivers.length === 0 ? (
+              <div className="text-[11px] text-muted">
+                {data.exploratory ? "No dominant drivers — no DIRECTIONAL edges available yet." : "No driver dominance detected."}
+              </div>
+            ) : (
+              <table className="w-full text-[11px] font-mono">
+                <thead>
+                  <tr className="text-[9px] uppercase tracking-[0.18em] text-muted border-b border-border/60">
+                    <th className="text-left py-1.5">SYMBOL</th>
+                    <th className="text-right py-1.5">REACH</th>
+                    <th className="text-right py-1.5">OUT</th>
+                    <th className="text-right py-1.5">CONF</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.dominant_drivers.slice(0, 8).map((d) => (
+                    <tr key={d.symbol} className="border-t border-border/40" title={d.rationale + "\nreachable: " + d.reachable_sample.join(", ")}>
+                      <td className="py-1 text-zinc-200">{d.symbol}</td>
+                      <td className="py-1 text-right text-zinc-300 tabular-nums">{d.reach_size}</td>
+                      <td className="py-1 text-right text-muted tabular-nums">{d.direct_out_count}</td>
+                      <td className="py-1 text-right text-muted tabular-nums">{(d.avg_out_confidence * 100).toFixed(0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">
+              co-driver clusters ({data.dependency_clusters.length})
+            </div>
+            {data.dependency_clusters.length === 0 ? (
+              <div className="text-[11px] text-muted">No common-driver groups detected.</div>
+            ) : (
+              <ul className="space-y-1.5 font-mono text-[11px]">
+                {data.dependency_clusters.slice(0, 6).map((c) => (
+                  <li key={c.cluster_id} title={c.rationale} className="leading-tight">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[#e3b457]">{c.driver}</span>
+                      <span className="text-muted">drives</span>
+                      <span className="text-zinc-300">{c.size}</span>
+                    </div>
+                    <div className="text-[10px] text-muted truncate">
+                      {c.members.join(", ")}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">
+              synchronized stress groups ({data.synchronized_groups.length})
+            </div>
+            {data.synchronized_groups.length === 0 ? (
+              <div className="text-[11px] text-muted">No coincidence clusters detected.</div>
+            ) : (
+              <ul className="space-y-1.5 font-mono text-[11px]">
+                {data.synchronized_groups.slice(0, 6).map((g) => (
+                  <li key={g.group_id} title={g.rationale} className="leading-tight">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[#d68b8b]">group {g.group_id}</span>
+                      <span className="text-muted">·</span>
+                      <span className="text-zinc-300">{g.size} symbols</span>
+                      <span className="text-muted">·</span>
+                      <span className="text-muted">{g.coincidence_edges} pairs</span>
+                    </div>
+                    <div className="text-[10px] text-muted truncate">
+                      {g.members.join(", ")}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Market State Transitions (Phase 15 #3) ──────────────────────────────
+
+const TRANSITION_VERDICT_COLOR: Record<TransitionVerdict, string> = {
+  PERSISTENT:   "rgba(82, 185, 122, 0.95)",
+  ACCELERATING: "rgba(214, 139, 105, 0.95)",
+  FLICKER:      "rgba(140, 140, 140, 0.85)",
+  REVERSED:     "rgba(214, 105, 105, 0.95)",
+};
+
+function TransitionVerdictChip({ v }: { v: TransitionVerdict }) {
+  const color = TRANSITION_VERDICT_COLOR[v];
+  return (
+    <span
+      className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+      }}
+    >
+      {v.toLowerCase()}
+    </span>
+  );
+}
+
+function fmtDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600 * 10) / 10}h`;
+  return `${Math.round(seconds / 86400 * 10) / 10}d`;
+}
+
+function MarketStateTransitionsPanel() {
+  const [data, setData] = useState<MarketStateTransitions | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getMarketStateTransitions()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  return (
+    <Panel
+      title="State Transition Intelligence"
+      subtitle={data ? data.summary : "how the market moves between coordinated states"}
+      toolbar={data ? <DataQualityChip q={data.data_quality} /> : null}
+    >
+      {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
+      {!error && !data && <div className="text-xs text-muted">Loading…</div>}
+      {data && (
+        <div className="space-y-3">
+          {/* Current state + vocabulary */}
+          <div className="flex flex-wrap items-baseline gap-3 text-[11px] font-mono">
+            <div>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-muted mr-2">now</span>
+              <span className="text-zinc-200">{data.current_state ?? "—"}</span>
+              {data.current_state && data.current_state_duration_snapshots > 1 && (
+                <span className="text-muted ml-2">
+                  for {fmtDuration(data.current_state_duration_seconds / 1000)} ({data.current_state_duration_snapshots} snapshots)
+                </span>
+              )}
+            </div>
+            <div className="text-muted">·</div>
+            <div>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-muted mr-2">vocabulary</span>
+              <span className="text-zinc-300">{data.state_vocabulary.length} states</span>
+            </div>
+            <div className="text-muted">·</div>
+            <div>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-muted mr-2">rate</span>
+              <span className="text-zinc-300">{data.transition_rate_per_day.toFixed(1)}/day</span>
+            </div>
+            <div className="text-muted">·</div>
+            <div>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-muted mr-2">flicker</span>
+              <span className={data.flicker_ratio < 0.25 ? "text-[#52b97a]" : data.flicker_ratio < 0.5 ? "text-[#e3b457]" : "text-[#d68b8b]"}>
+                {(data.flicker_ratio * 100).toFixed(0)}%
+              </span>
+            </div>
+          </div>
+
+          {/* Oscillation warning */}
+          {data.oscillation_periods.length > 0 && (
+            <div className="rounded-sm border border-[#e3b457]/50 bg-[#e3b457]/10 px-2 py-1.5 text-[10px]">
+              <span className="text-[#e3b457] uppercase tracking-[0.16em] mr-2">oscillation</span>
+              <span className="text-muted">
+                {data.oscillation_periods.length} period(s) where the system fired ≥3 transitions within 1h —
+                treat any single transition there as exploratory
+              </span>
+            </div>
+          )}
+
+          {/* Transition table */}
+          {data.transitions.length === 0 ? (
+            <div className="text-xs text-muted">
+              No transitions yet — {data.snapshot_count} snapshot(s) all in same state.
+              {data.exploratory && " Engine is still accumulating intelligence history."}
+            </div>
+          ) : (
+            <table className="w-full text-sm font-mono">
+              <thead>
+                <tr className="text-[10px] uppercase tracking-[0.18em] text-muted border-b border-border/60">
+                  <th className="text-left py-2">AT</th>
+                  <th className="text-left py-2">FROM → TO</th>
+                  <th className="text-right py-2">HELD</th>
+                  <th className="text-right py-2">ACCEL</th>
+                  <th className="text-right py-2">META</th>
+                  <th className="text-right py-2">CONF</th>
+                  <th className="text-left py-2">VERDICT</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.transitions.slice(0, 15).map((t, i) => {
+                  const at = new Date(t.ts_ms).toISOString().slice(11, 16);
+                  const accStr = t.acceleration != null ? `${t.acceleration > 0 ? "+" : ""}${t.acceleration.toFixed(1)}` : "—";
+                  const accColor = t.acceleration == null ? "text-muted" :
+                    Math.abs(t.acceleration) >= 5 ? "text-[#e3b457]" : "text-muted";
+                  return (
+                    <tr key={i} className="border-t border-border/40" title={t.rationale}>
+                      <td className="py-1 text-[10px] text-muted">{at}</td>
+                      <td className="py-1 text-[10px]">
+                        <span className="text-muted">{t.from_state.replace(/_/g, " ")}</span>
+                        <span className="text-muted"> → </span>
+                        <span className="text-zinc-200">{t.to_state.replace(/_/g, " ")}</span>
+                      </td>
+                      <td className="py-1 text-right text-muted tabular-nums">
+                        {fmtDuration(t.persistence_seconds / 1000)}
+                      </td>
+                      <td className={`py-1 text-right tabular-nums ${accColor}`}>{accStr}</td>
+                      <td className="py-1 text-right text-muted tabular-nums">{t.meta_confidence_at.toFixed(0)}</td>
+                      <td className="py-1 text-right text-zinc-300 tabular-nums">{(t.confidence * 100).toFixed(0)}</td>
+                      <td className="py-1"><TransitionVerdictChip v={t.verdict} /></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
     </Panel>

@@ -5225,6 +5225,1693 @@ def _classify_finding(
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 15 — Causal Propagation Layer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `propagation_graph` answered: "what pairs of symbols tend to alert in
+# sequence?". Useful but agnostic to *why* — A→B might be a real causal
+# influence, a common-driver echo (both follow some third symbol), or
+# pure coincidence within a market-wide event window.
+#
+# `causal_propagation` layers four explicit tests on top of the same
+# pair-finding logic and emits a verdict per pair with an explainable
+# rationale. The system never claims to "know the cause" — it accumulates
+# evidence and labels confidence honestly.
+#
+# Tests (each independently fails-the-claim):
+#
+#   1. Directional asymmetry: A→B count vs B→A count. If close to 50/50,
+#      direction is undetermined.
+#
+#   2. Multi-window persistence: lookback split into N sub-windows, pair
+#      must appear in ≥ 2 of them to count as "stable". A single-burst
+#      pair is flagged UNDER_EVIDENCED even if its raw count is high.
+#
+#   3. Common-driver elimination: if a third symbol C is found that
+#      separately influences both A and B with comparable strength, the
+#      (A, B) pair is reclassified COMMON_DRIVEN — not because we
+#      "proved" C is the cause, but because the structural pattern is
+#      consistent with C-mediation and we must surface that ambiguity.
+#
+#   4. Scarcity gate: data_quality INSUFFICIENT/LOW → all pairs are
+#      EXPLORATORY regardless of how clean their numbers look. We never
+#      issue causal verdicts on a fresh DB.
+#
+# Verdicts (priority order on emission):
+#   COINCIDENCE       — symmetry_penalty ≥ 0.7 (effectively bidirectional)
+#   COMMON_DRIVEN     — common-driver candidate found
+#   EXPLORATORY       — data_quality below MEDIUM
+#   UNDER_EVIDENCED   — present in ≤ 1 sub-window
+#   AMBIGUOUS         — asymmetry < 0.40, no clear direction
+#   DIRECTIONAL       — only label we treat as a working hypothesis
+
+
+def _causal_compute_edges(
+    by_kind: Dict[str, List[Tuple[int, str]]],
+    lead_window_ms: int,
+    min_lead_ms: int,
+) -> Dict[Tuple[str, str], int]:
+    """Compute deduplicated A→B pair counts for one slice of events.
+    Shared helper between full-window and sub-window passes."""
+    edges: Dict[Tuple[str, str], int] = defaultdict(int)
+    for lst in by_kind.values():
+        lst.sort()
+        for i, (ts_a, sym_a) in enumerate(lst):
+            charged: set = set()
+            for j in range(i + 1, len(lst)):
+                ts_b, sym_b = lst[j]
+                lead = ts_b - ts_a
+                if lead > lead_window_ms:
+                    break
+                if lead < min_lead_ms or sym_a == sym_b or sym_b in charged:
+                    continue
+                charged.add(sym_b)
+                edges[(sym_a, sym_b)] += 1
+    return edges
+
+
+def causal_propagation(
+    db: Session,
+    lookback_days: int = 7,
+    lead_window_ms: int = 30 * 60_000,
+    min_lead_ms: int = 5_000,
+    n_windows: int = 3,
+) -> dict:
+    """Build a causal-style propagation analysis with explicit verdicts.
+    Output is intentionally conservative: edges are labeled by the
+    strongest disqualifying signal first (coincidence > common-driver >
+    evidence > asymmetry) and only the residue is called DIRECTIONAL.
+
+    `n_windows` splits the lookback period into N equal-length slices;
+    a directional claim must survive in ≥ 2 of them. With 7d lookback
+    and n_windows=3, each slice is ~2.3 days.
+    """
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = db.execute(
+        text(
+            """
+            SELECT symbol, kind, started_at_ms
+            FROM liquidity_alert_history
+            WHERE started_at_ms >= :since
+            ORDER BY started_at_ms
+            """
+        ),
+        {"since": since_ms},
+    ).fetchall()
+
+    total_alerts = len(rows)
+    overall_quality = _discovery_quality(total_alerts, low=200, medium=800, high=3000)
+
+    # Split alerts into full window AND each sub-window in a single pass.
+    span_ms = max(1, int(time.time() * 1000) - since_ms)
+    window_ms = span_ms // n_windows
+    by_kind_full: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+    by_kind_per_window: List[Dict[str, List[Tuple[int, str]]]] = [
+        defaultdict(list) for _ in range(n_windows)
+    ]
+    for r in rows:
+        ts = int(r.started_at_ms)
+        w_idx = min(n_windows - 1, max(0, (ts - since_ms) // window_ms))
+        by_kind_full[r.kind].append((ts, r.symbol))
+        by_kind_per_window[w_idx][r.kind].append((ts, r.symbol))
+
+    full_edges = _causal_compute_edges(by_kind_full, lead_window_ms, min_lead_ms)
+    window_edges: List[Dict[Tuple[str, str], int]] = [
+        _causal_compute_edges(by_kind_per_window[w], lead_window_ms, min_lead_ms)
+        for w in range(n_windows)
+    ]
+
+    # ── Common-driver detection ───────────────────────────────────────
+    # Build per-symbol "influences" set: which symbols does X precede
+    # with count ≥ threshold? Then for each candidate pair (A, B), look
+    # for a third symbol C in the intersection of influencers of A and
+    # influencers of B with comparable strength to both legs.
+    INFLUENCE_THRESHOLD = 5
+    influences_to: Dict[str, set] = defaultdict(set)  # X → {Y: X→Y count ≥ threshold}
+    influenced_by: Dict[str, set] = defaultdict(set)  # Y → {X: X→Y count ≥ threshold}
+    for (a, b), c in full_edges.items():
+        if c >= INFLUENCE_THRESHOLD:
+            influences_to[a].add(b)
+            influenced_by[b].add(a)
+
+    def find_common_driver(a: str, b: str) -> Optional[Tuple[str, int]]:
+        # Drivers must be sources of both A and B (i.e. C→A and C→B).
+        candidates = influenced_by[a] & influenced_by[b]
+        best: Optional[Tuple[str, int]] = None
+        for c in candidates:
+            if c == a or c == b:
+                continue
+            ca = full_edges.get((c, a), 0)
+            cb = full_edges.get((c, b), 0)
+            strength = min(ca, cb)
+            if strength >= INFLUENCE_THRESHOLD and (best is None or strength > best[1]):
+                best = (c, strength)
+        return best
+
+    # ── Per-edge classification ──────────────────────────────────────
+
+    causal_edges: List[dict] = []
+    for (a, b), count in full_edges.items():
+        if count < 3:
+            continue
+        reverse_count = full_edges.get((b, a), 0)
+        total = count + reverse_count
+        # Asymmetry in [-1, +1]; positive means A→B dominates.
+        asymmetry = (count - reverse_count) / max(total, 1)
+        if reverse_count > 0:
+            symmetry_penalty = (min(count, reverse_count) / max(count, reverse_count)) ** 2
+        else:
+            symmetry_penalty = 0.0
+
+        evidence_count = sum(1 for w in range(n_windows) if (a, b) in window_edges[w])
+
+        cd = find_common_driver(a, b)
+        common_driver = cd[0] if cd else None
+        common_driver_strength = cd[1] if cd else 0
+
+        # Verdict — priority order: coincidence first (because it cancels
+        # everything else), then scarcity, then common-driver, then
+        # evidence, then asymmetry.
+        if symmetry_penalty >= 0.70:
+            verdict = "COINCIDENCE"
+        elif overall_quality in ("INSUFFICIENT", "LOW"):
+            verdict = "EXPLORATORY"
+        elif common_driver is not None:
+            verdict = "COMMON_DRIVEN"
+        elif evidence_count <= 1:
+            verdict = "UNDER_EVIDENCED"
+        elif asymmetry < 0.40:
+            verdict = "AMBIGUOUS"
+        else:
+            verdict = "DIRECTIONAL"
+
+        # Causal confidence — multiplicative blend. Each factor is in
+        # [0, 1] and zeros-out the claim independently. Surfaced as four
+        # separate numbers so the operator can see which factor dragged
+        # it down.
+        volume_factor = 1.0 - math.exp(-count / 15.0)
+        asymmetry_factor = max(0.0, asymmetry)
+        evidence_factor = evidence_count / float(n_windows)
+        common_driver_factor = 0.35 if common_driver else 1.0
+        symmetry_factor = 1.0 - symmetry_penalty
+        SCARCITY = {"INSUFFICIENT": 0.15, "LOW": 0.40, "MEDIUM": 0.75, "HIGH": 1.0}
+        scarcity_factor = SCARCITY.get(overall_quality, 0.15)
+
+        causal_confidence = (
+            volume_factor * asymmetry_factor * evidence_factor *
+            common_driver_factor * symmetry_factor * scarcity_factor
+        )
+
+        # Human-readable rationale — what evidence drove the verdict.
+        if verdict == "DIRECTIONAL":
+            rationale = (
+                f"{count} A→B vs {reverse_count} B→A (asymmetry "
+                f"{asymmetry * 100:.0f}%), survives in {evidence_count}/{n_windows} "
+                f"sub-windows; no common driver detected"
+            )
+        elif verdict == "COMMON_DRIVEN":
+            ca = full_edges.get((common_driver, a), 0)
+            cb = full_edges.get((common_driver, b), 0)
+            rationale = (
+                f"{common_driver} independently precedes both A ({ca}×) "
+                f"and B ({cb}×) — A→B likely mediated by {common_driver}, "
+                f"not direct"
+            )
+        elif verdict == "COINCIDENCE":
+            rationale = (
+                f"A→B {count} ≈ B→A {reverse_count} (symmetry "
+                f"{symmetry_penalty * 100:.0f}%) — direction can't be inferred"
+            )
+        elif verdict == "UNDER_EVIDENCED":
+            rationale = (
+                f"present in only {evidence_count}/{n_windows} "
+                f"sub-windows — single-burst, not stable"
+            )
+        elif verdict == "AMBIGUOUS":
+            rationale = (
+                f"asymmetry only {asymmetry * 100:.0f}% "
+                f"(threshold 40%) — direction is too close to call"
+            )
+        else:  # EXPLORATORY
+            rationale = (
+                f"data_quality={overall_quality} — no causal claims "
+                f"on {total_alerts} alerts"
+            )
+
+        causal_edges.append({
+            "from_symbol": a,
+            "to_symbol": b,
+            "count": count,
+            "reverse_count": reverse_count,
+            "asymmetry": asymmetry,
+            "evidence_count": evidence_count,
+            "n_windows": n_windows,
+            "symmetry_penalty": symmetry_penalty,
+            "common_driver": common_driver,
+            "common_driver_strength": common_driver_strength,
+            "causal_confidence": causal_confidence,
+            "verdict": verdict,
+            "rationale": rationale,
+            # Confidence decomposition — exposed so the UI can show why.
+            "factors": {
+                "volume": volume_factor,
+                "asymmetry": asymmetry_factor,
+                "evidence": evidence_factor,
+                "common_driver_penalty": common_driver_factor,
+                "symmetry": symmetry_factor,
+                "scarcity": scarcity_factor,
+            },
+        })
+
+    # Sort by causal_confidence descending so the most defensible claims
+    # surface first (DIRECTIONAL will naturally cluster at the top).
+    causal_edges.sort(key=lambda e: -e["causal_confidence"])
+    causal_edges = causal_edges[:60]
+
+    # ── Influence hierarchy per node ─────────────────────────────────
+    #
+    # Each symbol gets a role + an explicit rationale. Roles are derived
+    # only from edges that we've already labeled — we never look "inside"
+    # an edge again, so hierarchy is consistent with the per-edge verdicts.
+
+    out_edges_by_sym: Dict[str, List[dict]] = defaultdict(list)
+    in_edges_by_sym: Dict[str, List[dict]] = defaultdict(list)
+    for e in causal_edges:
+        out_edges_by_sym[e["from_symbol"]].append(e)
+        in_edges_by_sym[e["to_symbol"]].append(e)
+
+    symbols = set(out_edges_by_sym) | set(in_edges_by_sym)
+    nodes_out: List[dict] = []
+    for s in symbols:
+        outs = out_edges_by_sym.get(s, [])
+        ins = in_edges_by_sym.get(s, [])
+        n_out = len(outs)
+        n_in = len(ins)
+        total_edges = n_out + n_in
+
+        avg_out_conf = (sum(e["causal_confidence"] for e in outs) / n_out) if n_out else 0.0
+        avg_in_conf = (sum(e["causal_confidence"] for e in ins) / n_in) if n_in else 0.0
+
+        all_edges = outs + ins
+        n_directional = sum(1 for e in all_edges if e["verdict"] == "DIRECTIONAL")
+        n_low_quality = sum(1 for e in all_edges if e["verdict"] in ("COINCIDENCE", "UNDER_EVIDENCED", "AMBIGUOUS"))
+        stability = n_directional / total_edges if total_edges else 0.0
+
+        if total_edges < 3:
+            role = "ISOLATED"
+            role_rationale = f"only {total_edges} edge(s) above the confidence cutoff"
+        elif stability < 0.30 and n_low_quality >= 2:
+            role = "INSTABILITY_HUB"
+            role_rationale = (
+                f"{n_low_quality}/{total_edges} edges are coincidence/ambiguous/"
+                f"under-evidenced — symbol participates in many pairings but few are "
+                f"directional"
+            )
+        else:
+            out_ratio = n_out / total_edges
+            if out_ratio > 0.70 and avg_out_conf >= 0.20:
+                role = "LEADER"
+                role_rationale = (
+                    f"out={n_out} ≫ in={n_in}, avg outgoing causal_confidence "
+                    f"{avg_out_conf * 100:.0f}%; precedes others more than it follows"
+                )
+            elif out_ratio < 0.30 and avg_in_conf >= 0.20:
+                role = "FOLLOWER"
+                role_rationale = (
+                    f"in={n_in} ≫ out={n_out}, avg incoming causal_confidence "
+                    f"{avg_in_conf * 100:.0f}%; consistently lagging others"
+                )
+            elif 0.30 <= out_ratio <= 0.70 and (avg_out_conf >= 0.20 or avg_in_conf >= 0.20):
+                role = "AMPLIFIER"
+                role_rationale = (
+                    f"balanced in/out ({n_out}/{n_in}) — receives and passes "
+                    f"events through, not a directional source or sink"
+                )
+            else:
+                role = "ISOLATED"
+                role_rationale = (
+                    f"in/out balance {n_in}/{n_out} but average confidence too low"
+                    f" to commit to a role"
+                )
+
+        nodes_out.append({
+            "symbol": s,
+            "out_count": n_out,
+            "in_count": n_in,
+            "avg_out_confidence": avg_out_conf,
+            "avg_in_confidence": avg_in_conf,
+            "stability": stability,
+            "role": role,
+            "role_rationale": role_rationale,
+        })
+
+    nodes_out.sort(key=lambda n: (
+        # LEADER first, then AMPLIFIER, then FOLLOWER, then HUB, then ISOLATED
+        {"LEADER": 0, "AMPLIFIER": 1, "FOLLOWER": 2, "INSTABILITY_HUB": 3, "ISOLATED": 4}.get(n["role"], 5),
+        -n["avg_out_confidence"],
+    ))
+
+    # ── Summary counts for UI banner ─────────────────────────────────
+    verdict_counts: Dict[str, int] = defaultdict(int)
+    for e in causal_edges:
+        verdict_counts[e["verdict"]] += 1
+    role_counts: Dict[str, int] = defaultdict(int)
+    for n in nodes_out:
+        role_counts[n["role"]] += 1
+
+    return {
+        "since_ms": since_ms,
+        "lookback_days": lookback_days,
+        "n_windows": n_windows,
+        "total_alerts": total_alerts,
+        "edges": causal_edges,
+        "nodes": nodes_out[:60],
+        "verdict_counts": dict(verdict_counts),
+        "role_counts": dict(role_counts),
+        "data_quality": overall_quality,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 15 #2 — Structural Dependency Graph
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `causal_propagation` produces per-pair verdicts. The dependency graph
+# layer composes those verdicts into structural findings:
+#
+#   1. Influence chains — A → B → C paths where each step is DIRECTIONAL.
+#      Surfaces multi-hop influence beyond pairwise lead-lag.
+#
+#   2. Dependency clusters (common-driver groups) — symbols that share a
+#      common driver C are grouped under C. These are NOT claims of
+#      "C controls the cluster"; they say "this set co-moves around C
+#      with no detected direct influence between members".
+#
+#   3. Dominant drivers — ranked by BFS reach in the DIRECTIONAL subgraph.
+#      A symbol's reach is the number of distinct symbols it can influence
+#      through chains of up to 3 hops.
+#
+#   4. Synchronized stress groups — connected components on the COINCIDENCE
+#      pair graph (undirected). Names groups of symbols that alert
+#      together in time-bursts without a detectable directional structure.
+#
+# Every output explicitly inherits the scarcity gate from causal_propagation:
+# under INSUFFICIENT/LOW data_quality the entire result is flagged
+# exploratory and the UI surfaces it as candidate-only.
+
+
+def structural_dependencies(
+    db: Session,
+    lookback_days: int = 7,
+) -> dict:
+    """Compose causal_propagation verdicts into structural findings.
+    Read-only — no new SQL beyond what causal_propagation already runs.
+    """
+    causal = causal_propagation(db, lookback_days=lookback_days)
+    edges: List[dict] = causal["edges"]
+    quality: str = causal["data_quality"]
+    exploratory = quality in ("INSUFFICIENT", "LOW")
+
+    directional = [e for e in edges if e["verdict"] == "DIRECTIONAL"]
+    common_driven = [e for e in edges if e["verdict"] == "COMMON_DRIVEN"]
+    coincidence_e = [e for e in edges if e["verdict"] == "COINCIDENCE"]
+
+    # ── Influence chains ─────────────────────────────────────────────
+    out_adj: Dict[str, List[Tuple[str, float, dict]]] = defaultdict(list)
+    for e in directional:
+        out_adj[e["from_symbol"]].append(
+            (e["to_symbol"], e["causal_confidence"], e)
+        )
+
+    chains: List[dict] = []
+    for a, outs_a in out_adj.items():
+        for b, conf_ab, edge_ab in outs_a:
+            if b not in out_adj:
+                continue
+            for c, conf_bc, edge_bc in out_adj[b]:
+                if c == a:
+                    continue  # no degenerate self-loop chains
+                # min-confidence is the bottleneck of the chain
+                min_conf = min(conf_ab, conf_bc)
+                chains.append({
+                    "path": [a, b, c],
+                    "min_confidence": min_conf,
+                    "step_confidences": [conf_ab, conf_bc],
+                    "rationale": (
+                        f"{a}→{b} (conf {conf_ab * 100:.0f}, asym "
+                        f"{edge_ab['asymmetry'] * 100:.0f}%) then "
+                        f"{b}→{c} (conf {conf_bc * 100:.0f}, asym "
+                        f"{edge_bc['asymmetry'] * 100:.0f}%) — "
+                        f"both DIRECTIONAL"
+                    ),
+                })
+    chains.sort(key=lambda c: -c["min_confidence"])
+    chains = chains[:25]
+
+    # ── Dependency clusters from common-driver groups ────────────────
+    driver_members: Dict[str, set] = defaultdict(set)
+    driver_strength: Dict[str, int] = defaultdict(int)
+    for e in common_driven:
+        d = e["common_driver"]
+        if not d:
+            continue
+        driver_members[d].add(e["from_symbol"])
+        driver_members[d].add(e["to_symbol"])
+        driver_strength[d] = max(driver_strength[d], e["common_driver_strength"])
+
+    dependency_clusters: List[dict] = []
+    cluster_id = 0
+    for driver, members in driver_members.items():
+        members.discard(driver)  # driver itself isn't a cluster member
+        if len(members) < 2:
+            continue
+        cluster_id += 1
+        dependency_clusters.append({
+            "cluster_id": cluster_id,
+            "cluster_type": "common_driver",
+            "driver": driver,
+            "members": sorted(members),
+            "size": len(members),
+            "min_driver_strength": driver_strength[driver],
+            "rationale": (
+                f"{len(members)} symbols share {driver} as detected common "
+                f"driver (no direct DIRECTIONAL edges between them). "
+                f"Cluster is co-movement around {driver}, not internal "
+                f"causal structure."
+            ),
+        })
+    dependency_clusters.sort(key=lambda c: -c["size"])
+
+    # ── Dominant drivers via BFS reach in DIRECTIONAL subgraph ───────
+    REACH_DEPTH = 3
+    direct_out_count: Dict[str, int] = defaultdict(int)
+    avg_out_conf: Dict[str, float] = {}
+    for sym, outs in out_adj.items():
+        direct_out_count[sym] = len(outs)
+        avg_out_conf[sym] = sum(c for _, c, _ in outs) / max(1, len(outs))
+
+    reach: Dict[str, set] = {}
+    for sym in out_adj:
+        visited = {sym}
+        frontier = {sym}
+        for _ in range(REACH_DEPTH):
+            next_frontier: set = set()
+            for node in frontier:
+                for n2, _, _ in out_adj.get(node, ()):
+                    if n2 not in visited:
+                        visited.add(n2)
+                        next_frontier.add(n2)
+            frontier = next_frontier
+            if not frontier:
+                break
+        reach[sym] = visited - {sym}
+
+    dominant_drivers: List[dict] = []
+    for sym, reachable in reach.items():
+        if len(reachable) < 1:
+            continue
+        # Influence score blends reach with average outgoing confidence.
+        score = len(reachable) * avg_out_conf[sym]
+        dominant_drivers.append({
+            "symbol": sym,
+            "reach_depth": REACH_DEPTH,
+            "reach_size": len(reachable),
+            "direct_out_count": direct_out_count[sym],
+            "avg_out_confidence": avg_out_conf[sym],
+            "influence_score": score,
+            "reachable_sample": sorted(reachable)[:6],
+            "rationale": (
+                f"{direct_out_count[sym]} direct DIRECTIONAL out-edge(s), "
+                f"reaches {len(reachable)} distinct symbol(s) within "
+                f"{REACH_DEPTH} hops at avg confidence "
+                f"{avg_out_conf[sym] * 100:.0f}%"
+            ),
+        })
+    dominant_drivers.sort(key=lambda d: -d["influence_score"])
+    dominant_drivers = dominant_drivers[:15]
+
+    # ── Synchronized stress groups (coincidence connected components) ─
+    coin_adj: Dict[str, set] = defaultdict(set)
+    for e in coincidence_e:
+        coin_adj[e["from_symbol"]].add(e["to_symbol"])
+        coin_adj[e["to_symbol"]].add(e["from_symbol"])
+
+    sync_groups: List[dict] = []
+    seen_in_group: set = set()
+    group_id = 0
+    for start in coin_adj:
+        if start in seen_in_group:
+            continue
+        # BFS connected component
+        component: List[str] = []
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in seen_in_group:
+                continue
+            seen_in_group.add(node)
+            component.append(node)
+            queue.extend(n for n in coin_adj[node] if n not in seen_in_group)
+        if len(component) < 2:
+            continue
+        comp_set = set(component)
+        internal_edges = sum(
+            1 for e in coincidence_e
+            if e["from_symbol"] in comp_set and e["to_symbol"] in comp_set
+            and e["from_symbol"] < e["to_symbol"]
+        )
+        group_id += 1
+        sync_groups.append({
+            "group_id": group_id,
+            "members": sorted(component),
+            "size": len(component),
+            "coincidence_edges": internal_edges,
+            "rationale": (
+                f"{len(component)} symbols connected by {internal_edges} "
+                f"COINCIDENCE pair(s) — alert together in time-bursts without "
+                f"detected directional structure"
+            ),
+        })
+    sync_groups.sort(key=lambda g: -g["size"])
+    sync_groups = sync_groups[:10]
+
+    # ── Summary line for UI ──────────────────────────────────────────
+    if exploratory:
+        summary = (
+            f"data_quality={quality} — {len(edges)} candidate edge(s), "
+            f"no structural claims yet"
+        )
+    else:
+        summary = (
+            f"{len(directional)} directional edges → "
+            f"{len(chains)} multi-hop chain(s), "
+            f"{len(dependency_clusters)} co-driver cluster(s), "
+            f"{len(dominant_drivers)} dominant driver(s), "
+            f"{len(sync_groups)} synchronized stress group(s)"
+        )
+
+    return {
+        "since_ms": causal["since_ms"],
+        "lookback_days": lookback_days,
+        "data_quality": quality,
+        "exploratory": exploratory,
+        "directional_edge_count": len(directional),
+        "common_driven_edge_count": len(common_driven),
+        "coincidence_edge_count": len(coincidence_e),
+        "influence_chains": chains,
+        "dependency_clusters": dependency_clusters,
+        "dominant_drivers": dominant_drivers,
+        "synchronized_groups": sync_groups,
+        "summary": summary,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 15 #3 — Market State Transition Intelligence
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Previous layers care about WHERE the market is. This layer cares about
+# HOW it moves between states — which transitions persisted, which were
+# flickers, where the system oscillates, where stress accelerated
+# through the change.
+#
+# Inputs: `liquidity_intelligence_history` snapshots (5-min cadence),
+# specifically the `coordinated_state` label plus `synthesized_stress`
+# and `meta_confidence_score` numbers around each state change.
+#
+# Per transition we compute:
+#
+#   * persistence — how many consecutive snapshots remained in `to_state`
+#     before the next transition. < PERSISTENCE_THRESHOLD = FLICKER.
+#   * reversal — did we bounce back to `from_state` within REVERSAL_WINDOW
+#     ticks? If yes, the transition is rejected (FLICKER even if longer).
+#   * acceleration — slope of synthesized_stress in PRE_WINDOW before vs
+#     POST_WINDOW after. Surfaces whether the state change coincided with
+#     a meaningful change in pace, not just a relabel.
+#   * meta_confidence — engine's own confidence at the moment of change.
+#     Low values demote the transition.
+#
+# Aggregate:
+#   * current state + how long it's lasted
+#   * transition rate per day (≥ TRANSITION_RATE_WARN = system unstable)
+#   * flicker ratio (flickers / total)
+#   * oscillation periods (sliding windows with ≥ 3 transitions inside)
+#
+# As with #1/#2, scarcity gating cascades: under INSUFFICIENT/LOW
+# data_quality everything is exploratory and confidence is scaled down.
+
+
+def market_state_transitions(
+    db: Session,
+    lookback_days: int = 14,
+) -> dict:
+    """Detect + classify coordinated_state transitions in the intelligence
+    snapshot stream. Output is per-transition with verdicts + an aggregate
+    stability picture.
+    """
+    from kazus_db.models import LiquidityIntelligenceHistory
+
+    PERSISTENCE_THRESHOLD = 3       # snapshots that must hold (≈ 15 min @ 5-min cadence)
+    REVERSAL_WINDOW = 3             # snapshots within which a bounce-back invalidates
+    PRE_WINDOW = 6                  # ≈ 30 min before
+    POST_WINDOW = 6                 # ≈ 30 min after
+    OSCILLATION_MIN_TRANSITIONS = 3 # within OSCILLATION_WINDOW_S
+    OSCILLATION_WINDOW_S = 3600     # 1 hour
+    ACCELERATION_THRESHOLD = 5.0    # stress points per 5-min slope diff
+
+    since_ms = int(time.time() * 1000) - lookback_days * 24 * 3600 * 1000
+    rows = (
+        db.query(
+            LiquidityIntelligenceHistory.ts_ms,
+            LiquidityIntelligenceHistory.coordinated_state,
+            LiquidityIntelligenceHistory.synthesized_stress,
+            LiquidityIntelligenceHistory.meta_confidence_score,
+            LiquidityIntelligenceHistory.dominant_regime,
+        )
+        .filter(LiquidityIntelligenceHistory.ts_ms >= since_ms)
+        .filter(LiquidityIntelligenceHistory.coordinated_state.isnot(None))
+        .order_by(LiquidityIntelligenceHistory.ts_ms.asc())
+        .all()
+    )
+
+    snapshots = [
+        {
+            "ts_ms": int(r.ts_ms),
+            "state": r.coordinated_state,
+            "stress": float(r.synthesized_stress) if r.synthesized_stress is not None else None,
+            "meta_conf": float(r.meta_confidence_score) if r.meta_confidence_score is not None else None,
+            "regime": r.dominant_regime,
+        }
+        for r in rows
+    ]
+    n = len(snapshots)
+    overall_quality = _discovery_quality(n, low=24, medium=72, high=288)
+    exploratory = overall_quality in ("INSUFFICIENT", "LOW")
+    SCARCITY = {"INSUFFICIENT": 0.15, "LOW": 0.40, "MEDIUM": 0.75, "HIGH": 1.0}
+    scarcity_factor = SCARCITY.get(overall_quality, 0.15)
+
+    # State vocabulary stats
+    state_counts: Dict[str, int] = defaultdict(int)
+    for s in snapshots:
+        state_counts[s["state"]] += 1
+    vocabulary = sorted(state_counts.keys())
+
+    # ── Detect transitions ───────────────────────────────────────────
+    transitions: List[dict] = []
+    for i in range(1, n):
+        if snapshots[i]["state"] == snapshots[i - 1]["state"]:
+            continue
+        from_state = snapshots[i - 1]["state"]
+        to_state = snapshots[i]["state"]
+        ts_ms = snapshots[i]["ts_ms"]
+
+        # Persistence: how many consecutive snapshots remain in to_state
+        persistence = 1
+        for j in range(i + 1, n):
+            if snapshots[j]["state"] == to_state:
+                persistence += 1
+            else:
+                break
+
+        # Reversal: did we return to from_state within REVERSAL_WINDOW snapshots
+        was_reverted = any(
+            snapshots[j]["state"] == from_state
+            for j in range(i + 1, min(n, i + 1 + REVERSAL_WINDOW))
+        )
+
+        # Stress slope before and after
+        def _slope(window: List[dict]) -> Optional[float]:
+            vals = [w["stress"] for w in window if w["stress"] is not None]
+            if len(vals) < 2:
+                return None
+            # OLS-free: simple diff per step ≈ average rate of change
+            return (vals[-1] - vals[0]) / max(1, len(vals) - 1)
+
+        pre = snapshots[max(0, i - PRE_WINDOW):i]
+        post = snapshots[i:min(n, i + POST_WINDOW)]
+        pre_slope = _slope(pre)
+        post_slope = _slope(post)
+        acceleration = (post_slope - pre_slope) if (pre_slope is not None and post_slope is not None) else None
+
+        meta_conf = snapshots[i]["meta_conf"] or 0.0
+
+        # Verdict: priority — REVERSED > FLICKER > ACCELERATING > PERSISTENT
+        if was_reverted:
+            verdict = "REVERSED"
+        elif persistence < PERSISTENCE_THRESHOLD:
+            verdict = "FLICKER"
+        elif acceleration is not None and abs(acceleration) >= ACCELERATION_THRESHOLD:
+            verdict = "ACCELERATING"
+        else:
+            verdict = "PERSISTENT"
+
+        # Confidence: multiplicative blend.
+        persistence_factor = min(1.0, persistence / 12.0)   # 1h = full credit
+        meta_conf_factor = meta_conf / 100.0
+        reversal_factor = 0.25 if was_reverted else 1.0
+        confidence = persistence_factor * max(0.2, meta_conf_factor) * reversal_factor * scarcity_factor
+
+        # Rationale
+        if verdict == "REVERSED":
+            rationale = (
+                f"reverted to {from_state} within {REVERSAL_WINDOW} snapshots — "
+                f"flicker, not a real state change"
+            )
+        elif verdict == "FLICKER":
+            rationale = (
+                f"only {persistence} snapshot(s) in {to_state} before next "
+                f"change (threshold {PERSISTENCE_THRESHOLD}) — too brief to commit"
+            )
+        elif verdict == "ACCELERATING":
+            arrow = "↑" if acceleration and acceleration > 0 else "↓"
+            rationale = (
+                f"persisted {persistence} snapshot(s); stress acceleration "
+                f"{acceleration:+.1f}/tick {arrow} (pre {pre_slope:+.1f} vs "
+                f"post {post_slope:+.1f}) — meaningful pace change"
+            )
+        else:
+            rationale = (
+                f"persisted {persistence} snapshot(s) at meta_confidence "
+                f"{meta_conf:.0f} — stable change"
+            )
+
+        transitions.append({
+            "ts_ms": ts_ms,
+            "from_state": from_state,
+            "to_state": to_state,
+            "persistence_snapshots": persistence,
+            "persistence_seconds": (
+                snapshots[min(n - 1, i + persistence - 1)]["ts_ms"] - ts_ms
+            ),
+            "was_reverted": was_reverted,
+            "pre_stress_slope": pre_slope,
+            "post_stress_slope": post_slope,
+            "acceleration": acceleration,
+            "meta_confidence_at": meta_conf,
+            "verdict": verdict,
+            "confidence": confidence,
+            "rationale": rationale,
+        })
+
+    # ── Current state stability ──────────────────────────────────────
+    current_state = snapshots[-1]["state"] if snapshots else None
+    current_state_duration_snapshots = 0
+    if current_state is not None:
+        for i in range(n - 1, -1, -1):
+            if snapshots[i]["state"] == current_state:
+                current_state_duration_snapshots += 1
+            else:
+                break
+    current_state_duration_seconds = (
+        snapshots[-1]["ts_ms"] - snapshots[n - current_state_duration_snapshots]["ts_ms"]
+        if current_state_duration_snapshots > 1 else 0
+    )
+
+    # ── Oscillation periods: sliding-window over transition timestamps ─
+    oscillation_periods: List[dict] = []
+    t_times = [t["ts_ms"] for t in transitions]
+    for i, t0 in enumerate(t_times):
+        window_end = t0 + OSCILLATION_WINDOW_S * 1000
+        count = sum(1 for ts in t_times[i:] if ts <= window_end)
+        if count >= OSCILLATION_MIN_TRANSITIONS:
+            # Avoid duplicates by checking if previous window already covered this
+            if not oscillation_periods or oscillation_periods[-1]["end_ms"] < t0:
+                oscillation_periods.append({
+                    "start_ms": t0,
+                    "end_ms": window_end,
+                    "transition_count": count,
+                    "rationale": (
+                        f"{count} transitions in 1h — system oscillating between "
+                        f"states, treat any single transition here as exploratory"
+                    ),
+                })
+
+    # ── Aggregates ───────────────────────────────────────────────────
+    total = len(transitions)
+    flickers = sum(1 for t in transitions if t["verdict"] in ("FLICKER", "REVERSED"))
+    flicker_ratio = (flickers / total) if total else 0.0
+    span_days = max(1e-9, (snapshots[-1]["ts_ms"] - snapshots[0]["ts_ms"]) / 86400_000) if n > 1 else 0.0
+    transition_rate_per_day = total / span_days if span_days > 0 else 0.0
+
+    # Summary
+    if exploratory:
+        summary = (
+            f"data_quality={overall_quality} ({n} snapshots) — "
+            f"transitions tracked but classifications are exploratory"
+        )
+    else:
+        stability = "stable" if flicker_ratio < 0.25 else ("noisy" if flicker_ratio < 0.5 else "unstable")
+        summary = (
+            f"{total} transitions over {span_days:.1f}d "
+            f"({transition_rate_per_day:.1f}/day, {flicker_ratio * 100:.0f}% flicker) — "
+            f"transition layer {stability}"
+        )
+
+    # Surface recent transitions first
+    transitions.sort(key=lambda t: -t["ts_ms"])
+
+    return {
+        "since_ms": since_ms,
+        "lookback_days": lookback_days,
+        "data_quality": overall_quality,
+        "exploratory": exploratory,
+        "snapshot_count": n,
+        "state_vocabulary": vocabulary,
+        "state_counts": dict(state_counts),
+        "current_state": current_state,
+        "current_state_duration_snapshots": current_state_duration_snapshots,
+        "current_state_duration_seconds": current_state_duration_seconds,
+        "transition_count": total,
+        "flicker_count": flickers,
+        "flicker_ratio": flicker_ratio,
+        "transition_rate_per_day": transition_rate_per_day,
+        "transitions": transitions[:30],
+        "oscillation_periods": oscillation_periods,
+        "summary": summary,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 15 #4 — Crisis Genesis Detection
+# ══════════════════════════════════════════════════════════════════════════
+#
+# This layer answers: "is the market drifting toward a cascade BEFORE
+# the cascade actually hits?" — i.e. early structural distortions that
+# typically precede crisis events.
+#
+# It does NOT predict. It composes seven independent precursor probes,
+# each with its own data source + scoring + rationale, into a composite
+# genesis_score. Each probe is honest about its own data quality and
+# can report INSUFFICIENT to take itself out of the composite.
+#
+# Probes (each in [0, 100]):
+#
+#   1. fragmentation_growth   coordinated_state vocabulary expanding 24h vs prior
+#   2. resiliency_decay       avg resiliency_score across symbols falling
+#   3. propagation_widening   propagation integrity dropping (weak + symmetric edges)
+#   4. dependency_concentration top dominant driver's reach over the network
+#   5. anomaly_synchronization anomaly_memory write rate accelerating
+#   6. transition_instability flicker + oscillation in state changes
+#   7. stress_acceleration    synthesized_stress slope rising faster than baseline
+#
+# Composite verdicts:
+#   CALM             < 25
+#   EARLY_DISTORTION  25-50    (one or two probes elevated)
+#   ELEVATED_RISK     50-75    (multiple probes elevated)
+#   PRE_CASCADE      ≥ 75      (most probes hot + recent confirming evidence)
+#
+# Scarcity cascade: under INSUFFICIENT/LOW data_quality, verdict is
+# capped at EARLY_DISTORTION regardless of probe scores — the system
+# refuses to declare PRE_CASCADE on a fresh database.
+
+
+def _crisis_probe(
+    *,
+    kind: str,
+    name: str,
+    score: Optional[float],
+    rationale: str,
+    metric_value: Optional[float] = None,
+    insufficient: bool = False,
+) -> dict:
+    """Normalize a precursor probe into a uniform dict shape with status
+    derived from score so the UI doesn't have to."""
+    if insufficient or score is None:
+        return {
+            "kind": kind,
+            "name": name,
+            "score": 0.0,
+            "status": "insufficient",
+            "rationale": rationale,
+            "metric_value": metric_value,
+            "contributes": False,
+        }
+    score_clipped = max(0.0, min(100.0, score))
+    if score_clipped < 30:
+        status = "calm"
+    elif score_clipped < 65:
+        status = "elevated"
+    else:
+        status = "hot"
+    return {
+        "kind": kind,
+        "name": name,
+        "score": score_clipped,
+        "status": status,
+        "rationale": rationale,
+        "metric_value": metric_value,
+        "contributes": True,
+    }
+
+
+def crisis_genesis(db: Session, lookback_days: int = 7) -> dict:
+    """Compose seven precursor probes into a single genesis_score with
+    explainable per-probe rationale. Read-only over cached upstream
+    layers + two cheap direct queries (resiliency + anomaly counts)."""
+    now_ms = int(time.time() * 1000)
+    H = 3600 * 1000
+
+    probes: List[dict] = []
+
+    # ── Probe 1: fragmentation growth ────────────────────────────────
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT coordinated_state, ts_ms
+                FROM liquidity_intelligence_history
+                WHERE ts_ms >= :since AND coordinated_state IS NOT NULL
+                """
+            ),
+            {"since": now_ms - 2 * 24 * H},
+        ).fetchall()
+        recent_states: set = set()
+        prior_states: set = set()
+        for r in rows:
+            (recent_states if int(r.ts_ms) >= now_ms - 24 * H else prior_states).add(r.coordinated_state)
+        if len(recent_states) == 0 and len(prior_states) == 0:
+            probes.append(_crisis_probe(
+                kind="fragmentation_growth",
+                name="state vocabulary growth",
+                score=None,
+                rationale="no intelligence snapshots in either 24h window",
+                insufficient=True,
+            ))
+        elif len(prior_states) == 0:
+            # bootstrap — no baseline, can't measure growth
+            probes.append(_crisis_probe(
+                kind="fragmentation_growth",
+                name="state vocabulary growth",
+                score=None,
+                rationale=f"no prior-24h baseline ({len(recent_states)} states present in recent 24h)",
+                insufficient=True,
+            ))
+        else:
+            ratio = len(recent_states) / max(1, len(prior_states))
+            score = max(0.0, min(100.0, (ratio - 1.0) / 1.5 * 100.0))
+            probes.append(_crisis_probe(
+                kind="fragmentation_growth",
+                name="state vocabulary growth",
+                score=score,
+                metric_value=ratio,
+                rationale=(
+                    f"{len(recent_states)} distinct coordinated_states in last 24h "
+                    f"vs {len(prior_states)} prior — {ratio:.1f}× expansion"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="fragmentation_growth", name="state vocabulary growth",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 2: resiliency decay (samples) ──────────────────────────
+    try:
+        # Average resiliency_score over last 6h vs prior 6h, across symbols.
+        recent = db.execute(
+            text(
+                "SELECT AVG(value) AS v, COUNT(*) AS n FROM liquidity_samples "
+                "WHERE metric = 'resiliency_score' AND ts >= :since AND value IS NOT NULL"
+            ),
+            {"since": now_ms - 6 * H},
+        ).first()
+        prior = db.execute(
+            text(
+                "SELECT AVG(value) AS v, COUNT(*) AS n FROM liquidity_samples "
+                "WHERE metric = 'resiliency_score' AND ts >= :s AND ts < :e AND value IS NOT NULL"
+            ),
+            {"s": now_ms - 12 * H, "e": now_ms - 6 * H},
+        ).first()
+        rv = float(recent.v) if recent and recent.v is not None else None
+        pv = float(prior.v) if prior and prior.v is not None else None
+        rn = int(recent.n or 0) if recent else 0
+        pn = int(prior.n or 0) if prior else 0
+        if rv is None or pv is None or rn < 20 or pn < 20:
+            probes.append(_crisis_probe(
+                kind="resiliency_decay", name="resiliency decay",
+                score=None,
+                rationale=f"not enough resiliency_score samples (recent {rn}, prior {pn}; need ≥ 20 each)",
+                insufficient=True,
+            ))
+        else:
+            delta = rv - pv  # negative = decay
+            # 0 at delta ≥ 0; 50 at delta = -10; 100 at delta ≤ -25
+            score = max(0.0, min(100.0, -delta * 4.0))
+            probes.append(_crisis_probe(
+                kind="resiliency_decay", name="resiliency decay",
+                score=score, metric_value=delta,
+                rationale=(
+                    f"avg resiliency {rv:.1f} (recent 6h, n={rn}) vs {pv:.1f} "
+                    f"(prior 6h, n={pn}) — Δ {delta:+.1f}"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="resiliency_decay", name="resiliency decay",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 3: propagation widening ────────────────────────────────
+    try:
+        prop = propagation_graph(db, lookback_days=lookback_days)
+        comp = prop.get("integrity_components") or {}
+        weak = float(comp.get("weak_share", 0.0))
+        symmetric = float(comp.get("symmetric_share", 0.0))
+        widening = (weak + symmetric) / 2.0 * 100.0
+        if not prop.get("edges"):
+            probes.append(_crisis_probe(
+                kind="propagation_widening", name="propagation widening",
+                score=None,
+                rationale="propagation graph empty — no alert pairs to analyze",
+                insufficient=True,
+            ))
+        else:
+            probes.append(_crisis_probe(
+                kind="propagation_widening", name="propagation widening",
+                score=widening, metric_value=widening,
+                rationale=(
+                    f"weak edges {weak * 100:.0f}% + symmetric pairs {symmetric * 100:.0f}% "
+                    f"of top-50 propagation graph — integrity "
+                    f"{prop.get('integrity_score', 0):.0f}/100"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="propagation_widening", name="propagation widening",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 4: dependency concentration ────────────────────────────
+    try:
+        sd = structural_dependencies(db, lookback_days=lookback_days)
+        drivers = sd.get("dominant_drivers") or []
+        if sd.get("exploratory") or not drivers:
+            probes.append(_crisis_probe(
+                kind="dependency_concentration", name="dependency concentration",
+                score=None,
+                rationale=(
+                    f"no dominant drivers identified ({sd.get('directional_edge_count', 0)} "
+                    f"directional edge(s) in upstream layer)"
+                ),
+                insufficient=True,
+            ))
+        else:
+            # Universe of symbols touched by dominant drivers or their reach.
+            universe: set = set()
+            for d in drivers:
+                universe.add(d["symbol"])
+                universe.update(d.get("reachable_sample", []))
+            uni_size = max(1, len(universe))
+            top_reach = max(d["reach_size"] for d in drivers)
+            share = top_reach / uni_size
+            # 0 at share < 0.30; 100 at share ≥ 0.70
+            score = max(0.0, min(100.0, (share - 0.30) / 0.40 * 100.0))
+            top_driver = max(drivers, key=lambda d: d["reach_size"])
+            probes.append(_crisis_probe(
+                kind="dependency_concentration", name="dependency concentration",
+                score=score, metric_value=share,
+                rationale=(
+                    f"top driver {top_driver['symbol']} reaches "
+                    f"{top_driver['reach_size']}/{uni_size} symbols "
+                    f"({share * 100:.0f}% of touched universe)"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="dependency_concentration", name="dependency concentration",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 5: anomaly synchronization (anomaly_memory rate) ──────
+    try:
+        recent = db.execute(
+            text("SELECT COUNT(*) AS c FROM liquidity_anomaly_memory WHERE occurred_at_ms >= :s"),
+            {"s": now_ms - 6 * H},
+        ).first()
+        prior = db.execute(
+            text(
+                "SELECT COUNT(*) AS c FROM liquidity_anomaly_memory "
+                "WHERE occurred_at_ms >= :s AND occurred_at_ms < :e"
+            ),
+            {"s": now_ms - 12 * H, "e": now_ms - 6 * H},
+        ).first()
+        rc = int(recent.c or 0) if recent else 0
+        pc = int(prior.c or 0) if prior else 0
+        if rc == 0 and pc == 0:
+            probes.append(_crisis_probe(
+                kind="anomaly_synchronization", name="anomaly synchronization",
+                score=None,
+                rationale="no anomaly_memory writes in last 12h",
+                insufficient=True,
+            ))
+        elif pc == 0:
+            # Bootstrap: new anomalies but no baseline to compare against
+            probes.append(_crisis_probe(
+                kind="anomaly_synchronization", name="anomaly synchronization",
+                score=None,
+                rationale=f"no prior-6h baseline ({rc} anomalies in recent 6h)",
+                insufficient=True,
+            ))
+        else:
+            ratio = rc / pc
+            score = max(0.0, min(100.0, (ratio - 1.0) / 2.0 * 100.0))
+            probes.append(_crisis_probe(
+                kind="anomaly_synchronization", name="anomaly synchronization",
+                score=score, metric_value=ratio,
+                rationale=(
+                    f"{rc} anomaly records in last 6h vs {pc} prior 6h — "
+                    f"{ratio:.1f}× acceleration"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="anomaly_synchronization", name="anomaly synchronization",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 6: transition instability ──────────────────────────────
+    try:
+        tr = market_state_transitions(db, lookback_days=lookback_days)
+        if tr.get("exploratory") or tr.get("transition_count", 0) == 0:
+            probes.append(_crisis_probe(
+                kind="transition_instability", name="state transition instability",
+                score=None,
+                rationale=(
+                    f"insufficient transitions ({tr.get('transition_count', 0)} "
+                    f"in {tr.get('snapshot_count', 0)} snapshots)"
+                ),
+                insufficient=True,
+            ))
+        else:
+            flicker = float(tr.get("flicker_ratio") or 0.0)
+            oscillating = len(tr.get("oscillation_periods") or [])
+            score = flicker * 60.0 + (40.0 if oscillating else 0.0)
+            probes.append(_crisis_probe(
+                kind="transition_instability", name="state transition instability",
+                score=score, metric_value=flicker,
+                rationale=(
+                    f"flicker {flicker * 100:.0f}% of {tr.get('transition_count', 0)} "
+                    f"transitions, {oscillating} oscillation period(s) detected"
+                ),
+            ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="transition_instability", name="state transition instability",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Probe 7: stress slope acceleration ───────────────────────────
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT ts_ms, synthesized_stress
+                FROM liquidity_intelligence_history
+                WHERE ts_ms >= :since AND synthesized_stress IS NOT NULL
+                ORDER BY ts_ms ASC
+                """
+            ),
+            {"since": now_ms - 12 * H},
+        ).fetchall()
+        rs = [(int(r.ts_ms), float(r.synthesized_stress)) for r in rows]
+        if len(rs) < 12:
+            probes.append(_crisis_probe(
+                kind="stress_acceleration", name="stress slope acceleration",
+                score=None,
+                rationale=f"only {len(rs)} stress samples in 12h — need ≥ 12",
+                insufficient=True,
+            ))
+        else:
+            mid_ms = now_ms - 6 * H
+            prior = [v for ts, v in rs if ts < mid_ms]
+            recent = [v for ts, v in rs if ts >= mid_ms]
+            if len(prior) < 5 or len(recent) < 5:
+                probes.append(_crisis_probe(
+                    kind="stress_acceleration", name="stress slope acceleration",
+                    score=None,
+                    rationale=f"unbalanced windows (prior {len(prior)}, recent {len(recent)}; need ≥ 5 each)",
+                    insufficient=True,
+                ))
+            else:
+                prior_slope = (prior[-1] - prior[0]) / max(1, len(prior) - 1)
+                recent_slope = (recent[-1] - recent[0]) / max(1, len(recent) - 1)
+                accel = recent_slope - prior_slope
+                # Positive accel = stress accelerating up = bad
+                score = max(0.0, min(100.0, accel * 10.0)) if accel > 0 else 0.0
+                probes.append(_crisis_probe(
+                    kind="stress_acceleration", name="stress slope acceleration",
+                    score=score, metric_value=accel,
+                    rationale=(
+                        f"stress slope {prior_slope:+.1f}/tick (prior 6h) → "
+                        f"{recent_slope:+.1f}/tick (recent 6h) — acceleration "
+                        f"{accel:+.1f}"
+                    ),
+                ))
+    except Exception:  # noqa: BLE001
+        probes.append(_crisis_probe(
+            kind="stress_acceleration", name="stress slope acceleration",
+            score=None, rationale="query failed", insufficient=True,
+        ))
+
+    # ── Compose ──────────────────────────────────────────────────────
+    contributing = [p for p in probes if p["contributes"]]
+    insufficient_count = sum(1 for p in probes if not p["contributes"])
+    hot_count = sum(1 for p in probes if p["status"] == "hot")
+    elevated_count = sum(1 for p in probes if p["status"] == "elevated")
+    calm_count = sum(1 for p in probes if p["status"] == "calm")
+
+    if not contributing:
+        # Nothing has enough data — verdict is honestly NONE
+        genesis_score = 0.0
+        verdict = "INSUFFICIENT"
+        confidence = 0.0
+    else:
+        # Plain mean of contributing probes — explicit and inspectable.
+        genesis_score = sum(p["score"] for p in contributing) / len(contributing)
+        confidence = len(contributing) / 7.0  # how many probes had data
+        # Scarcity cap: if more than half the probes are INSUFFICIENT,
+        # verdict is capped at EARLY_DISTORTION regardless of score.
+        if insufficient_count > 3:
+            verdict = "EARLY_DISTORTION" if genesis_score >= 25 else "CALM"
+        elif genesis_score >= 75 and hot_count >= 3:
+            verdict = "PRE_CASCADE"
+        elif genesis_score >= 50:
+            verdict = "ELEVATED_RISK"
+        elif genesis_score >= 25:
+            verdict = "EARLY_DISTORTION"
+        else:
+            verdict = "CALM"
+
+    # Summary — adapts to verdict.
+    if verdict == "INSUFFICIENT":
+        summary = "No probes had enough data to score — system is silent, not safe."
+    elif verdict == "CALM":
+        summary = (
+            f"genesis_score {genesis_score:.0f}/100 — "
+            f"no precursor signals materially elevated"
+        )
+    elif verdict == "EARLY_DISTORTION":
+        elevated_names = ", ".join(p["kind"] for p in probes if p["status"] == "elevated")
+        summary = (
+            f"genesis_score {genesis_score:.0f}/100 — early distortion in: {elevated_names or '(scarcity cap)'}"
+        )
+    elif verdict == "ELEVATED_RISK":
+        hot_names = ", ".join(p["kind"] for p in probes if p["status"] == "hot") or "multiple probes"
+        summary = (
+            f"genesis_score {genesis_score:.0f}/100 — elevated risk: {hot_names} are firing"
+        )
+    else:  # PRE_CASCADE
+        hot_names = ", ".join(p["kind"] for p in probes if p["status"] == "hot")
+        summary = (
+            f"genesis_score {genesis_score:.0f}/100 — PRE_CASCADE: "
+            f"{hot_count} hot probes ({hot_names})"
+        )
+
+    return {
+        "fetched_at_ms": now_ms,
+        "lookback_days": lookback_days,
+        "genesis_score": genesis_score,
+        "verdict": verdict,
+        "confidence": confidence,
+        "probe_count": len(probes),
+        "hot_count": hot_count,
+        "elevated_count": elevated_count,
+        "calm_count": calm_count,
+        "insufficient_count": insufficient_count,
+        "probes": probes,
+        "summary": summary,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 15 #6 — Narrative Causality
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Final layer in Phase 15: compose causal_propagation, structural_dependencies,
+# market_state_transitions, and crisis_genesis into a human-readable
+# narrative. The narrative is deterministic — built from templates that
+# pick phrasing based on which numbers came back from upstream — NOT
+# generated by a model. Every sentence is traceable to a specific data
+# point.
+#
+# Phrasing rules followed throughout:
+#   * "X tends to precede Y"           (NOT "X causes Y")
+#   * "consistent with X influencing Y" (NOT "X influences Y")
+#   * "no committed claim of direct influence between A and B"
+#   * "lead-lag signature" / "directional signal"  (NOT "causality")
+#   * "the data has not yet ruled out coincidence/common-driver"
+#
+# Every section carries a confidence number AND a missing-data caveat
+# when applicable.
+
+
+def _fmt_duration_short(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86_400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86_400}d"
+
+
+def _narrate_state(tr: dict) -> dict:
+    """Narrate market state transitions."""
+    n_snap = tr.get("snapshot_count", 0)
+    quality = tr.get("data_quality", "INSUFFICIENT")
+    if tr.get("exploratory"):
+        text = (
+            f"State-transition layer is in exploratory mode "
+            f"({n_snap} intelligence snapshots, data_quality={quality}). "
+            f"Transitions are tracked but classifications are not committed."
+        )
+        return {"kind": "state", "title": "Market state", "text": text, "confidence": 0.3}
+
+    current = tr.get("current_state") or "unknown"
+    dur_s = (tr.get("current_state_duration_seconds") or 0) // 1000
+    dur = _fmt_duration_short(dur_s) if dur_s > 0 else "less than one snapshot"
+    transitions = tr.get("transition_count", 0)
+    rate = tr.get("transition_rate_per_day", 0.0)
+    flicker = tr.get("flicker_ratio", 0.0)
+    stability_label = "stable" if flicker < 0.25 else ("noisy" if flicker < 0.50 else "unstable")
+    oscillations = len(tr.get("oscillation_periods") or [])
+
+    txt_parts = [
+        f"Market is currently in {current} (held for {dur})."
+    ]
+    if transitions > 0:
+        txt_parts.append(
+            f"Over the lookback window the engine recorded {transitions} state "
+            f"transitions ({rate:.1f}/day, {flicker * 100:.0f}% flicker) — "
+            f"transition layer reads {stability_label}."
+        )
+    else:
+        txt_parts.append(
+            f"No state transitions recorded over the lookback window — "
+            f"state has held throughout."
+        )
+    if oscillations > 0:
+        txt_parts.append(
+            f"{oscillations} oscillation period(s) detected (≥3 transitions "
+            f"within 1 hour); transitions inside those windows should not be "
+            f"interpreted as meaningful regime changes."
+        )
+
+    return {
+        "kind": "state",
+        "title": "Market state",
+        "text": " ".join(txt_parts),
+        "confidence": 1.0 if quality == "HIGH" else (0.7 if quality == "MEDIUM" else 0.4),
+    }
+
+
+def _narrate_propagation(causal: dict) -> dict:
+    """Narrate causal propagation findings."""
+    quality = causal.get("data_quality", "INSUFFICIENT")
+    edges = causal.get("edges") or []
+    counts = causal.get("verdict_counts") or {}
+    n_total = len(edges)
+    directional = counts.get("DIRECTIONAL", 0)
+    common_driven = counts.get("COMMON_DRIVEN", 0)
+    coincidence = counts.get("COINCIDENCE", 0)
+    under_evidenced = counts.get("UNDER_EVIDENCED", 0)
+    ambiguous = counts.get("AMBIGUOUS", 0)
+    exploratory = counts.get("EXPLORATORY", 0)
+
+    if exploratory == n_total and n_total > 0:
+        text = (
+            f"Causal propagation layer is in EXPLORATORY mode (data_quality="
+            f"{quality}, {causal.get('total_alerts', 0)} alerts). "
+            f"{n_total} candidate edge(s) identified but no causal claims "
+            f"are committed — the scarcity gate is preventing any single "
+            f"edge from being labeled directional."
+        )
+        return {"kind": "propagation", "title": "Causal propagation", "text": text, "confidence": 0.2}
+
+    if n_total == 0:
+        text = (
+            f"No propagation pairs above the count threshold. "
+            f"Insufficient alert history across multiple symbols."
+        )
+        return {"kind": "propagation", "title": "Causal propagation", "text": text, "confidence": 0.0}
+
+    parts: List[str] = []
+    if directional > 0:
+        # Cite top directional edge
+        top = next((e for e in edges if e["verdict"] == "DIRECTIONAL"), None)
+        if top:
+            parts.append(
+                f"{directional} edge(s) survived all four causality tests "
+                f"(asymmetric direction, multi-window persistence, no common "
+                f"driver, sufficient data) — strongest is {top['from_symbol']}"
+                f" tends to precede {top['to_symbol']} (causal_confidence "
+                f"{top['causal_confidence'] * 100:.0f}, n={top['count']} vs "
+                f"reverse {top['reverse_count']})."
+            )
+        else:
+            parts.append(f"{directional} edge(s) labeled DIRECTIONAL.")
+    else:
+        parts.append("No edges survived all four causality tests — no directional claims are committed.")
+
+    if common_driven > 0:
+        # Find the common drivers
+        drivers = {e["common_driver"] for e in edges if e["verdict"] == "COMMON_DRIVEN" and e["common_driver"]}
+        if drivers:
+            parts.append(
+                f"{common_driven} pair(s) labeled COMMON_DRIVEN — most likely "
+                f"co-movement around {', '.join(sorted(drivers)[:3])} rather "
+                f"than direct influence between the pair members."
+            )
+        else:
+            parts.append(f"{common_driven} pair(s) labeled COMMON_DRIVEN.")
+
+    if coincidence > 0:
+        parts.append(
+            f"{coincidence} pair(s) labeled COINCIDENCE (bidirectional, "
+            f"≥70% mirrored) — these are co-firing, not lead-lag."
+        )
+
+    if under_evidenced + ambiguous > 0:
+        parts.append(
+            f"{under_evidenced + ambiguous} pair(s) flagged UNDER_EVIDENCED "
+            f"or AMBIGUOUS — direction not stable across sub-windows or "
+            f"asymmetry below the 40% threshold."
+        )
+
+    text = " ".join(parts)
+    confidence = 1.0 if quality == "HIGH" else (0.7 if quality == "MEDIUM" else 0.3)
+    return {"kind": "propagation", "title": "Causal propagation", "text": text, "confidence": confidence}
+
+
+def _narrate_structural(sd: dict) -> dict:
+    """Narrate structural dependency findings."""
+    if sd.get("exploratory"):
+        text = (
+            "No structural dependencies surfaced — upstream causal "
+            "propagation layer is in EXPLORATORY mode, so chains, "
+            "clusters and dominant drivers cannot be committed yet."
+        )
+        return {"kind": "structural", "title": "Structural dependencies", "text": text, "confidence": 0.2}
+
+    chains = sd.get("influence_chains") or []
+    clusters = sd.get("dependency_clusters") or []
+    drivers = sd.get("dominant_drivers") or []
+    sync_groups = sd.get("synchronized_groups") or []
+
+    parts: List[str] = []
+    if chains:
+        top_chain = chains[0]
+        parts.append(
+            f"{len(chains)} multi-hop influence chain(s) detected. "
+            f"Strongest: {' → '.join(top_chain['path'])} "
+            f"(min_confidence {top_chain['min_confidence'] * 100:.0f})."
+        )
+    else:
+        parts.append("No multi-hop chains — no two directional edges share a midpoint symbol.")
+
+    if drivers:
+        top = drivers[0]
+        parts.append(
+            f"{top['symbol']} reaches {top['reach_size']} symbol(s) within "
+            f"3 hops at avg confidence {top['avg_out_confidence'] * 100:.0f} — "
+            f"the largest detected influence footprint."
+        )
+    else:
+        parts.append("No dominant drivers identified.")
+
+    if clusters:
+        top_cluster = clusters[0]
+        parts.append(
+            f"{len(clusters)} co-driver cluster(s): "
+            f"{top_cluster['driver']} mediates a group of "
+            f"{top_cluster['size']} symbol(s) without detected internal "
+            f"causal structure."
+        )
+
+    if sync_groups:
+        top_grp = sync_groups[0]
+        parts.append(
+            f"{len(sync_groups)} synchronized stress group(s): largest has "
+            f"{top_grp['size']} symbols connected by "
+            f"{top_grp['coincidence_edges']} coincidence pair(s) "
+            f"(co-firing, not directional)."
+        )
+
+    text = " ".join(parts)
+    return {"kind": "structural", "title": "Structural dependencies", "text": text, "confidence": 0.7}
+
+
+def _narrate_genesis(cg: dict) -> dict:
+    """Narrate crisis genesis verdict."""
+    verdict = cg.get("verdict", "INSUFFICIENT")
+    score = cg.get("genesis_score", 0.0)
+    confidence_pct = cg.get("confidence", 0.0) * 100
+    probes = cg.get("probes") or []
+    hot = [p for p in probes if p["status"] == "hot"]
+    elevated = [p for p in probes if p["status"] == "elevated"]
+    insufficient = [p for p in probes if not p["contributes"]]
+
+    if verdict == "INSUFFICIENT":
+        text = (
+            "Crisis-genesis layer is silent because most precursor probes "
+            "have insufficient data, NOT because the market is calm. "
+            f"{len(insufficient)}/{len(probes)} probes could not be scored: "
+            f"{', '.join(p['kind'] for p in insufficient)}."
+        )
+        return {"kind": "genesis", "title": "Crisis genesis", "text": text, "confidence": 0.0}
+
+    parts: List[str] = [
+        f"Genesis composite verdict: {verdict} at score {score:.0f}/100 "
+        f"(confidence {confidence_pct:.0f}%, "
+        f"{len(probes) - len(insufficient)}/{len(probes)} probes contributing)."
+    ]
+
+    if verdict == "PRE_CASCADE":
+        parts.append(
+            f"Pattern is consistent with pre-cascade structural distortion — "
+            f"{len(hot)} probe(s) hot: {', '.join(p['kind'] for p in hot)}."
+        )
+    elif verdict == "ELEVATED_RISK":
+        parts.append(
+            f"{len(hot)} probe(s) hot ({', '.join(p['kind'] for p in hot)})"
+            + (f" and {len(elevated)} elevated ({', '.join(p['kind'] for p in elevated)})" if elevated else "")
+            + ". Watch for the next probe to confirm before treating as pre-cascade."
+        )
+    elif verdict == "EARLY_DISTORTION":
+        if elevated:
+            parts.append(
+                f"Early distortion in: {', '.join(p['kind'] for p in elevated)}. "
+                f"Other probes calm or insufficient — could resolve or escalate."
+            )
+        else:
+            parts.append(
+                "Score above CALM threshold but no single probe elevated — "
+                "composite from low-grade signals."
+            )
+    else:  # CALM
+        parts.append("No precursor probes are materially elevated.")
+
+    if insufficient and verdict not in ("INSUFFICIENT", "PRE_CASCADE"):
+        parts.append(
+            f"{len(insufficient)} probe(s) report insufficient data "
+            f"({', '.join(p['kind'] for p in insufficient)}) — verdict is "
+            f"composed from the {len(probes) - len(insufficient)} probes that "
+            f"could score."
+        )
+
+    text = " ".join(parts)
+    return {"kind": "genesis", "title": "Crisis genesis", "text": text, "confidence": confidence_pct / 100.0}
+
+
+def _narrate_uncertainty(causal: dict, sd: dict, tr: dict, cg: dict) -> dict:
+    """Explicit summary of what the system does NOT know."""
+    items: List[str] = []
+    if causal.get("data_quality") in ("INSUFFICIENT", "LOW"):
+        items.append(
+            f"causal propagation layer in EXPLORATORY mode "
+            f"(data_quality={causal.get('data_quality')}) — no directional claims"
+        )
+    if tr.get("exploratory"):
+        items.append(
+            f"transition layer in EXPLORATORY mode "
+            f"({tr.get('snapshot_count', 0)} snapshots, "
+            f"data_quality={tr.get('data_quality')})"
+        )
+    insufficient_probes = [p for p in (cg.get("probes") or []) if not p["contributes"]]
+    if insufficient_probes:
+        items.append(
+            f"{len(insufficient_probes)} crisis-genesis probe(s) cannot score: "
+            f"{', '.join(p['kind'] for p in insufficient_probes)}"
+        )
+
+    if not items:
+        text = (
+            "All four upstream layers are above the scarcity threshold. "
+            "The narrative above is the system's best current interpretation "
+            "with no major data gaps."
+        )
+    else:
+        text = "Known gaps: " + "; ".join(items) + "."
+
+    return {
+        "kind": "uncertainty",
+        "title": "What the system does not know",
+        "text": text,
+        "confidence": None,
+    }
+
+
+def _build_headline(cg: dict, tr: dict, causal: dict) -> str:
+    verdict = cg.get("verdict", "INSUFFICIENT")
+    if verdict == "PRE_CASCADE":
+        return f"Pre-cascade structural distortion: {cg.get('hot_count', 0)} hot probe(s) firing."
+    if verdict == "ELEVATED_RISK":
+        return f"Elevated structural risk: {cg.get('hot_count', 0)} hot + {cg.get('elevated_count', 0)} elevated precursor signal(s)."
+    if verdict == "EARLY_DISTORTION":
+        return f"Early distortion: composite genesis score {cg.get('genesis_score', 0):.0f}/100 (confidence {cg.get('confidence', 0) * 100:.0f}%)."
+    if verdict == "INSUFFICIENT":
+        return "Insufficient evidence for a narrative — the system is silent because data is missing, not because the market is calm."
+    # CALM
+    return f"All precursor signals quiet — {tr.get('current_state', 'unknown')} held for {_fmt_duration_short((tr.get('current_state_duration_seconds') or 0) // 1000)}."
+
+
+def narrative_causality(db: Session, lookback_days: int = 7) -> dict:
+    """Compose Phase 15 layers into a deterministic narrative.
+    All sentences are template-built — no model calls, every claim
+    traceable to a specific upstream number."""
+    now_ms = int(time.time() * 1000)
+
+    causal = causal_propagation(db, lookback_days=lookback_days)
+    sd = structural_dependencies(db, lookback_days=lookback_days)
+    tr = market_state_transitions(db, lookback_days=lookback_days)
+    cg = crisis_genesis(db, lookback_days=lookback_days)
+
+    sections = [
+        _narrate_state(tr),
+        _narrate_propagation(causal),
+        _narrate_structural(sd),
+        _narrate_genesis(cg),
+        _narrate_uncertainty(causal, sd, tr, cg),
+    ]
+    headline = _build_headline(cg, tr, causal)
+    paragraph = "\n\n".join(f"{s['title']}. {s['text']}" for s in sections)
+
+    # Overall confidence = mean of per-section confidences that have one.
+    confidences = [s["confidence"] for s in sections if s.get("confidence") is not None]
+    overall_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+
+    return {
+        "fetched_at_ms": now_ms,
+        "lookback_days": lookback_days,
+        "headline": headline,
+        "verdict": cg.get("verdict", "INSUFFICIENT"),
+        "overall_confidence": overall_confidence,
+        "sections": sections,
+        "paragraph": paragraph,
+    }
+
+
 def sanity_audit(db: Session) -> dict:
     """Integrity-monitoring engine for the discovery layer.
 
@@ -5591,3 +7278,8 @@ evolutionary_behavior = _ttl_cached(300.0)(evolutionary_behavior)
 # fresh view on the next polling cycle without paying the full cost
 # every minute.
 sanity_audit = _ttl_cached(30.0)(sanity_audit)
+causal_propagation = _ttl_cached(300.0)(causal_propagation)
+structural_dependencies = _ttl_cached(300.0)(structural_dependencies)
+market_state_transitions = _ttl_cached(300.0)(market_state_transitions)
+crisis_genesis = _ttl_cached(120.0)(crisis_genesis)  # tighter TTL — meant for early-warning
+narrative_causality = _ttl_cached(120.0)(narrative_causality)

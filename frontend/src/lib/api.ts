@@ -1679,6 +1679,249 @@ export type SanityTrend =
   | "CHRONIC"
   | "TRANSIENT";
 
+export type CausalVerdict =
+  | "DIRECTIONAL"
+  | "COMMON_DRIVEN"
+  | "COINCIDENCE"
+  | "UNDER_EVIDENCED"
+  | "AMBIGUOUS"
+  | "EXPLORATORY";
+
+export type CausalRole =
+  | "LEADER"
+  | "AMPLIFIER"
+  | "FOLLOWER"
+  | "INSTABILITY_HUB"
+  | "ISOLATED";
+
+export type CausalEdge = {
+  from_symbol: string;
+  to_symbol: string;
+  count: number;
+  reverse_count: number;
+  asymmetry: number;
+  evidence_count: number;
+  n_windows: number;
+  symmetry_penalty: number;
+  common_driver: string | null;
+  common_driver_strength: number;
+  causal_confidence: number;
+  verdict: CausalVerdict;
+  rationale: string;
+  factors: {
+    volume: number;
+    asymmetry: number;
+    evidence: number;
+    common_driver_penalty: number;
+    symmetry: number;
+    scarcity: number;
+  };
+};
+
+export type CausalNode = {
+  symbol: string;
+  out_count: number;
+  in_count: number;
+  avg_out_confidence: number;
+  avg_in_confidence: number;
+  stability: number;
+  role: CausalRole;
+  role_rationale: string;
+};
+
+export type CausalPropagation = {
+  since_ms: number;
+  lookback_days: number;
+  n_windows: number;
+  total_alerts: number;
+  edges: CausalEdge[];
+  nodes: CausalNode[];
+  verdict_counts: Partial<Record<CausalVerdict, number>>;
+  role_counts: Partial<Record<CausalRole, number>>;
+  data_quality: DataQuality;
+};
+
+export async function getCausalPropagation(opts: { lookback_days?: number; n_windows?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.n_windows != null) usp.set("n_windows", String(opts.n_windows));
+  return request<CausalPropagation>(`/liquidity/research/causal-propagation${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type InfluenceChain = {
+  path: string[];
+  min_confidence: number;
+  step_confidences: number[];
+  rationale: string;
+};
+
+export type DependencyCluster = {
+  cluster_id: number;
+  cluster_type: "common_driver";
+  driver: string;
+  members: string[];
+  size: number;
+  min_driver_strength: number;
+  rationale: string;
+};
+
+export type DominantDriver = {
+  symbol: string;
+  reach_depth: number;
+  reach_size: number;
+  direct_out_count: number;
+  avg_out_confidence: number;
+  influence_score: number;
+  reachable_sample: string[];
+  rationale: string;
+};
+
+export type SynchronizedGroup = {
+  group_id: number;
+  members: string[];
+  size: number;
+  coincidence_edges: number;
+  rationale: string;
+};
+
+export type StructuralDependencies = {
+  since_ms: number;
+  lookback_days: number;
+  data_quality: DataQuality;
+  exploratory: boolean;
+  directional_edge_count: number;
+  common_driven_edge_count: number;
+  coincidence_edge_count: number;
+  influence_chains: InfluenceChain[];
+  dependency_clusters: DependencyCluster[];
+  dominant_drivers: DominantDriver[];
+  synchronized_groups: SynchronizedGroup[];
+  summary: string;
+};
+
+export async function getStructuralDependencies(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<StructuralDependencies>(`/liquidity/research/structural-dependencies${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type TransitionVerdict =
+  | "PERSISTENT"
+  | "ACCELERATING"
+  | "FLICKER"
+  | "REVERSED";
+
+export type MarketTransition = {
+  ts_ms: number;
+  from_state: string;
+  to_state: string;
+  persistence_snapshots: number;
+  persistence_seconds: number;
+  was_reverted: boolean;
+  pre_stress_slope: number | null;
+  post_stress_slope: number | null;
+  acceleration: number | null;
+  meta_confidence_at: number;
+  verdict: TransitionVerdict;
+  confidence: number;
+  rationale: string;
+};
+
+export type OscillationPeriod = {
+  start_ms: number;
+  end_ms: number;
+  transition_count: number;
+  rationale: string;
+};
+
+export type MarketStateTransitions = {
+  since_ms: number;
+  lookback_days: number;
+  data_quality: DataQuality;
+  exploratory: boolean;
+  snapshot_count: number;
+  state_vocabulary: string[];
+  state_counts: Record<string, number>;
+  current_state: string | null;
+  current_state_duration_snapshots: number;
+  current_state_duration_seconds: number;
+  transition_count: number;
+  flicker_count: number;
+  flicker_ratio: number;
+  transition_rate_per_day: number;
+  transitions: MarketTransition[];
+  oscillation_periods: OscillationPeriod[];
+  summary: string;
+};
+
+export async function getMarketStateTransitions(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<MarketStateTransitions>(`/liquidity/research/state-transitions${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type CrisisGenesisStatus = "calm" | "elevated" | "hot" | "insufficient";
+export type CrisisGenesisVerdict =
+  | "CALM"
+  | "EARLY_DISTORTION"
+  | "ELEVATED_RISK"
+  | "PRE_CASCADE"
+  | "INSUFFICIENT";
+
+export type CrisisGenesisProbe = {
+  kind: string;
+  name: string;
+  score: number;
+  status: CrisisGenesisStatus;
+  rationale: string;
+  metric_value: number | null;
+  contributes: boolean;
+};
+
+export type CrisisGenesis = {
+  fetched_at_ms: number;
+  lookback_days: number;
+  genesis_score: number;
+  verdict: CrisisGenesisVerdict;
+  confidence: number;
+  probe_count: number;
+  hot_count: number;
+  elevated_count: number;
+  calm_count: number;
+  insufficient_count: number;
+  probes: CrisisGenesisProbe[];
+  summary: string;
+};
+
+export async function getCrisisGenesis(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<CrisisGenesis>(`/liquidity/research/crisis-genesis${usp.toString() ? `?${usp}` : ""}`);
+}
+
+export type NarrativeSection = {
+  kind: "state" | "propagation" | "structural" | "genesis" | "uncertainty";
+  title: string;
+  text: string;
+  confidence: number | null;
+};
+
+export type NarrativeCausality = {
+  fetched_at_ms: number;
+  lookback_days: number;
+  headline: string;
+  verdict: CrisisGenesisVerdict;
+  overall_confidence: number;
+  sections: NarrativeSection[];
+  paragraph: string;
+};
+
+export async function getNarrativeCausality(opts: { lookback_days?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  return request<NarrativeCausality>(`/liquidity/research/narrative-causality${usp.toString() ? `?${usp}` : ""}`);
+}
+
 export type SanityFinding = {
   kind: string;
   category: SanityCategory;
