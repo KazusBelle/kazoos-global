@@ -1441,6 +1441,8 @@ export type DiscoveredPattern = {
   novelty_score: number;
 };
 
+export type DataQuality = "HIGH" | "MEDIUM" | "LOW" | "INSUFFICIENT";
+
 export type PatternDiscovery = {
   since_ms: number;
   min_support: number;
@@ -1449,6 +1451,7 @@ export type PatternDiscovery = {
   base_rate: number;
   total_buckets: number;
   patterns: DiscoveredPattern[];
+  data_quality: DataQuality;
 };
 
 export async function getPatternDiscovery(opts: { since_ms?: number; min_support?: number; bucket_minutes?: number } = {}) {
@@ -1474,7 +1477,7 @@ export type Archetype = {
   centroid: Record<string, number>;
 };
 
-export type CrisisArchetypes = { archetypes: Archetype[]; anomaly_count: number; vocabulary: string[] };
+export type CrisisArchetypes = { archetypes: Archetype[]; anomaly_count: number; vocabulary: string[]; data_quality: DataQuality };
 
 export async function getCrisisArchetypes(max_archetypes = 8) {
   return request<CrisisArchetypes>(`/liquidity/research/crisis-archetypes?max_archetypes=${max_archetypes}`);
@@ -1493,7 +1496,7 @@ export type HiddenRegimeCluster = {
   is_emergent: boolean;
 };
 
-export type HiddenRegimes = { since_ms: number; snapshot_count: number; clusters: HiddenRegimeCluster[] };
+export type HiddenRegimes = { since_ms: number; snapshot_count: number; clusters: HiddenRegimeCluster[]; data_quality: DataQuality };
 
 export async function getHiddenRegimes(opts: { lookback_days?: number; max_clusters?: number } = {}) {
   const usp = new URLSearchParams();
@@ -1508,6 +1511,7 @@ export type PropagationEdge = {
   count: number;
   avg_lead_ms: number;
   avg_lead_s: number;
+  confidence: "HIGH" | "MEDIUM" | "LOW";
 };
 
 export type PropagationNode = { symbol: string; out_count: number; in_count: number; net_lead: number };
@@ -1522,10 +1526,11 @@ export type Propagation = {
   total_alerts: number;
 };
 
-export async function getPropagation(opts: { lookback_days?: number; lead_window_minutes?: number } = {}) {
+export async function getPropagation(opts: { lookback_days?: number; lead_window_minutes?: number; min_lead_seconds?: number } = {}) {
   const usp = new URLSearchParams();
   if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
   if (opts.lead_window_minutes != null) usp.set("lead_window_minutes", String(opts.lead_window_minutes));
+  if (opts.min_lead_seconds != null) usp.set("min_lead_seconds", String(opts.min_lead_seconds));
   return request<Propagation>(`/liquidity/research/propagation${usp.toString() ? `?${usp}` : ""}`);
 }
 
@@ -1582,6 +1587,7 @@ export type IntelligenceForecast = {
   forecasts: ForecastEntry[];
   trajectory: "ESCALATING" | "DEESCALATING" | "STEADY" | "DRIFTING" | "UNKNOWN" | null;
   snapshot_count: number;
+  data_quality: DataQuality;
 };
 
 export async function getIntelligenceForecast(horizon_days = 7) {
@@ -1603,4 +1609,27 @@ export type AdaptationOut = {
 
 export async function getAdaptationRecommendations() {
   return request<AdaptationOut>("/liquidity/research/adaptation-recommendations");
+}
+
+export type SanityFinding = {
+  kind:
+    | "validation_collapse"
+    | "anomaly_inflation"
+    | "propagation_loop"
+    | "forecast_overshoot"
+    | "pattern_explosion"
+    | "unstable_clustering";
+  severity: "critical" | "warn" | "info";
+  detail: string;
+};
+
+export type SanityAudit = {
+  fetched_at_ms: number;
+  overall_state: "CRITICAL" | "WARN" | "INFO" | "CLEAN";
+  findings: SanityFinding[];
+  check_count: number;
+};
+
+export async function getSanityAudit() {
+  return request<SanityAudit>("/liquidity/research/sanity-audit");
 }

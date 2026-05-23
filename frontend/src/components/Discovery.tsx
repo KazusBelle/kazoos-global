@@ -19,14 +19,17 @@ import {
   getMemoryAbstraction,
   getPatternDiscovery,
   getPropagation,
+  getSanityAudit,
   type AdaptationOut,
   type CrisisArchetypes,
+  type DataQuality,
   type EvolutionaryBehavior,
   type HiddenRegimes,
   type IntelligenceForecast,
   type MemoryAbstraction,
   type PatternDiscovery,
   type Propagation,
+  type SanityAudit,
 } from "../lib/api";
 
 const REFRESH_MS = 60_000;
@@ -41,6 +44,7 @@ export function Discovery() {
         </div>
       </div>
 
+      <SanityBanner />
       <PatternDiscoveryPanel />
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <CrisisArchetypesPanel />
@@ -100,6 +104,137 @@ function fmtTs(ts: number): string {
   return new Date(ts).toISOString().replace("T", " ").slice(0, 16);
 }
 
+const DATA_QUALITY_COLOR: Record<DataQuality, string> = {
+  HIGH: "rgba(82, 185, 122, 0.95)",
+  MEDIUM: "rgba(140, 170, 235, 0.95)",
+  LOW: "rgba(227, 180, 87, 0.95)",
+  INSUFFICIENT: "rgba(140, 140, 140, 0.85)",
+};
+
+function DataQualityChip({ q }: { q: DataQuality | undefined }) {
+  if (!q) return null;
+  const color = DATA_QUALITY_COLOR[q];
+  return (
+    <span
+      className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.14em]"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+      }}
+      title="Sample-adequacy gate. INSUFFICIENT/LOW = treat as exploratory; HIGH = enough data to trust."
+    >
+      {q}
+    </span>
+  );
+}
+
+const PROPAGATION_CONF_COLOR: Record<"HIGH" | "MEDIUM" | "LOW", string> = {
+  HIGH: "rgba(82, 185, 122, 0.95)",
+  MEDIUM: "rgba(140, 170, 235, 0.95)",
+  LOW: "rgba(227, 180, 87, 0.95)",
+};
+
+function EdgeConfidenceChip({ c }: { c: "HIGH" | "MEDIUM" | "LOW" }) {
+  const color = PROPAGATION_CONF_COLOR[c];
+  return (
+    <span
+      className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$/, "0.10)"),
+      }}
+    >
+      {c}
+    </span>
+  );
+}
+
+// ── Sanity audit banner ─────────────────────────────────────────────────
+
+const SANITY_SEVERITY_COLOR: Record<"critical" | "warn" | "info", string> = {
+  critical: "rgba(214, 75, 75, 0.95)",
+  warn: "rgba(227, 180, 87, 0.95)",
+  info: "rgba(140, 170, 235, 0.95)",
+};
+
+const SANITY_OVERALL_LABEL: Record<SanityAudit["overall_state"], string> = {
+  CRITICAL: "engine integrity check failing",
+  WARN: "engine integrity warnings",
+  INFO: "engine notes",
+  CLEAN: "engine sanity checks clean",
+};
+
+function SanityBanner() {
+  const [data, setData] = useState<SanityAudit | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getSanityAudit()
+        .then((d) => { if (!cancelled) setData(d); })
+        .catch((e) => { if (!cancelled) setError(e?.message ?? "failed"); });
+    load();
+    const id = window.setInterval(load, REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  if (error) return null;
+  if (!data) return null;
+  if (data.overall_state === "CLEAN") {
+    return (
+      <div className="rounded-lg border border-border/60 bg-panel/60 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-muted flex items-center gap-3">
+        <span style={{ color: "rgba(82, 185, 122, 0.95)" }}>● clean</span>
+        <span>{data.check_count} integrity checks · {SANITY_OVERALL_LABEL[data.overall_state]}</span>
+      </div>
+    );
+  }
+  const overallColor =
+    data.overall_state === "CRITICAL" ? "rgba(214, 75, 75, 0.95)" :
+    data.overall_state === "WARN" ? "rgba(227, 180, 87, 0.95)" :
+    "rgba(140, 170, 235, 0.95)";
+  return (
+    <div
+      className="rounded-lg border bg-panel/60 px-3 py-2.5"
+      style={{ borderColor: overallColor.replace(/0\.95\)$/, "0.55)") }}
+    >
+      <div className="flex items-baseline gap-3 mb-2">
+        <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: overallColor }}>
+          ● {data.overall_state}
+        </span>
+        <span className="text-[10px] uppercase tracking-[0.2em] text-muted">
+          {SANITY_OVERALL_LABEL[data.overall_state]} · {data.findings.length}/{data.check_count}
+        </span>
+      </div>
+      <ul className="space-y-1 font-mono text-[11px]">
+        {data.findings.map((f, i) => {
+          const sc = SANITY_SEVERITY_COLOR[f.severity];
+          return (
+            <li key={i} className="flex items-start gap-2">
+              <span
+                className="mt-0.5 inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0"
+                style={{
+                  color: sc,
+                  borderColor: sc.replace(/0\.95\)$/, "0.5)"),
+                  background: sc.replace(/0\.95\)$/, "0.10)"),
+                }}
+              >
+                {f.severity}
+              </span>
+              <span className="text-muted shrink-0 w-44 truncate" title={f.kind}>
+                {f.kind.replace(/_/g, " ")}
+              </span>
+              <span className="text-zinc-300">{f.detail}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 // ── Pattern discovery ───────────────────────────────────────────────────
 
 function PatternDiscoveryPanel() {
@@ -121,18 +256,21 @@ function PatternDiscoveryPanel() {
       title="Pattern Discovery"
       subtitle={data ? `base rate ${(data.base_rate * 100).toFixed(2)}% · ${data.total_buckets} buckets · ${data.patterns.length} patterns` : "recurring metric combos → downstream alert rates"}
       toolbar={
-        <div className="flex items-center gap-1">
-          {[5, 8, 15, 30].map((s) => (
-            <button
-              key={s}
-              onClick={() => setMinSupport(s)}
-              className={`h-6 px-2 rounded border text-[9px] uppercase tracking-[0.14em] ${
-                minSupport === s ? "border-accent text-accent bg-accent/10" : "border-border text-muted hover:text-zinc-200"
-              }`}
-            >
-              n≥{s}
-            </button>
-          ))}
+        <div className="flex items-center gap-3">
+          <DataQualityChip q={data?.data_quality} />
+          <div className="flex items-center gap-1">
+            {[5, 8, 15, 30].map((s) => (
+              <button
+                key={s}
+                onClick={() => setMinSupport(s)}
+                className={`h-6 px-2 rounded border text-[9px] uppercase tracking-[0.14em] ${
+                  minSupport === s ? "border-accent text-accent bg-accent/10" : "border-border text-muted hover:text-zinc-200"
+                }`}
+              >
+                n≥{s}
+              </button>
+            ))}
+          </div>
         </div>
       }
     >
@@ -215,6 +353,7 @@ function CrisisArchetypesPanel() {
     <Panel
       title="Crisis Archetypes"
       subtitle={data ? `${data.archetypes.length} clusters · ${data.anomaly_count} anomalies` : "auto-labelled archetype clusters"}
+      toolbar={<DataQualityChip q={data?.data_quality} />}
     >
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
@@ -285,6 +424,7 @@ function HiddenRegimesPanel() {
     <Panel
       title="Hidden Regimes"
       subtitle={data ? `${data.clusters.length} clusters · ${data.snapshot_count} snapshots` : "clusters in engine-state space"}
+      toolbar={<DataQualityChip q={data?.data_quality} />}
     >
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
       {!error && !data && <div className="text-xs text-muted">Loading…</div>}
@@ -369,6 +509,7 @@ function PropagationPanel() {
                   <th className="text-left py-2">A → B</th>
                   <th className="text-right py-2">N</th>
                   <th className="text-right py-2">LEAD</th>
+                  <th className="text-right py-2">CONF</th>
                 </tr>
               </thead>
               <tbody>
@@ -381,6 +522,7 @@ function PropagationPanel() {
                     </td>
                     <td className="py-1 text-right text-zinc-200">{e.count}</td>
                     <td className="py-1 text-right text-muted">{e.avg_lead_s.toFixed(0)}s</td>
+                    <td className="py-1 text-right"><EdgeConfidenceChip c={e.confidence} /></td>
                   </tr>
                 ))}
               </tbody>
@@ -566,18 +708,21 @@ function IntelligenceForecastPanel() {
       title="Intelligence Forecast"
       subtitle="OLS extrapolation of engine state (not price)"
       toolbar={
-        <div className="flex items-center gap-1">
-          {[3, 7, 14].map((d) => (
-            <button
-              key={d}
-              onClick={() => setDays(d)}
-              className={`h-6 px-2 rounded border text-[9px] uppercase tracking-[0.14em] ${
-                days === d ? "border-accent text-accent bg-accent/10" : "border-border text-muted hover:text-zinc-200"
-              }`}
-            >
-              +{d}d
-            </button>
-          ))}
+        <div className="flex items-center gap-3">
+          <DataQualityChip q={data?.data_quality} />
+          <div className="flex items-center gap-1">
+            {[3, 7, 14].map((d) => (
+              <button
+                key={d}
+                onClick={() => setDays(d)}
+                className={`h-6 px-2 rounded border text-[9px] uppercase tracking-[0.14em] ${
+                  days === d ? "border-accent text-accent bg-accent/10" : "border-border text-muted hover:text-zinc-200"
+                }`}
+              >
+                +{d}d
+              </button>
+            ))}
+          </div>
         </div>
       }
     >

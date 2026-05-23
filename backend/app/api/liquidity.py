@@ -2751,6 +2751,7 @@ class CrisisArchetypesOut(BaseModel):
     archetypes: List[Archetype]
     anomaly_count: int
     vocabulary: List[str]
+    data_quality: str = "INSUFFICIENT"
 
 
 @router.get("/research/crisis-archetypes", response_model=CrisisArchetypesOut)
@@ -2779,6 +2780,7 @@ class HiddenRegimesOut(BaseModel):
     since_ms: int
     snapshot_count: int
     clusters: List[HiddenRegimeCluster]
+    data_quality: str = "INSUFFICIENT"
 
 
 @router.get("/research/hidden-regimes", response_model=HiddenRegimesOut)
@@ -2895,6 +2897,7 @@ class IntelligenceForecastOut(BaseModel):
     forecasts: List[ForecastEntry]
     trajectory: Optional[str] = None
     snapshot_count: int
+    data_quality: str = "INSUFFICIENT"
 
 
 @router.get("/research/intelligence-forecast", response_model=IntelligenceForecastOut)
@@ -2925,3 +2928,24 @@ async def adaptation_recommendations_endpoint(
     _user: User = Depends(get_current_user),
 ) -> AdaptationOut:
     return AdaptationOut(**_research.adaptation_recommendations(db))
+
+
+class SanityFinding(BaseModel):
+    kind: str          # validation_collapse | anomaly_inflation | propagation_loop | forecast_overshoot | pattern_explosion | unstable_clustering
+    severity: str      # critical | warn | info
+    detail: str
+
+
+class SanityAuditOut(BaseModel):
+    fetched_at_ms: int
+    overall_state: str  # CRITICAL | WARN | INFO | CLEAN
+    findings: List[SanityFinding]
+    check_count: int
+
+
+@router.get("/research/sanity-audit", response_model=SanityAuditOut)
+async def sanity_audit_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SanityAuditOut:
+    return SanityAuditOut(**_research.sanity_audit(db))
