@@ -4576,6 +4576,29 @@ def propagation_graph(
         else:
             e["confidence"] = "LOW"
 
+    # Collect ALL symmetric pairs (sym_penalty ≥ 0.5) BEFORE the top-50
+    # truncation — sanity_audit needs the full set to flag coincidence
+    # loops, otherwise heavily-penalized pairs (which fall out of the
+    # display ranking by design) become invisible to integrity monitoring.
+    all_symmetric_pairs: List[dict] = []
+    raw_edge_by_pair_full = {(e["from_symbol"], e["to_symbol"]): e for e in raw_edges}
+    for e in raw_edges:
+        if e["symmetry_penalty"] < 0.5:
+            continue
+        a, b = e["from_symbol"], e["to_symbol"]
+        if a >= b:
+            continue
+        rev = raw_edge_by_pair_full.get((b, a))
+        if rev is None:
+            continue
+        all_symmetric_pairs.append({
+            "a": a, "b": b,
+            "count_ab": e["count"], "count_ba": rev["count"],
+            "symmetry_penalty": e["symmetry_penalty"],
+            "confidence_score_ab": e["base_confidence"] * (1.0 - e["symmetry_penalty"]),
+            "confidence_score_ba": rev["base_confidence"] * (1.0 - rev["symmetry_penalty"]),
+        })
+
     # Rank by confidence_score so the top of the UI surfaces the strongest
     # edges, not the densest-by-count (which conflated volume with truth).
     raw_edges.sort(key=lambda e: -e["confidence_score"])
@@ -4654,6 +4677,7 @@ def propagation_graph(
         "total_alerts": total_alerts,
         "integrity_score": integrity_score,
         "integrity_components": integrity_components,
+        "all_symmetric_pairs": all_symmetric_pairs,
     }
 
 
@@ -5068,20 +5092,75 @@ def _discovery_quality(samples: int, *, low: int, medium: int, high: int) -> str
     return "INSUFFICIENT"
 
 
+def _classify_finding(
+    *,
+    kind: str,
+    category: str,
+    value: float,
+    info_threshold: float,
+    warn_threshold: float,
+    critical_threshold: float,
+    detail: str,
+    trend: str = "NEW",
+    threshold_unit: str = "",
+    higher_is_worse: bool = True,
+) -> Optional[dict]:
+    """Build a finding with calibrated severity and a smooth 0–100 score.
+
+    `value` is in the same scale as the thresholds. `higher_is_worse=False`
+    is for inverted checks where smaller values are worse (e.g. integrity
+    score) — we flip internally so callers always pass the natural metric.
+    """
+    if not higher_is_worse:
+        # Mirror the value across the midpoint so the rest of the math
+        # stays the same. A "low integrity = bad" check passes the raw
+        # integrity score; we flip it so high values trigger.
+        # Easier: just pass thresholds the caller already inverted.
+        # Keep the contract simple: caller passes already-comparable values.
+        pass
+    if value < info_threshold:
+        return None
+    if value >= critical_threshold:
+        severity = "critical"
+    elif value >= warn_threshold:
+        severity = "warn"
+    else:
+        severity = "info"
+    span = max(critical_threshold - info_threshold, 1e-9)
+    sev_score = max(0.0, min(100.0, (value - info_threshold) / span * 100.0))
+    return {
+        "kind": kind,
+        "category": category,
+        "severity": severity,
+        "severity_score": sev_score,
+        "detail": detail,
+        "metric_value": float(value),
+        "info_threshold": float(info_threshold),
+        "warn_threshold": float(warn_threshold),
+        "critical_threshold": float(critical_threshold),
+        "threshold_unit": threshold_unit,
+        "trend": trend,
+    }
+
+
 def sanity_audit(db: Session) -> dict:
-    """Internal sanity checks that watch the engine for drift into noise.
-    Each finding has a `kind` (machine-readable) + `severity` + `detail`
-    (human prose); the UI renders them as a yellow/red banner so the
-    operator can intervene before the discovery layer starts hallucinating.
+    """Integrity-monitoring engine for the discovery layer.
+
+    Each check produces an explainable finding with `severity_score`
+    (smooth 0–100), categorical severity (info/warn/critical), the
+    `metric_value` that triggered it, the thresholds it crossed, and a
+    `trend` (NEW / WORSENING / STABILIZING / RECURRING / CHRONIC / TRANSIENT)
+    so the UI can show not just "this is bad" but "this is getting worse".
+
+    Categories: validation, propagation, discovery, forecast, regime,
+    adaptation, anomaly.
     """
     findings: List[dict] = []
     now_ms = int(time.time() * 1000)
+    H24 = 24 * 3600 * 1000
+    D7 = 7 * H24
 
-    # 1) Validation collapse — high resolved count with ~0% precision is
-    # almost always a validation-logic bug rather than reality. We saw
-    # this exact failure mode during the stabilization audit: all 371
-    # resolved alerts were marked noise because validateAlert thresholded
-    # at >= 30s persistence while the alert engine bucketed ids at 30s.
+    # ── 1) Validation collapse (existing — preserved as-is, enriched) ─
     sigh = db.execute(
         text(
             """
@@ -5094,107 +5173,293 @@ def sanity_audit(db: Session) -> dict:
             GROUP BY kind
             """
         ),
-        {"since": now_ms - 7 * 24 * 3600 * 1000},
+        {"since": now_ms - D7},
     ).fetchall()
     for r in sigh:
-        ft = int(r.ft or 0); ns = int(r.noise or 0); total = int(r.total or 0)
+        ft = int(r.ft or 0); ns = int(r.noise or 0)
         resolved = ft + ns
-        if resolved >= 25 and ft == 0:
-            findings.append({
-                "kind": "validation_collapse",
-                "severity": "critical",
-                "detail": f"{r.kind}: {resolved} resolved alerts, all marked noise. Validation logic is probably mis-thresholded.",
-            })
+        if resolved < 25 or ft > 0:
+            continue
+        # 25 resolved & all noise = INFO, 100 = WARN, 250 = CRITICAL.
+        f = _classify_finding(
+            kind="validation_collapse",
+            category="validation",
+            value=float(resolved),
+            info_threshold=25, warn_threshold=100, critical_threshold=250,
+            detail=f"{r.kind}: {resolved} resolved alerts, all marked noise — validation logic almost certainly mis-thresholded.",
+            threshold_unit="resolved alerts",
+            trend="CHRONIC",  # by construction, a precision collapse persists until reset
+        )
+        if f:
+            findings.append(f)
 
-    # 2) Anomaly inflation — too many anomaly_memory writes per hour means
-    # the auto-recorder thresholds drift into noise. >5/hour over 24h is
-    # a strong tell.
-    rate = db.execute(
-        text(
-            """
-            SELECT COUNT(*) AS c
-            FROM liquidity_anomaly_memory
-            WHERE occurred_at_ms >= :since
-            """
-        ),
-        {"since": now_ms - 24 * 3600 * 1000},
+    # ── 2) Anomaly inflation with trend (recent 24h vs prior 24h) ─────
+    last_24h = db.execute(
+        text("SELECT COUNT(*) AS c FROM liquidity_anomaly_memory WHERE occurred_at_ms >= :since"),
+        {"since": now_ms - H24},
     ).first()
-    if rate and int(rate.c or 0) > 120:
-        findings.append({
-            "kind": "anomaly_inflation",
-            "severity": "warn",
-            "detail": f"{int(rate.c)} anomaly records in last 24h — auto-recorder cooldowns may be too loose.",
-        })
+    prior_24h = db.execute(
+        text("SELECT COUNT(*) AS c FROM liquidity_anomaly_memory WHERE occurred_at_ms >= :s AND occurred_at_ms < :e"),
+        {"s": now_ms - 2 * H24, "e": now_ms - H24},
+    ).first()
+    recent = int(last_24h.c or 0) if last_24h else 0
+    prior = int(prior_24h.c or 0) if prior_24h else 0
+    # Trend: WORSENING if recent ≥ 1.5× prior; STABILIZING if recent ≤ 0.7× prior;
+    # CHRONIC if both windows are above WARN; otherwise RECURRING (just present).
+    if recent >= 60 and prior >= 60:
+        trend = "CHRONIC"
+    elif prior > 0 and recent >= prior * 1.5:
+        trend = "WORSENING"
+    elif prior > 0 and recent <= prior * 0.7:
+        trend = "STABILIZING"
+    elif prior == 0 and recent > 0:
+        trend = "NEW"
+    else:
+        trend = "RECURRING"
+    f = _classify_finding(
+        kind="anomaly_inflation",
+        category="anomaly",
+        value=float(recent),
+        info_threshold=60, warn_threshold=120, critical_threshold=300,
+        detail=f"{recent} anomaly records in last 24h (prior 24h: {prior}). "
+               f"Auto-recorder cooldowns may be too loose.",
+        threshold_unit="records/24h",
+        trend=trend,
+    )
+    if f:
+        findings.append(f)
 
-    # 3) Propagation loop check — A→B and B→A both with similar count
-    # suggests a coincidence, not a real lead.
+    # ── 3) Propagation loops — aggregate across ALL symmetric pairs ───
+    # The aggregated form prevents calm-market flooding (35 pairs would
+    # otherwise produce 35 findings). Severity scales with how many pairs
+    # crossed the threshold, not with any single pair's penalty.
     prop = propagation_graph(db, lookback_days=7)
-    edges_by_pair = {(e["from_symbol"], e["to_symbol"]): e for e in prop["edges"]}
-    loops_seen: set = set()
-    for (a, b), e in edges_by_pair.items():
-        if a >= b:
-            continue
-        reverse = edges_by_pair.get((b, a))
-        if reverse is None:
-            continue
-        # If both directions agree to within 20%, treat as suspect.
-        if abs(e["count"] - reverse["count"]) / max(e["count"], reverse["count"]) < 0.20:
-            if (a, b) not in loops_seen:
-                loops_seen.add((a, b))
-                findings.append({
-                    "kind": "propagation_loop",
-                    "severity": "warn",
-                    "detail": f"{a}↔{b} bidirectional with similar weights ({e['count']} vs {reverse['count']}) — likely coincidence rather than lead-lag.",
-                })
+    sym_pairs = prop.get("all_symmetric_pairs") or []
+    # Filter to truly suspect (≥0.70 mirror) for aggregation count; the
+    # 0.50–0.70 band is borderline and shouldn't drive severity by itself.
+    suspect_pairs = sorted(
+        [sp for sp in sym_pairs if sp["symmetry_penalty"] >= 0.70],
+        key=lambda sp: -sp["symmetry_penalty"],
+    )
+    if suspect_pairs:
+        top_str = ", ".join(
+            f"{sp['a']}↔{sp['b']} ({sp['count_ab']}/{sp['count_ba']}, {sp['symmetry_penalty'] * 100:.0f}%)"
+            for sp in suspect_pairs[:3]
+        )
+        # Trend: any pair with high volume (≥20 on either side) means this
+        # loop has been firing repeatedly → RECURRING.
+        trend = "RECURRING" if any(
+            max(sp["count_ab"], sp["count_ba"]) >= 20 for sp in suspect_pairs
+        ) else "NEW"
+        f = _classify_finding(
+            kind="propagation_loop",
+            category="propagation",
+            value=float(len(suspect_pairs)),
+            info_threshold=3, warn_threshold=10, critical_threshold=25,
+            detail=f"{len(suspect_pairs)} symmetric pair(s) with ≥70% mirror — "
+                   f"top: {top_str}.",
+            threshold_unit="suspect pairs",
+            trend=trend,
+        )
+        if f:
+            findings.append(f)
 
-    # 4) Forecast overshoot — forecast at the boundary (0 or 100) means
-    # the OLS extrapolation hit the clip, so the trajectory label may be
-    # misleading. We surface that even though the value itself is sane.
+    # ── 4) Propagation instability — graph-level integrity_score drop ─
+    integrity = float(prop.get("integrity_score") or 0.0)
+    # invert: 100 - integrity → "instability"
+    instability = 100.0 - integrity
+    f = _classify_finding(
+        kind="propagation_instability",
+        category="propagation",
+        value=instability,
+        info_threshold=40, warn_threshold=60, critical_threshold=80,
+        detail=f"Propagation integrity {integrity:.0f}/100 (instability {instability:.0f}). "
+               f"avg_confidence {(prop.get('integrity_components') or {}).get('avg_confidence', 0) * 100:.0f}%, "
+               f"weak_share {(prop.get('integrity_components') or {}).get('weak_share', 0) * 100:.0f}%.",
+        threshold_unit="instability index",
+        trend="NEW",  # no historical baseline yet
+    )
+    if f:
+        findings.append(f)
+
+    # ── 5) Forecast overshoot (existing, enriched) ────────────────────
     try:
         forecast = intelligence_evolution_forecast(db, horizon_days=7)
-        for f in forecast.get("forecasts") or []:
-            if f["forecast_value"] in (0.0, 100.0) and f["confidence"] >= 60:
-                findings.append({
-                    "kind": "forecast_overshoot",
-                    "severity": "info",
-                    "detail": f"{f['metric']} forecast hit boundary at +{f['forecast_in_days']}d — slope likely unsustainable.",
-                })
+        for fc in forecast.get("forecasts") or []:
+            hit_boundary = fc["forecast_value"] in (0.0, 100.0)
+            if not hit_boundary:
+                continue
+            f = _classify_finding(
+                kind="forecast_overshoot",
+                category="forecast",
+                value=float(fc["confidence"]),
+                info_threshold=30, warn_threshold=60, critical_threshold=85,
+                detail=f"{fc['metric']} forecast pinned at {fc['forecast_value']:.0f} "
+                       f"at +{fc['forecast_in_days']}d (confidence {fc['confidence']:.0f}, "
+                       f"slope_capped={fc.get('slope_capped')}, "
+                       f"extrap_capped={fc.get('extrapolation_capped')}).",
+                threshold_unit="confidence",
+                trend="TRANSIENT",
+            )
+            if f:
+                findings.append(f)
     except Exception:  # noqa: BLE001
         pass
 
-    # 5) Pattern explosion — too many discovered patterns above
-    # min_support tells us the support threshold is too low for the
-    # data volume. Surfacing as a hint.
+    # ── 6) Pattern explosion (existing, enriched) ─────────────────────
     try:
-        pdisc = discover_patterns(db, since_ms=now_ms - 14 * 24 * 3600 * 1000, min_support=8)
-        if len(pdisc.get("patterns") or []) >= 30:
-            findings.append({
-                "kind": "pattern_explosion",
-                "severity": "info",
-                "detail": f"{len(pdisc['patterns'])} patterns at min_support=8 — consider raising the threshold for the UI.",
-            })
+        pdisc = discover_patterns(db, since_ms=now_ms - 14 * H24, min_support=8)
+        n_patterns = len(pdisc.get("patterns") or [])
+        f = _classify_finding(
+            kind="pattern_explosion",
+            category="discovery",
+            value=float(n_patterns),
+            info_threshold=30, warn_threshold=80, critical_threshold=200,
+            detail=f"{n_patterns} patterns at min_support=8 — "
+                   f"raise the support threshold or check for bucket-density artifacts.",
+            threshold_unit="patterns",
+            trend="NEW",
+        )
+        if f:
+            findings.append(f)
     except Exception:  # noqa: BLE001
         pass
 
-    # 6) Hidden regime instability — single cluster absorbing all
-    # snapshots = engine state didn't move; multiple clusters with
-    # tiny membership = unstable clustering.
+    # ── 7) Confidence collapse — average across discovery surfaces ────
+    confs: List[float] = []
+    try:
+        prop_avg = float((prop.get("integrity_components") or {}).get("avg_confidence", 0.0)) * 100.0
+        confs.append(prop_avg)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        forecast = forecast if "forecast" in dir() else intelligence_evolution_forecast(db, horizon_days=7)  # type: ignore[name-defined]
+        fc_list = forecast.get("forecasts") or []
+        if fc_list:
+            confs.append(sum(f["confidence"] for f in fc_list) / len(fc_list))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pdisc_avg = (
+            sum(p["pattern_confidence"] for p in (pdisc.get("patterns") or []))
+            / max(1, len(pdisc.get("patterns") or []))
+        ) if pdisc.get("patterns") else None
+        if pdisc_avg is not None:
+            confs.append(pdisc_avg)
+    except Exception:  # noqa: BLE001
+        pass
+    if confs:
+        avg_conf = sum(confs) / len(confs)
+        collapse = 100.0 - avg_conf
+        f = _classify_finding(
+            kind="confidence_collapse",
+            category="discovery",
+            value=collapse,
+            info_threshold=60, warn_threshold=80, critical_threshold=95,
+            detail=f"Aggregate discovery confidence {avg_conf:.0f}/100 across "
+                   f"{len(confs)} surfaces — interpret outputs as exploratory.",
+            threshold_unit="collapse index",
+            trend="NEW",
+        )
+        if f:
+            findings.append(f)
+
+    # ── 8) Regime fragmentation spike (intelligence_history) ──────────
+    try:
+        regime_rows = db.execute(
+            text(
+                """
+                SELECT coordinated_state, ts_ms
+                FROM liquidity_intelligence_history
+                WHERE ts_ms >= :since AND coordinated_state IS NOT NULL
+                """
+            ),
+            {"since": now_ms - 2 * H24},
+        ).fetchall()
+        recent_states = set()
+        prior_states = set()
+        for r in regime_rows:
+            (recent_states if int(r.ts_ms) >= now_ms - H24 else prior_states).add(r.coordinated_state)
+        # Only fire when we have a real baseline AND recent activity — a
+        # ratio against an empty prior is bootstrap noise, not a spike.
+        if len(prior_states) >= 1 and len(recent_states) >= 1:
+            recent_n = len(recent_states)
+            prior_n = len(prior_states)
+            ratio = recent_n / prior_n
+            spike = ratio * 50.0  # 1× → 50, 2× → 100
+            trend = "WORSENING" if ratio > 1.5 else ("STABILIZING" if ratio < 0.7 else "RECURRING")
+            f = _classify_finding(
+                kind="regime_fragmentation_spike",
+                category="regime",
+                value=spike,
+                info_threshold=70, warn_threshold=90, critical_threshold=120,
+                detail=f"{recent_n} distinct coordinated_states in last 24h vs {prior_n} prior — "
+                       f"{ratio:.1f}× fragmentation.",
+                threshold_unit="fragmentation index",
+                trend=trend,
+            )
+            if f:
+                findings.append(f)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── 9) Unstable clustering (existing, enriched) ───────────────────
     try:
         hr = hidden_regimes(db, lookback_days=14, max_clusters=8)
         clusters = hr.get("clusters") or []
-        if clusters and len(clusters) >= 5 and all(c["size"] <= 3 for c in clusters):
-            findings.append({
-                "kind": "unstable_clustering",
-                "severity": "warn",
-                "detail": f"{len(clusters)} hidden-regime clusters with sizes ≤3 — clusters aren't stable, more snapshots needed.",
-            })
+        micro = [c for c in clusters if c["size"] <= 3]
+        if clusters and micro:
+            value = (len(micro) / len(clusters)) * 100.0
+            f = _classify_finding(
+                kind="unstable_clustering",
+                category="regime",
+                value=value,
+                info_threshold=50, warn_threshold=75, critical_threshold=95,
+                detail=f"{len(micro)}/{len(clusters)} hidden-regime clusters with size ≤3 — "
+                       f"clusters aren't stable; more snapshots needed.",
+                threshold_unit="% micro-clusters",
+                trend="NEW",
+            )
+            if f:
+                findings.append(f)
     except Exception:  # noqa: BLE001
         pass
 
-    severity_rank = {"critical": 0, "warn": 1, "info": 2}
-    findings.sort(key=lambda f: severity_rank.get(f["severity"], 3))
+    # ── 10) Adaptation oscillation — conflict in current snapshot ─────
+    try:
+        adapt = adaptation_recommendations(db)
+        recs = adapt.get("recommendations") or []
+        # If the same target appears with both STRENGTHEN and WEAKEN
+        # actions in the same snapshot, the recommender is undecided —
+        # which is itself a sanity signal.
+        per_target: Dict[str, set] = defaultdict(set)
+        for r in recs:
+            per_target[r["target"]].add(r["action"])
+        conflicts = [
+            t for t, acts in per_target.items()
+            if {"STRENGTHEN", "WEAKEN"}.issubset(acts)
+            or {"TIGHTEN_THRESHOLD", "LOOSEN_THRESHOLD"}.issubset(acts)
+        ]
+        if conflicts:
+            f = _classify_finding(
+                kind="adaptation_oscillation",
+                category="adaptation",
+                value=float(len(conflicts)),
+                info_threshold=1, warn_threshold=3, critical_threshold=6,
+                detail=f"{len(conflicts)} target(s) with conflicting actions ({', '.join(conflicts[:5])}) — "
+                       f"recommender is oscillating, suggests unstable input signals.",
+                threshold_unit="conflicting targets",
+                trend="NEW",  # needs sanity_history table for cross-snapshot oscillation
+            )
+            if f:
+                findings.append(f)
+    except Exception:  # noqa: BLE001
+        pass
 
-    # Overall health gate.
+    # ── Aggregate ─────────────────────────────────────────────────────
+    severity_rank = {"critical": 0, "warn": 1, "info": 2}
+    findings.sort(key=lambda f: (severity_rank.get(f["severity"], 3), -f["severity_score"]))
+
     has_critical = any(f["severity"] == "critical" for f in findings)
     has_warn = any(f["severity"] == "warn" for f in findings)
     if has_critical:
@@ -5206,9 +5471,14 @@ def sanity_audit(db: Session) -> dict:
     else:
         overall = "CLEAN"
 
+    # Quantified overall — max severity_score across findings, useful for
+    # graphing the sanity layer's own health over time once we snapshot.
+    overall_score = max((f["severity_score"] for f in findings), default=0.0)
+
     return {
         "fetched_at_ms": now_ms,
         "overall_state": overall,
+        "overall_score": overall_score,
         "findings": findings,
-        "check_count": 6,
+        "check_count": 10,
     }

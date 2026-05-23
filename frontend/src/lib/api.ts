@@ -1661,21 +1661,42 @@ export async function getAdaptationRecommendations() {
   return request<AdaptationOut>("/liquidity/research/adaptation-recommendations");
 }
 
+export type SanityCategory =
+  | "validation"
+  | "propagation"
+  | "discovery"
+  | "forecast"
+  | "regime"
+  | "adaptation"
+  | "anomaly"
+  | "general";
+
+export type SanityTrend =
+  | "NEW"
+  | "WORSENING"
+  | "STABILIZING"
+  | "RECURRING"
+  | "CHRONIC"
+  | "TRANSIENT";
+
 export type SanityFinding = {
-  kind:
-    | "validation_collapse"
-    | "anomaly_inflation"
-    | "propagation_loop"
-    | "forecast_overshoot"
-    | "pattern_explosion"
-    | "unstable_clustering";
+  kind: string;
+  category: SanityCategory;
   severity: "critical" | "warn" | "info";
+  severity_score: number;
   detail: string;
+  metric_value: number;
+  info_threshold: number;
+  warn_threshold: number;
+  critical_threshold: number;
+  threshold_unit: string;
+  trend: SanityTrend;
 };
 
 export type SanityAudit = {
   fetched_at_ms: number;
   overall_state: "CRITICAL" | "WARN" | "INFO" | "CLEAN";
+  overall_score: number;
   findings: SanityFinding[];
   check_count: number;
 };

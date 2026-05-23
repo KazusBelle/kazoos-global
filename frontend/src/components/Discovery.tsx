@@ -205,14 +205,27 @@ function SanityBanner() {
           ● {data.overall_state}
         </span>
         <span className="text-[10px] uppercase tracking-[0.2em] text-muted">
-          {SANITY_OVERALL_LABEL[data.overall_state]} · {data.findings.length}/{data.check_count}
+          {SANITY_OVERALL_LABEL[data.overall_state]} · {data.findings.length}/{data.check_count} · score {data.overall_score.toFixed(0)}
         </span>
       </div>
-      <ul className="space-y-1 font-mono text-[11px]">
+      <ul className="space-y-1.5 font-mono text-[11px]">
         {data.findings.map((f, i) => {
           const sc = SANITY_SEVERITY_COLOR[f.severity];
+          const trendColor =
+            f.trend === "WORSENING" ? "text-[#d68b8b]"
+              : f.trend === "STABILIZING" ? "text-[#52b97a]"
+                : f.trend === "CHRONIC" ? "text-[#e3b457]"
+                  : f.trend === "RECURRING" ? "text-[#8caaeb]"
+                    : "text-muted";
+          const tip = [
+            `category    ${f.category}`,
+            `value       ${f.metric_value.toFixed(1)} ${f.threshold_unit}`,
+            `thresholds  info≥${f.info_threshold} warn≥${f.warn_threshold} crit≥${f.critical_threshold}`,
+            `severity    ${f.severity_score.toFixed(0)}/100`,
+            `trend       ${f.trend}`,
+          ].join("\n");
           return (
-            <li key={i} className="flex items-start gap-2">
+            <li key={i} className="flex items-start gap-2" title={tip}>
               <span
                 className="mt-0.5 inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0"
                 style={{
@@ -221,12 +234,15 @@ function SanityBanner() {
                   background: sc.replace(/0\.95\)$/, "0.10)"),
                 }}
               >
-                {f.severity}
+                {f.severity} {f.severity_score.toFixed(0)}
               </span>
-              <span className="text-muted shrink-0 w-44 truncate" title={f.kind}>
+              <span className={`mt-0.5 inline-block text-[9px] uppercase tracking-[0.12em] shrink-0 ${trendColor}`}>
+                {f.trend}
+              </span>
+              <span className="text-muted shrink-0 w-40 truncate">
                 {f.kind.replace(/_/g, " ")}
               </span>
-              <span className="text-zinc-300">{f.detail}</span>
+              <span className="text-zinc-300 flex-1">{f.detail}</span>
             </li>
           );
         })}

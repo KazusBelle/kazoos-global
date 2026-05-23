@@ -2969,14 +2969,23 @@ async def adaptation_recommendations_endpoint(
 
 
 class SanityFinding(BaseModel):
-    kind: str          # validation_collapse | anomaly_inflation | propagation_loop | forecast_overshoot | pattern_explosion | unstable_clustering
-    severity: str      # critical | warn | info
+    kind: str
+    category: str = "general"     # validation|propagation|discovery|forecast|regime|adaptation|anomaly
+    severity: str                 # critical | warn | info
+    severity_score: float = 0.0   # smooth 0..100 within [info, critical] band
     detail: str
+    metric_value: float = 0.0
+    info_threshold: float = 0.0
+    warn_threshold: float = 0.0
+    critical_threshold: float = 0.0
+    threshold_unit: str = ""
+    trend: str = "NEW"            # NEW|WORSENING|STABILIZING|RECURRING|CHRONIC|TRANSIENT
 
 
 class SanityAuditOut(BaseModel):
     fetched_at_ms: int
     overall_state: str  # CRITICAL | WARN | INFO | CLEAN
+    overall_score: float = 0.0
     findings: List[SanityFinding]
     check_count: int
 
