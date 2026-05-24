@@ -156,6 +156,33 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | TTL | 120s |
 | Reversibility | Pure read; turning the loop off = downstream stops reading the modifier |
 
+### Layer 12 — Replay Intelligence (Phase 19, Pass A backend)
+
+| | |
+|---|---|
+| Code | `investigation_replay_*` in `research.py` |
+| Purpose | Forensic FROZEN-vs-LIVE replay of an investigation case |
+| Tables | `investigation_replay_snapshots` (one row per case, UPSERT) |
+| Capture | Auto-fires on `investigation_create` (kind=`auto_create` or `auto_draft`). Operator can recapture via `force=true` |
+| State modes | `frozen` reads the opaque JSON snapshot; `live` reconstructs from `liquidity_intelligence_history` + `liquidity_alert_history` + `liquidity_anomaly_memory` + `operator_priority_*` tables. Same response schema, distinguished by `is_frozen` |
+| Replay safety | Each reconstructed surface publishes its own `data_quality` ∈ HIGH/PARTIAL/INSUFFICIENT/PRUNED. PRUNED triggers when a window is past retention; the engine refuses to invent a value |
+| Diff | Narrow semantic comparison at anchor: genesis verdict + score, sanity overall_state, adaptation modifier values (Δ ≥ 0.05), operator queue size + escalation counts, narrative headline. Every drift carries before/after/delta |
+| Timeline | Scrubber keyframes — material events (operator_priority_events + alerts + anomalies + case lifecycle) inside a `[anchor − pre, anchor + post]` window |
+| Propagation | Frame-bucketed alert-start counts per symbol over the case window + static propagation edges. Per-frame edge transmission is intentionally NOT inferred — propagation_graph doesn't carry timestamped pair data |
+
+Pass B (Phase 19) lands the operator-facing UI on top of the Pass A endpoints, inside the INV drawer as a new lazy-mounted `replay` tab:
+
+* **FROZEN vs LIVE diff banner** — prominent header that shows the count + per-field deltas (genesis verdict, sanity overall_state, adaptation modifier values, queue size + escalation counts, narrative headline). Color band escalates with drift count. Includes one explicit `recapture` button that is the only frontend write path mutating the frozen reference.
+* **Scrubber** — SVG strip with click-to-seek, play/pause loop (`requestAnimationFrame` × speed factor; 1s wall ≈ 1m case time at speed=1, capped at window_end), step ±keyframe, prev/next critical-keyframe, jump-to-anchor, speed selector (0.5×–16×).
+* **Overlay toggles** — operator_priority / alert / anomaly / case sources can each be hidden from the keyframe strip; severity-colored ticks (info/warn/critical).
+* **Cursor snapshot** — toggle between live-reconstruction at cursor (debounced 250 ms refetch on cursor settle) and the frozen blob; live view surfaces per-section `data_quality` (HIGH/PARTIAL/INSUFFICIENT/PRUNED) explicitly.
+* **State evolution mini-charts** — keyframe density + alert activity per bucket, derived from already-fetched timeline + propagation data. Vanilla SVG sparklines with a synchronized cursor line. No interpolation, no smoothing.
+* **Propagation playback** — frame-bucketed per-symbol activation bars (current frame indexed by cursor); historical lead-lag edges from `propagation_graph` rendered as a static list, NOT animated per frame (no fake transmission order).
+
+UX discipline: no cinematic effects, no glow, no auto-camera, no AI storytelling. The only moving element is the scrubber cursor. Every series and every overlay is sourced from already-fetched real data; missing surfaces stay missing (data_quality flagged) rather than being interpolated.
+
+Performance: lazy-mounted (no fetches until the operator opens the `replay` tab); a single round-trip on mount (state + timeline + diff + propagation in parallel) plus debounced cursor-position fetches.
+
 ### Layer 11 — Investigation & Casework (Phase 18)
 
 | | |
@@ -499,6 +526,17 @@ lifecycle (DB-backed):
 | `GET /research/investigations/{id}/export` | Stable 8-section markdown (JSON) | <200 ms | — | none |
 | `GET /research/investigations/{id}/export.md` | Same, as plain text/markdown download | <200 ms | — | none |
 
+### Phase 19 — Replay Intelligence (Pass A)
+
+| route | purpose | cold | warm | TTL |
+|---|---|---|---|---|
+| `POST /research/investigations/{id}/replay/capture` | Capture or recapture (`force=true`) the frozen snapshot | ~400 ms (composes all surfaces) | — | none |
+| `GET .../replay/state?mode=frozen` | Return the opaque snapshot payload | <50 ms | — | none |
+| `GET .../replay/state?mode=live&at_ms=…` | Reconstruct surface from history tables at `at_ms` | <150 ms | — | none |
+| `GET .../replay/timeline` | Scrubber keyframes around the case anchor | <150 ms | — | none |
+| `GET .../replay/diff` | FROZEN vs LIVE narrow semantic diff at anchor | <500 ms | — | none |
+| `GET .../replay/propagation` | Frame-bucketed alert counts per symbol + static prop edges | <150 ms | — | none |
+
 ### Phase 15 causal layers
 
 | route | purpose | cold | warm | TTL |
@@ -575,6 +613,7 @@ Postgres 16, single instance, no replication. Sizes as of 2026-05-23.
 | `investigation_evidence` | new | 0 | per link | bound to case | operator | `(investigation_id)`, `(evidence_type, ref_key)`, unique triple |
 | `investigation_notes` | new | 0 | per note | append-only | operator | `(investigation_id, created_at_ms)` |
 | `investigation_events` | new | 0 | per event | append-only | operator | `(investigation_id, ts_ms)`, `(ts_ms, event_type)` |
+| `investigation_replay_snapshots` | new | 0 | one per case | bound to case | operator/worker | unique `(investigation_id)`, `(captured_at_ms)` |
 | `users`, `coins`, `system_status`, `liquidity_ws_status`, `liquidity_pins`, `liquidity_annotations`, `structure_overrides`, `user_tda_states`, `liquidity_crossex_history` | < 70 kB each | small | low | unbounded (small) | various | — |
 
 **Steady-state projection at 1y:** ~7 GB total. `liquidity_samples` (35d retention) dominates at ~6.6 GB; everything else bounded. Adopt aggregation tier (`docs/2026-05-23-p1-hardening-plan.md` §1) before scaling symbol count 2×.
@@ -720,6 +759,7 @@ These layers are valuable but their absolute numbers should be read as "best cur
 - **Pattern Discovery / Hidden Regimes / Crisis Archetypes** — data-driven mining, all guarded by `data_quality`.
 - **Investigation causal tree / similarity** (Phase 18 Pass B) — investigation-support graphs and deterministic case similarity. Tree edges come from already-stable upstream layers (anomaly genealogy, propagation, structural deps, transitions); similarity is rule-based (no ML). Useful diagnostically; reasons always exposed.
 - **Investigation auto-draft** — only fires on `crisis_genesis = PRE_CASCADE` with deduped fingerprint. Treat the absolute count of auto-drafts as exploratory until the genesis layer itself stabilizes.
+- **Replay reconstruction / FROZEN-vs-LIVE diff** (Phase 19 Pass A) — frozen snapshot store is stable, but per-surface live reconstruction inherits the experimental status of its inputs (causal/structural/genesis/narrative). Diff entries should be read as "engine interpretation changed" — not a market prediction signal.
 
 ### Frozen interfaces (do not break)
 

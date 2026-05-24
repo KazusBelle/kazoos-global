@@ -315,6 +315,21 @@ _ADDITIVE_MIGRATIONS = [
     "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS last_touched_by INTEGER",
     "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS last_touched_at_ms BIGINT",
     "CREATE INDEX IF NOT EXISTS ix_investigations_primary_symbol ON investigations (primary_symbol)",
+    # Phase-19 replay snapshot store — one frozen snapshot per case.
+    """
+    CREATE TABLE IF NOT EXISTS investigation_replay_snapshots (
+        id SERIAL PRIMARY KEY,
+        investigation_id INTEGER NOT NULL,
+        captured_at_ms BIGINT NOT NULL,
+        anchor_ms BIGINT,
+        captured_kind VARCHAR(24) NOT NULL DEFAULT 'auto_create',
+        captured_by INTEGER,
+        payload_json TEXT NOT NULL,
+        payload_size INTEGER NOT NULL DEFAULT 0,
+        CONSTRAINT uq_inv_replay_snapshot_case UNIQUE (investigation_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_inv_replay_snapshot_captured ON investigation_replay_snapshots (captured_at_ms)",
 ]
 
 

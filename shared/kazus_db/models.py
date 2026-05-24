@@ -663,6 +663,49 @@ class InvestigationNote(Base):
     created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class InvestigationReplaySnapshot(Base):
+    """Frozen state-of-the-system captured for an investigation case.
+
+    Phase 19 forensic property: when an investigation opens (manual or
+    auto-draft), the worker / API captures a single JSON blob carrying
+    every intelligence-layer surface the engine was emitting at that
+    moment (operator priorities, sanity audit, genesis verdict,
+    adaptation modifiers, narrative causality, transitions, structural
+    deps, a slice of propagation). This is the FROZEN reference: it
+    never changes after capture. Live reconstruction at any other time
+    in the case window is rebuilt from the still-retained history
+    tables (intel_history, alert_history, anomaly_memory,
+    operator_priority_events), so the frozen vs live diff is the
+    operator's forensic signal of "what the engine knew then vs. what
+    hindsight now shows".
+
+    One row per case (UPSERT). Recapture is explicit — the prior
+    captured_at_ms / payload are overwritten only when the operator
+    or worker calls replay_capture with `force=True`.
+    """
+
+    __tablename__ = "investigation_replay_snapshots"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", name="uq_inv_replay_snapshot_case"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    investigation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    captured_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # The "case time" the snapshot represents. Typically the
+    # investigation's replay_anchor_ms; may diverge if the operator
+    # recaptures at a different cursor.
+    anchor_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # 'auto_create' | 'auto_draft' | 'operator_recapture'
+    captured_kind: Mapped[str] = mapped_column(String(24), nullable=False, default="auto_create")
+    captured_by: Mapped[Optional[int]] = mapped_column(Integer)
+    # Opaque JSON blob — see _replay_capture_payload in research.py for
+    # the section keys. Treated as a frozen reference; do not mutate.
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # Bytes of payload — surfaced so the operator can see storage cost.
+    payload_size: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class InvestigationEvent(Base):
     """Append-only lifecycle audit log for a case. Captures status
     transitions, severity changes, evidence-link/unlink, note additions,

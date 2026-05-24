@@ -2440,3 +2440,159 @@ export async function getInvestigationExport(case_id: number) {
 export function investigationExportDownloadUrl(case_id: number): string {
   return `/api/liquidity/research/investigations/${case_id}/export.md`;
 }
+
+// ── Phase 19 — Replay Intelligence ────────────────────────────────────
+
+export type ReplayCaptureResult = {
+  captured: boolean;
+  investigation_id: number;
+  captured_at_ms: number | null;
+  anchor_ms: number | null;
+  captured_kind: string | null;
+  captured_by: number | null;
+  payload_size: number | null;
+  sections: string[] | null;
+  reason: string | null;
+};
+
+export async function captureInvestigationReplay(case_id: number, opts: { force?: boolean; anchor_ms?: number } = {}) {
+  return request<ReplayCaptureResult>(
+    `/liquidity/research/investigations/${case_id}/replay/capture`,
+    { method: "POST", body: JSON.stringify(opts) },
+  );
+}
+
+export type ReplaySurfaceQuality = "HIGH" | "PARTIAL" | "INSUFFICIENT" | "PRUNED";
+
+export type ReplayStatePayload = Record<string, unknown>;
+
+export type ReplayState = {
+  found: boolean;
+  id: number;
+  mode: "frozen" | "live" | null;
+  is_frozen: boolean | null;
+  snapshot_present: boolean | null;
+  captured_at_ms: number | null;
+  anchor_ms: number | null;
+  captured_kind: string | null;
+  captured_by: number | null;
+  payload_size: number | null;
+  payload: ReplayStatePayload | null;
+  warning: string | null;
+  at_ms: number | null;
+  reconstructed: {
+    at_ms: number;
+    intel_snapshot: { data_quality: ReplaySurfaceQuality; value: any | null; closest_ts_ms?: number; gap_seconds?: number };
+    alerts: { data_quality: ReplaySurfaceQuality; rows: any[] };
+    operator_priority_events: { data_quality: ReplaySurfaceQuality; rows: any[] };
+    active_operator_priorities: any[];
+    anomalies: { data_quality: ReplaySurfaceQuality; rows: any[] };
+  } | null;
+};
+
+export async function getInvestigationReplayState(case_id: number, opts: { mode?: "frozen" | "live"; at_ms?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.mode) usp.set("mode", opts.mode);
+  if (opts.at_ms != null) usp.set("at_ms", String(opts.at_ms));
+  const qs = usp.toString();
+  return request<ReplayState>(
+    `/liquidity/research/investigations/${case_id}/replay/state${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type ReplayKeyframe = {
+  ts_ms: number;
+  source: "operator_priority" | "alert" | "anomaly" | "case";
+  kind: string;
+  severity_hint: string | null;
+  label: string;
+  ref: Record<string, unknown> | null;
+};
+
+export type ReplayTimeline = {
+  found: boolean;
+  id: number;
+  anchor_ms: number | null;
+  window_start_ms: number | null;
+  window_end_ms: number | null;
+  keyframes: ReplayKeyframe[];
+  keyframe_count: number;
+  snapped_count: number;
+};
+
+export async function getInvestigationReplayTimeline(case_id: number, opts: { pre_window_h?: number; post_window_h?: number; limit?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.pre_window_h != null) usp.set("pre_window_h", String(opts.pre_window_h));
+  if (opts.post_window_h != null) usp.set("post_window_h", String(opts.post_window_h));
+  if (opts.limit != null) usp.set("limit", String(opts.limit));
+  const qs = usp.toString();
+  return request<ReplayTimeline>(
+    `/liquidity/research/investigations/${case_id}/replay/timeline${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type ReplayDiffEntry = {
+  field: string;
+  before: unknown;
+  after: unknown;
+  delta: string;
+};
+
+export type ReplayDiff = {
+  found: boolean;
+  id: number;
+  frozen_present: boolean;
+  frozen_captured_at_ms: number | null;
+  frozen_age_seconds: number | null;
+  live_computed_at_ms: number | null;
+  diffs: ReplayDiffEntry[];
+  diff_count: number | null;
+  summary: string;
+};
+
+export async function getInvestigationReplayDiff(case_id: number) {
+  return request<ReplayDiff>(
+    `/liquidity/research/investigations/${case_id}/replay/diff`,
+  );
+}
+
+export type ReplayPropagationFrame = {
+  ts_ms: number;
+  per_symbol_count: Record<string, number>;
+  total_count: number;
+};
+
+export type ReplayPropagationEdge = {
+  edge_from: string;
+  edge_to: string;
+  confidence_score: number | null;
+  confidence_label: string | null;
+  count: number | null;
+  avg_lead_ms: number | null;
+};
+
+export type ReplayPropagation = {
+  found: boolean;
+  id: number;
+  anchor_ms: number | null;
+  window_start_ms: number | null;
+  window_end_ms: number | null;
+  bucket_ms: number | null;
+  symbols: string[];
+  frames: ReplayPropagationFrame[];
+  frame_count: number;
+  edges: ReplayPropagationEdge[];
+  rationale_note: string | null;
+};
+
+export async function getInvestigationReplayPropagation(case_id: number, opts: { pre_window_h?: number; post_window_h?: number; bucket_minutes?: number; max_frames?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.pre_window_h != null) usp.set("pre_window_h", String(opts.pre_window_h));
+  if (opts.post_window_h != null) usp.set("post_window_h", String(opts.post_window_h));
+  if (opts.bucket_minutes != null) usp.set("bucket_minutes", String(opts.bucket_minutes));
+  if (opts.max_frames != null) usp.set("max_frames", String(opts.max_frames));
+  const qs = usp.toString();
+  return request<ReplayPropagation>(
+    `/liquidity/research/investigations/${case_id}/replay/propagation${qs ? `?${qs}` : ""}`,
+  );
+}

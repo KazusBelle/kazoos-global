@@ -8307,6 +8307,21 @@ def investigation_create(
             continue  # skip malformed; case still created
     db.commit()
     db.refresh(row)
+
+    # Phase-19 auto-capture: freeze the engine surface at case-opening
+    # time so the FROZEN vs LIVE diff is anchored to "what the engine
+    # was saying when we noticed this". Failure is non-fatal — the case
+    # is already created and the operator can recapture manually.
+    try:
+        investigation_replay_capture(
+            db, row.id,
+            captured_kind=("auto_draft" if origin_kind == "auto_pre_cascade" else "auto_create"),
+            captured_by=created_by,
+            anchor_ms=replay_anchor_ms,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
     return _inv_to_dict(row)
 
 
@@ -9660,6 +9675,730 @@ def investigation_export_markdown(db: Session, case_id: int) -> dict:
         "generated_at_ms": _inv_now_ms(),
         "markdown": markdown,
         "char_count": len(markdown),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 19 — Replay Intelligence & Forensic Visualization
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Frozen-vs-live forensic replay. Every investigation case carries (at
+# most) ONE frozen snapshot of the engine's full intelligence surface as
+# of the time of capture (typically the moment the case is opened or
+# auto-drafted on PRE_CASCADE). Reconstruction for any other moment in
+# the case window happens on demand from the still-retained history
+# tables; FROZEN vs LIVE diff is the operator's forensic signal of "what
+# the engine knew then vs. what hindsight now shows".
+#
+# Design properties:
+#   * One snapshot per case (UPSERT). No multi-frame storage cost.
+#   * Snapshot is OPAQUE JSON; reconstruction never mutates it.
+#   * Replay-safe: if reconstruction can't pull a window (retention
+#     prune), the surface is annotated `data_quality=PRUNED` instead of
+#     silently inventing a value.
+#   * NOT a trading engine — every state is descriptive, not actionable.
+
+_REPLAY_PAYLOAD_VERSION = 1
+
+
+def _replay_capture_payload(db: Session) -> dict:
+    """Build the frozen snapshot blob. Each section is captured "as the
+    engine sees it right now" — if a section fails (cold caches, missing
+    data), it's stored as None with an explanatory `error` field so the
+    snapshot remains deterministic and inspectable later."""
+    captured: dict = {
+        "version": _REPLAY_PAYLOAD_VERSION,
+        "captured_at_ms": _inv_now_ms(),
+    }
+
+    def _safe(name: str, fn):
+        try:
+            captured[name] = fn()
+        except Exception as exc:  # noqa: BLE001
+            captured[name] = {"error": str(exc)[:240]}
+
+    _safe("operator_priorities", lambda: operator_priorities(db))
+    _safe("sanity_audit",        lambda: sanity_audit(db))
+    _safe("crisis_genesis",      lambda: crisis_genesis(db))
+    _safe("adaptation_state",    lambda: adaptation_state(db))
+    _safe("narrative_causality", lambda: narrative_causality(db))
+    _safe("market_state_transitions", lambda: market_state_transitions(db))
+    _safe("structural_dependencies",  lambda: structural_dependencies(db))
+    _safe("causal_propagation",  lambda: causal_propagation(db))
+    return captured
+
+
+def investigation_replay_capture(
+    db: Session,
+    case_id: int,
+    *,
+    captured_kind: str = "operator_recapture",
+    captured_by: Optional[int] = None,
+    anchor_ms: Optional[int] = None,
+    force: bool = False,
+) -> dict:
+    """Capture (or recapture) the frozen replay snapshot for a case.
+
+    If a snapshot already exists and `force=False`, returns the existing
+    row unchanged. With `force=True` the payload is overwritten and a
+    `replay_recaptured` event is logged on the case. This is the only
+    write path for `investigation_replay_snapshots`.
+
+    `captured_kind` is one of: 'auto_create' | 'auto_draft' |
+    'operator_recapture'. Auto-capture from `investigation_create` uses
+    'auto_create'; the worker's auto-draft uses 'auto_draft' via the
+    create function; operator-triggered recapture uses the default.
+    """
+    import json as _json
+    from kazus_db.models import Investigation, InvestigationReplaySnapshot
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        raise LookupError(f"investigation {case_id} not found")
+    if captured_kind not in ("auto_create", "auto_draft", "operator_recapture"):
+        raise ValueError(f"unknown captured_kind: {captured_kind}")
+    existing = (
+        db.query(InvestigationReplaySnapshot)
+        .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+        .first()
+    )
+    if existing is not None and not force:
+        return {
+            "captured": False,
+            "reason": "snapshot already exists; pass force=true to recapture",
+            "investigation_id": case_id,
+            "captured_at_ms": existing.captured_at_ms,
+            "captured_kind": existing.captured_kind,
+            "payload_size": existing.payload_size,
+        }
+
+    payload = _replay_capture_payload(db)
+    blob = _json.dumps(payload, separators=(",", ":"))
+    now_ms = _inv_now_ms()
+    eff_anchor = anchor_ms if anchor_ms is not None else case.replay_anchor_ms
+
+    if existing is None:
+        row = InvestigationReplaySnapshot(
+            investigation_id=case_id,
+            captured_at_ms=now_ms,
+            anchor_ms=eff_anchor,
+            captured_kind=captured_kind,
+            captured_by=captured_by,
+            payload_json=blob,
+            payload_size=len(blob),
+        )
+        db.add(row)
+        _inv_log_event(db, case_id=case_id, event_type="replay_captured",
+                       actor_id=captured_by,
+                       payload={"captured_kind": captured_kind,
+                                "payload_size": len(blob)})
+    else:
+        existing.captured_at_ms = now_ms
+        existing.anchor_ms = eff_anchor
+        existing.captured_kind = captured_kind
+        existing.captured_by = captured_by
+        existing.payload_json = blob
+        existing.payload_size = len(blob)
+        _inv_log_event(db, case_id=case_id, event_type="replay_recaptured",
+                       actor_id=captured_by,
+                       payload={"captured_kind": captured_kind,
+                                "payload_size": len(blob),
+                                "previous_captured_at_ms": existing.captured_at_ms})
+
+    db.commit()
+    return {
+        "captured": True,
+        "investigation_id": case_id,
+        "captured_at_ms": now_ms,
+        "anchor_ms": eff_anchor,
+        "captured_kind": captured_kind,
+        "captured_by": captured_by,
+        "payload_size": len(blob),
+        "sections": [k for k in payload if k not in ("version", "captured_at_ms")],
+    }
+
+
+def _replay_load_snapshot(db: Session, case_id: int) -> Optional[dict]:
+    import json as _json
+    from kazus_db.models import InvestigationReplaySnapshot
+    row = (
+        db.query(InvestigationReplaySnapshot)
+        .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+        .first()
+    )
+    if row is None:
+        return None
+    try:
+        payload = _json.loads(row.payload_json)
+    except Exception:  # noqa: BLE001
+        payload = {"error": "snapshot payload could not be parsed"}
+    return {
+        "investigation_id": case_id,
+        "captured_at_ms": row.captured_at_ms,
+        "anchor_ms": row.anchor_ms,
+        "captured_kind": row.captured_kind,
+        "captured_by": row.captured_by,
+        "payload_size": row.payload_size,
+        "payload": payload,
+    }
+
+
+def _replay_reconstruct_at(db: Session, case_id: int, at_ms: int) -> dict:
+    """Best-effort reconstruction of the engine surface at a given
+    historical moment, from still-retained history tables. Reads only —
+    never writes. Each surface declares its own `data_quality`:
+
+      * HIGH       — direct rows found in the window
+      * PARTIAL    — some rows present, gaps suspected
+      * INSUFFICIENT — empty / pre-creation
+      * PRUNED     — window is outside retention horizon
+
+    No silent backfills. If reconstruction can't say what the engine
+    saw at `at_ms`, the operator must know.
+    """
+    from kazus_db.models import (
+        LiquidityAlertHistory,
+        LiquidityAnomalyMemory,
+        LiquidityIntelligenceHistory,
+        OperatorPriorityEvent,
+        OperatorPriorityHistory,
+    )
+    # Look-back windows around the target ts for each surface.
+    intel_window_ms = 30 * 60 * 1000     # 30m: intel snapshots are 5min cadence
+    alert_window_ms = 60 * 60 * 1000     # 1h:  alerts are sparse
+    op_window_ms = 60 * 60 * 1000        # 1h:  op-priority events
+    anomaly_window_ms = 6 * 3600 * 1000  # 6h:  anomalies are slow signal
+
+    # ── Intelligence snapshot — closest row at or before at_ms ───────
+    intel_row = (
+        db.query(LiquidityIntelligenceHistory)
+        .filter(LiquidityIntelligenceHistory.ts_ms <= at_ms)
+        .order_by(LiquidityIntelligenceHistory.ts_ms.desc())
+        .first()
+    )
+    intel: dict
+    if intel_row is None:
+        intel = {"data_quality": "INSUFFICIENT", "value": None}
+    elif at_ms - intel_row.ts_ms > intel_window_ms * 4:
+        intel = {"data_quality": "PRUNED", "value": None,
+                 "closest_ts_ms": intel_row.ts_ms,
+                 "gap_seconds": (at_ms - intel_row.ts_ms) // 1000}
+    else:
+        intel = {
+            "data_quality": "HIGH" if at_ms - intel_row.ts_ms <= intel_window_ms else "PARTIAL",
+            "value": {
+                "ts_ms": intel_row.ts_ms,
+                "synthesized_stress": intel_row.synthesized_stress,
+                "coordinated_state": intel_row.coordinated_state,
+                "cross_layer_agreement": intel_row.cross_layer_agreement,
+                "structural_break_score": intel_row.structural_break_score,
+                "meta_confidence_score": intel_row.meta_confidence_score,
+                "meta_intelligence_health": intel_row.meta_intelligence_health,
+                "health_state": intel_row.health_state,
+                "risk_state_score": intel_row.risk_state_score,
+                "regime_shift_probability": intel_row.regime_shift_probability,
+                "dominant_regime": intel_row.dominant_regime,
+            },
+        }
+
+    # ── Alerts active in the window ─────────────────────────────────
+    alerts = (
+        db.query(LiquidityAlertHistory)
+        .filter(LiquidityAlertHistory.started_at_ms <= at_ms)
+        .filter(LiquidityAlertHistory.last_seen_at_ms >= at_ms - alert_window_ms)
+        .order_by(LiquidityAlertHistory.started_at_ms.desc())
+        .limit(50)
+        .all()
+    )
+    alerts_payload = {
+        "data_quality": "HIGH" if alerts else "INSUFFICIENT",
+        "rows": [
+            {"id": a.id, "symbol": a.symbol, "kind": a.kind,
+             "severity": a.severity, "confidence": a.confidence,
+             "priority": a.priority, "started_at_ms": a.started_at_ms,
+             "validated_outcome": a.validated_outcome}
+            for a in alerts
+        ],
+    }
+
+    # ── Operator-priority events in the window ──────────────────────
+    op_events = (
+        db.query(OperatorPriorityEvent)
+        .filter(OperatorPriorityEvent.ts_ms <= at_ms)
+        .filter(OperatorPriorityEvent.ts_ms >= at_ms - op_window_ms)
+        .order_by(OperatorPriorityEvent.ts_ms.desc())
+        .limit(50)
+        .all()
+    )
+    op_events_payload = {
+        "data_quality": "HIGH" if op_events else "INSUFFICIENT",
+        "rows": [
+            {"ts_ms": e.ts_ms, "priority_key": e.priority_key,
+             "source_layer": e.source_layer, "event_type": e.event_type,
+             "priority_before": e.priority_before, "priority_after": e.priority_after,
+             "escalation_before": e.escalation_before,
+             "escalation_after": e.escalation_after,
+             "note": e.note}
+            for e in op_events
+        ],
+    }
+
+    # ── Operator-priority history rows active at `at_ms` ────────────
+    active_op = (
+        db.query(OperatorPriorityHistory)
+        .filter(OperatorPriorityHistory.first_seen_at_ms <= at_ms)
+        .filter(
+            (OperatorPriorityHistory.resolved_at_ms.is_(None))
+            | (OperatorPriorityHistory.resolved_at_ms >= at_ms)
+        )
+        .order_by(OperatorPriorityHistory.priority_score.desc())
+        .limit(20)
+        .all()
+    )
+    active_op_payload = [
+        {"priority_key": r.priority_key, "source_layer": r.source_layer,
+         "kind": r.kind, "headline": r.headline,
+         "priority_score": r.priority_score,
+         "current_escalation": r.current_escalation,
+         "current_lifecycle": r.current_lifecycle}
+        for r in active_op
+    ]
+
+    # ── Anomalies near the target time ──────────────────────────────
+    anoms = (
+        db.query(LiquidityAnomalyMemory)
+        .filter(LiquidityAnomalyMemory.occurred_at_ms <= at_ms)
+        .filter(LiquidityAnomalyMemory.occurred_at_ms >= at_ms - anomaly_window_ms)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.desc())
+        .limit(20)
+        .all()
+    )
+    anoms_payload = {
+        "data_quality": "HIGH" if anoms else "INSUFFICIENT",
+        "rows": [
+            {"id": a.id, "kind": a.kind, "severity": a.severity,
+             "occurred_at_ms": a.occurred_at_ms,
+             "novelty_score": a.novelty_score,
+             "recurrence_count": a.recurrence_count}
+            for a in anoms
+        ],
+    }
+
+    return {
+        "at_ms": at_ms,
+        "intel_snapshot": intel,
+        "alerts": alerts_payload,
+        "operator_priority_events": op_events_payload,
+        "active_operator_priorities": active_op_payload,
+        "anomalies": anoms_payload,
+    }
+
+
+def investigation_replay_state(
+    db: Session,
+    case_id: int,
+    *,
+    at_ms: Optional[int] = None,
+    mode: str = "frozen",
+) -> dict:
+    """Return the engine's intelligence surface for a case at `at_ms`.
+
+    Modes:
+      * `frozen` — read the frozen snapshot (typically captured at
+        anchor). `at_ms` is ignored; FROZEN is a single moment by design.
+      * `live`   — reconstruct on the fly from history tables. `at_ms`
+        defaults to the case's `replay_anchor_ms`.
+
+    The two modes return the SAME schema so the frontend can render
+    either uniformly. The frozen call also carries an `is_frozen=True`
+    flag; live carries `is_frozen=False` plus per-surface `data_quality`.
+    """
+    from kazus_db.models import Investigation
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id}
+    if mode not in ("frozen", "live"):
+        raise ValueError(f"unknown mode: {mode}")
+
+    if mode == "frozen":
+        snap = _replay_load_snapshot(db, case_id)
+        if snap is None:
+            return {
+                "found": True, "id": case_id, "mode": "frozen",
+                "is_frozen": True, "snapshot_present": False,
+                "captured_at_ms": None, "payload": None,
+                "warning": "no frozen snapshot — call /replay/capture first",
+            }
+        return {
+            "found": True, "id": case_id, "mode": "frozen",
+            "is_frozen": True, "snapshot_present": True,
+            "captured_at_ms": snap["captured_at_ms"],
+            "anchor_ms": snap["anchor_ms"],
+            "captured_kind": snap["captured_kind"],
+            "captured_by": snap["captured_by"],
+            "payload_size": snap["payload_size"],
+            "payload": snap["payload"],
+        }
+
+    # live
+    eff_at = at_ms if at_ms is not None else case.replay_anchor_ms
+    if eff_at is None:
+        eff_at = _inv_now_ms()
+    reconstructed = _replay_reconstruct_at(db, case_id, eff_at)
+    return {
+        "found": True, "id": case_id, "mode": "live",
+        "is_frozen": False, "at_ms": eff_at,
+        "reconstructed": reconstructed,
+    }
+
+
+def investigation_replay_timeline(
+    db: Session,
+    case_id: int,
+    *,
+    pre_window_ms: int = 6 * 3600 * 1000,
+    post_window_ms: int = 6 * 3600 * 1000,
+    limit: int = 400,
+) -> dict:
+    """Build the scrubber keyframe list. Each keyframe is a material
+    moment the operator should be able to snap to: operator-priority
+    events, alerts, anomalies, case lifecycle events. Sorted ascending
+    by ts. This is the replay-scrubber data source — the frontend draws
+    a one-axis strip from this list, not from a fixed time grid.
+
+    The window is anchored around the case's `replay_anchor_ms` (or
+    `created_at_ms` if no anchor is set), expanded by `pre_window_ms`
+    backwards and `post_window_ms` forwards.
+    """
+    from kazus_db.models import (
+        Investigation, InvestigationEvent,
+        LiquidityAlertHistory, LiquidityAnomalyMemory,
+        OperatorPriorityEvent,
+    )
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "keyframes": []}
+
+    anchor = case.replay_anchor_ms or case.created_at_ms
+    window_start = anchor - pre_window_ms
+    window_end = anchor + post_window_ms
+
+    keyframes: List[dict] = []
+
+    # Operator priority events in window.
+    for e in (
+        db.query(OperatorPriorityEvent)
+        .filter(OperatorPriorityEvent.ts_ms >= window_start)
+        .filter(OperatorPriorityEvent.ts_ms <= window_end)
+        .order_by(OperatorPriorityEvent.ts_ms.asc())
+        .limit(limit)
+        .all()
+    ):
+        # Classify keyframe severity by event_type for color hinting.
+        sev = (
+            "critical" if e.event_type in ("escalation_up",) and (e.escalation_after or "") == "CRITICAL"
+            else "warn" if e.event_type in ("escalation_up", "priority_jump")
+            else "info"
+        )
+        keyframes.append({
+            "ts_ms": e.ts_ms,
+            "source": "operator_priority",
+            "kind": e.event_type,
+            "severity_hint": sev,
+            "label": (e.note or e.priority_key)[:120],
+            "ref": {"priority_key": e.priority_key, "source_layer": e.source_layer},
+        })
+
+    # Alerts in window.
+    for a in (
+        db.query(LiquidityAlertHistory)
+        .filter(LiquidityAlertHistory.started_at_ms >= window_start)
+        .filter(LiquidityAlertHistory.started_at_ms <= window_end)
+        .order_by(LiquidityAlertHistory.started_at_ms.asc())
+        .limit(limit)
+        .all()
+    ):
+        keyframes.append({
+            "ts_ms": a.started_at_ms,
+            "source": "alert",
+            "kind": a.kind,
+            "severity_hint": a.severity,
+            "label": f"{a.symbol} · {a.kind} ({a.severity})",
+            "ref": {"alert_id": a.id, "symbol": a.symbol},
+        })
+
+    # Anomalies in window.
+    for an in (
+        db.query(LiquidityAnomalyMemory)
+        .filter(LiquidityAnomalyMemory.occurred_at_ms >= window_start)
+        .filter(LiquidityAnomalyMemory.occurred_at_ms <= window_end)
+        .order_by(LiquidityAnomalyMemory.occurred_at_ms.asc())
+        .limit(limit)
+        .all()
+    ):
+        keyframes.append({
+            "ts_ms": an.occurred_at_ms,
+            "source": "anomaly",
+            "kind": an.kind,
+            "severity_hint": an.severity,
+            "label": f"{an.kind} (novelty {an.novelty_score:.0f})",
+            "ref": {"anomaly_id": an.id},
+        })
+
+    # Case-internal lifecycle events in window.
+    for ev in (
+        db.query(InvestigationEvent)
+        .filter(InvestigationEvent.investigation_id == case_id)
+        .order_by(InvestigationEvent.ts_ms.asc())
+        .limit(limit)
+        .all()
+    ):
+        if ev.ts_ms < window_start or ev.ts_ms > window_end:
+            continue
+        keyframes.append({
+            "ts_ms": ev.ts_ms,
+            "source": "case",
+            "kind": ev.event_type,
+            "severity_hint": "info",
+            "label": ev.event_type,
+            "ref": {"actor_id": ev.actor_id},
+        })
+
+    keyframes.sort(key=lambda k: k["ts_ms"])
+    return {
+        "found": True, "id": case_id,
+        "anchor_ms": anchor,
+        "window_start_ms": window_start,
+        "window_end_ms": window_end,
+        "keyframes": keyframes[:limit],
+        "keyframe_count": len(keyframes),
+        "snapped_count": min(len(keyframes), limit),
+    }
+
+
+def investigation_replay_diff(db: Session, case_id: int) -> dict:
+    """Compute the FROZEN vs LIVE diff at the case anchor. This is the
+    forensic comparison the operator opens to see what changed in
+    interpretation since the snapshot.
+
+    Diff scope is intentionally narrow — we compare a few semantically
+    meaningful fields (verdict labels, escalation counts, modifier
+    values), not raw JSON. Anything that drifts naturally with time
+    (timestamps, captured_at_ms) is ignored. Every reported drift
+    carries `before` + `after` + a human-readable `delta`.
+    """
+    from kazus_db.models import Investigation
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id}
+
+    frozen = investigation_replay_state(db, case_id, mode="frozen")
+    if not frozen.get("snapshot_present"):
+        return {
+            "found": True, "id": case_id,
+            "frozen_present": False,
+            "diffs": [],
+            "summary": "no frozen snapshot — capture one to enable diff",
+        }
+    fp = frozen.get("payload") or {}
+
+    def _live(name: str, fn):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)[:240]}
+
+    live = {
+        "operator_priorities": _live("operator_priorities", lambda: operator_priorities(db)),
+        "sanity_audit":        _live("sanity_audit", lambda: sanity_audit(db)),
+        "crisis_genesis":      _live("crisis_genesis", lambda: crisis_genesis(db)),
+        "adaptation_state":    _live("adaptation_state", lambda: adaptation_state(db)),
+        "narrative_causality": _live("narrative_causality", lambda: narrative_causality(db)),
+    }
+
+    diffs: List[dict] = []
+
+    def _add(field: str, before, after, delta: str) -> None:
+        diffs.append({"field": field, "before": before, "after": after, "delta": delta})
+
+    # crisis_genesis verdict + score
+    fg = fp.get("crisis_genesis") or {}
+    lg = live.get("crisis_genesis") or {}
+    if isinstance(fg, dict) and isinstance(lg, dict):
+        if fg.get("verdict") != lg.get("verdict"):
+            _add("crisis_genesis.verdict", fg.get("verdict"), lg.get("verdict"),
+                 f"{fg.get('verdict')} → {lg.get('verdict')}")
+        fs, ls = fg.get("genesis_score"), lg.get("genesis_score")
+        if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and abs(ls - fs) >= 5:
+            _add("crisis_genesis.genesis_score", fs, ls, f"{fs:.0f} → {ls:.0f} ({ls - fs:+.0f})")
+
+    # sanity_audit overall state
+    fs_a = fp.get("sanity_audit") or {}
+    ls_a = live.get("sanity_audit") or {}
+    if fs_a.get("overall_state") != ls_a.get("overall_state"):
+        _add("sanity_audit.overall_state",
+             fs_a.get("overall_state"), ls_a.get("overall_state"),
+             f"{fs_a.get('overall_state')} → {ls_a.get('overall_state')}")
+
+    # adaptation_state modifier values
+    fa = (fp.get("adaptation_state") or {}).get("modifiers") or {}
+    la = (live.get("adaptation_state") or {}).get("modifiers") or {}
+    for mod_name in set(fa) | set(la):
+        f_val = fa.get(mod_name)
+        l_val = la.get(mod_name)
+        if (isinstance(f_val, (int, float)) and isinstance(l_val, (int, float))
+                and abs(l_val - f_val) >= 0.05):
+            _add(f"adaptation.{mod_name}", round(f_val, 2), round(l_val, 2),
+                 f"{f_val:.2f} → {l_val:.2f}")
+
+    # operator queue: total + escalation counts
+    fop = fp.get("operator_priorities") or {}
+    lop = live.get("operator_priorities") or {}
+    if fop.get("total_items") != lop.get("total_items"):
+        _add("operator_priorities.total_items",
+             fop.get("total_items"), lop.get("total_items"),
+             f"{fop.get('total_items')} → {lop.get('total_items')}")
+    fec = fop.get("escalation_counts") or {}
+    lec = lop.get("escalation_counts") or {}
+    for lvl in ("CRITICAL", "IMPORTANT", "WATCH"):
+        if fec.get(lvl, 0) != lec.get(lvl, 0):
+            _add(f"operator_priorities.escalation.{lvl}",
+                 fec.get(lvl, 0), lec.get(lvl, 0),
+                 f"{fec.get(lvl, 0)} → {lec.get(lvl, 0)}")
+
+    # narrative headline
+    fn = fp.get("narrative_causality") or {}
+    ln = live.get("narrative_causality") or {}
+    if fn.get("headline") and ln.get("headline") and fn["headline"] != ln["headline"]:
+        _add("narrative.headline", fn["headline"], ln["headline"], "headline changed")
+
+    captured_at_ms = (frozen.get("captured_at_ms") or 0)
+    age_seconds = max(0, (_inv_now_ms() - captured_at_ms) // 1000) if captured_at_ms else 0
+    return {
+        "found": True, "id": case_id,
+        "frozen_present": True,
+        "frozen_captured_at_ms": captured_at_ms,
+        "frozen_age_seconds": age_seconds,
+        "live_computed_at_ms": _inv_now_ms(),
+        "diffs": diffs,
+        "diff_count": len(diffs),
+        "summary": (
+            f"{len(diffs)} material drift(s) since frozen snapshot "
+            f"({age_seconds // 60} minutes ago)."
+            if diffs else
+            "no material drift since frozen snapshot."
+        ),
+    }
+
+
+def investigation_replay_propagation(
+    db: Session,
+    case_id: int,
+    *,
+    pre_window_ms: int = 6 * 3600 * 1000,
+    post_window_ms: int = 6 * 3600 * 1000,
+    bucket_ms: int = 5 * 60 * 1000,
+    max_frames: int = 60,
+) -> dict:
+    """Frame-by-frame propagation playback for the case window.
+
+    Buckets the window into `bucket_ms` slices; for each slice, counts
+    new alerts per symbol that started in that slice. This is the
+    "who got hit when" view — the frontend animates these frames so the
+    operator sees the order in which symbols started lighting up.
+
+    Symbols are limited to the case's primary + related + symbols that
+    actually emit in the window (capped so the chart isn't a wall of
+    rows on quiet windows). Edges between symbols (lead-lag pairs from
+    propagation_graph) are exposed in `edges` but NOT animated per-frame
+    — animating edges would require timestamped pair data not present
+    in the current propagation layer. Pass B can layer that on top
+    deterministically if needed.
+    """
+    from kazus_db.models import Investigation, LiquidityAlertHistory
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "frames": []}
+    anchor = case.replay_anchor_ms or case.created_at_ms
+    window_start = anchor - pre_window_ms
+    window_end = anchor + post_window_ms
+
+    # Symbol seed.
+    seed: set = set()
+    if case.primary_symbol:
+        seed.add(case.primary_symbol)
+    seed.update(_inv_deserialize_tags(case.related_symbols_json))
+
+    alerts = (
+        db.query(LiquidityAlertHistory)
+        .filter(LiquidityAlertHistory.started_at_ms >= window_start)
+        .filter(LiquidityAlertHistory.started_at_ms <= window_end)
+        .order_by(LiquidityAlertHistory.started_at_ms.asc())
+        .all()
+    )
+
+    # Discover any extra symbols that fired in window — but cap so noisy
+    # global periods don't flood the playback.
+    symbols = set(seed)
+    for a in alerts:
+        symbols.add(a.symbol)
+    symbols = set(list(seed) + [s for s in sorted(symbols - set(seed))][:8])
+
+    if window_end <= window_start:
+        return {
+            "found": True, "id": case_id, "anchor_ms": anchor,
+            "window_start_ms": window_start, "window_end_ms": window_end,
+            "frames": [], "symbols": sorted(symbols), "edges": [],
+        }
+
+    # Frame the window into bucket_ms slices, capped at max_frames.
+    span = window_end - window_start
+    bucket = max(bucket_ms, span // max_frames + 1)
+    frames: List[dict] = []
+    cursor = window_start
+    while cursor <= window_end:
+        nxt = cursor + bucket
+        per_sym: Dict[str, int] = defaultdict(int)
+        for a in alerts:
+            if cursor <= a.started_at_ms < nxt and a.symbol in symbols:
+                per_sym[a.symbol] += 1
+        frames.append({
+            "ts_ms": cursor,
+            "per_symbol_count": dict(per_sym),
+            "total_count": sum(per_sym.values()),
+        })
+        cursor = nxt
+
+    # Edges from propagation_graph, filtered to seen symbols. Static.
+    edges: List[dict] = []
+    try:
+        prop = propagation_graph(db, lookback_days=max(1, (window_end - window_start) // (24 * 3600 * 1000)) or 1)
+        for e in prop.get("edges") or []:
+            if e.get("from") in symbols and e.get("to") in symbols:
+                edges.append({
+                    "from": e["from"], "to": e["to"],
+                    "confidence_score": e.get("confidence_score"),
+                    "confidence_label": e.get("confidence_label"),
+                    "count": e.get("count"),
+                    "avg_lead_ms": e.get("avg_lead_ms"),
+                })
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "found": True, "id": case_id,
+        "anchor_ms": anchor,
+        "window_start_ms": window_start,
+        "window_end_ms": window_end,
+        "bucket_ms": bucket,
+        "symbols": sorted(symbols),
+        "frames": frames,
+        "frame_count": len(frames),
+        "edges": edges,
+        "rationale_note": (
+            "Frame counts are alert-starts per bucket per symbol. "
+            "Edges come from propagation_graph and are static within the "
+            "window — they describe historical lead-lag, not per-frame transmission."
+        ),
     }
 
 

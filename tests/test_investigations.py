@@ -382,6 +382,149 @@ def test_export_404_for_missing(db):
     assert out["found"] is False
 
 
+# ─── Pass A: Phase 19 Replay Intelligence ─────────────────────────────
+
+
+def test_auto_capture_on_create(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    # Auto-capture should have fired at creation time.
+    snap = research._replay_load_snapshot(db, case["id"])
+    assert snap is not None
+    assert snap["captured_kind"] == "auto_create"
+    assert snap["payload_size"] > 0
+    # Sections are present even if upstream surfaces return empty dicts.
+    payload = snap["payload"]
+    for sec in ("operator_priorities", "sanity_audit", "crisis_genesis",
+                "adaptation_state", "narrative_causality"):
+        assert sec in payload
+
+
+def test_capture_idempotent_without_force(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    again = research.investigation_replay_capture(db, case["id"])
+    assert again["captured"] is False
+    assert "already exists" in (again.get("reason") or "")
+
+
+def test_recapture_with_force_overwrites_and_logs_event(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    first = research._replay_load_snapshot(db, case["id"])
+    import time as _t; _t.sleep(0.01)  # ensure captured_at_ms moves
+    forced = research.investigation_replay_capture(db, case["id"], force=True, captured_by=2)
+    assert forced["captured"] is True
+    second = research._replay_load_snapshot(db, case["id"])
+    assert second["captured_at_ms"] >= first["captured_at_ms"]
+    # Event log records the recapture.
+    Ev = __import__("kazus_db.models", fromlist=["InvestigationEvent"]).InvestigationEvent
+    types = [e.event_type for e in db.query(Ev).filter_by(investigation_id=case["id"]).all()]
+    assert "replay_captured" in types
+    assert "replay_recaptured" in types
+
+
+def test_state_frozen_returns_snapshot(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    state = research.investigation_replay_state(db, case["id"], mode="frozen")
+    assert state["found"] is True
+    assert state["mode"] == "frozen"
+    assert state["is_frozen"] is True
+    assert state["snapshot_present"] is True
+    assert state["payload"] is not None
+
+
+def test_state_live_reconstructs_at_anchor(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    state = research.investigation_replay_state(db, case["id"], mode="live")
+    assert state["found"] is True
+    assert state["mode"] == "live"
+    assert state["is_frozen"] is False
+    # Each surface in reconstruction publishes data_quality.
+    rec = state["reconstructed"]
+    assert "intel_snapshot" in rec
+    assert rec["intel_snapshot"]["data_quality"] in ("HIGH", "PARTIAL", "PRUNED", "INSUFFICIENT")
+
+
+def test_state_validates_mode(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        research.investigation_replay_state(db, case["id"], mode="bogus")
+
+
+def test_replay_timeline_includes_case_events_in_window(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    # Anchor at created_at so case events fall inside the default window.
+    tl = research.investigation_replay_timeline(db, case["id"])
+    assert tl["found"] is True
+    sources = {k["source"] for k in tl["keyframes"]}
+    assert "case" in sources  # at least the 'created' event
+    # Keyframes sorted ascending.
+    ts_list = [k["ts_ms"] for k in tl["keyframes"]]
+    assert ts_list == sorted(ts_list)
+
+
+def test_replay_diff_no_drift_immediately_after_capture(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    diff = research.investigation_replay_diff(db, case["id"])
+    assert diff["found"] is True
+    assert diff["frozen_present"] is True
+    # Right after capture, no drift expected (live surfaces == frozen).
+    assert diff["diff_count"] == 0
+
+
+def test_replay_diff_without_snapshot(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    # Remove the auto-captured snapshot to simulate the no-snapshot case.
+    from kazus_db.models import InvestigationReplaySnapshot
+    db.query(InvestigationReplaySnapshot).filter_by(investigation_id=case["id"]).delete()
+    db.commit()
+    diff = research.investigation_replay_diff(db, case["id"])
+    assert diff["found"] is True
+    assert diff["frozen_present"] is False
+
+
+def test_replay_propagation_returns_frames(db):
+    case = research.investigation_create(
+        db, title="t", primary_symbol="BTCUSDT",
+        related_symbols=["ETHUSDT"], created_by=1,
+    )
+    prop = research.investigation_replay_propagation(db, case["id"])
+    assert prop["found"] is True
+    assert "BTCUSDT" in prop["symbols"]
+    assert "ETHUSDT" in prop["symbols"]
+    assert isinstance(prop["frames"], list)
+    assert prop["frame_count"] >= 1
+    # Every frame has a ts_ms inside the window.
+    ws, we = prop["window_start_ms"], prop["window_end_ms"]
+    for f in prop["frames"]:
+        assert ws <= f["ts_ms"] <= we + prop["bucket_ms"]
+
+
+def test_replay_404_for_missing_case(db):
+    out_state = research.investigation_replay_state(db, 999, mode="frozen")
+    assert out_state["found"] is False
+    out_diff = research.investigation_replay_diff(db, 999)
+    assert out_diff["found"] is False
+    out_tl = research.investigation_replay_timeline(db, 999)
+    assert out_tl["found"] is False
+    import pytest as _pt
+    with _pt.raises(LookupError):
+        research.investigation_replay_capture(db, 999, force=True)
+
+
+def test_replay_safety_pruned_intel(db):
+    # Build a case anchored years in the past — no intel rows in window.
+    from kazus_db.models import Investigation
+    case = research.investigation_create(db, title="ancient", created_by=1)
+    # Manually push anchor backwards (intel_history is empty in tests anyway).
+    row = db.query(Investigation).filter_by(id=case["id"]).first()
+    row.replay_anchor_ms = 1_000_000_000_000  # 2001
+    db.commit()
+    state = research.investigation_replay_state(db, case["id"], mode="live")
+    rec = state["reconstructed"]
+    # With empty intel history, INSUFFICIENT is expected.
+    assert rec["intel_snapshot"]["data_quality"] == "INSUFFICIENT"
+
+
 def test_timeline_includes_case_events_and_notes(db):
     case = research.investigation_create(db, title="t")
     research.investigation_add_note(db, case["id"], body="first note")

@@ -3956,6 +3956,227 @@ async def investigation_export_md_endpoint(
     )
 
 
+# ── Phase 19 — Replay Intelligence ───────────────────────────────────
+
+
+class ReplayCaptureIn(BaseModel):
+    force: Optional[bool] = False
+    anchor_ms: Optional[int] = None
+
+
+class ReplayCaptureOut(BaseModel):
+    captured: bool
+    investigation_id: int
+    captured_at_ms: Optional[int] = None
+    anchor_ms: Optional[int] = None
+    captured_kind: Optional[str] = None
+    captured_by: Optional[int] = None
+    payload_size: Optional[int] = None
+    sections: Optional[List[str]] = None
+    reason: Optional[str] = None
+
+
+@router.post("/research/investigations/{case_id}/replay/capture", response_model=ReplayCaptureOut)
+async def investigation_replay_capture_endpoint(
+    case_id: int,
+    payload: ReplayCaptureIn = Body(default=ReplayCaptureIn()),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReplayCaptureOut:
+    try:
+        result = _research.investigation_replay_capture(
+            db, case_id,
+            captured_kind="operator_recapture",
+            captured_by=user.id,
+            anchor_ms=payload.anchor_ms,
+            force=bool(payload.force),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ReplayCaptureOut(**result)
+
+
+class ReplayStateOut(BaseModel):
+    found: bool
+    id: int
+    mode: Optional[str] = None
+    is_frozen: Optional[bool] = None
+    snapshot_present: Optional[bool] = None
+    captured_at_ms: Optional[int] = None
+    anchor_ms: Optional[int] = None
+    captured_kind: Optional[str] = None
+    captured_by: Optional[int] = None
+    payload_size: Optional[int] = None
+    payload: Optional[dict] = None
+    warning: Optional[str] = None
+    at_ms: Optional[int] = None
+    reconstructed: Optional[dict] = None
+
+
+@router.get("/research/investigations/{case_id}/replay/state", response_model=ReplayStateOut)
+async def investigation_replay_state_endpoint(
+    case_id: int,
+    mode: str = Query("frozen"),
+    at_ms: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayStateOut:
+    if mode not in ("frozen", "live"):
+        raise HTTPException(status_code=400, detail=f"unknown mode: {mode}")
+    result = _research.investigation_replay_state(
+        db, case_id, mode=mode, at_ms=at_ms,
+    )
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return ReplayStateOut(**result)
+
+
+class ReplayKeyframe(BaseModel):
+    ts_ms: int
+    source: str
+    kind: str
+    severity_hint: Optional[str] = None
+    label: str
+    ref: Optional[dict] = None
+
+
+class ReplayTimelineOut(BaseModel):
+    found: bool
+    id: int
+    anchor_ms: Optional[int] = None
+    window_start_ms: Optional[int] = None
+    window_end_ms: Optional[int] = None
+    keyframes: List[ReplayKeyframe] = []
+    keyframe_count: int = 0
+    snapped_count: int = 0
+
+
+@router.get("/research/investigations/{case_id}/replay/timeline", response_model=ReplayTimelineOut)
+async def investigation_replay_timeline_endpoint(
+    case_id: int,
+    pre_window_h: int = Query(6, ge=1, le=72),
+    post_window_h: int = Query(6, ge=1, le=72),
+    limit: int = Query(400, ge=10, le=2000),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayTimelineOut:
+    result = _research.investigation_replay_timeline(
+        db, case_id,
+        pre_window_ms=pre_window_h * 3600 * 1000,
+        post_window_ms=post_window_h * 3600 * 1000,
+        limit=limit,
+    )
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return ReplayTimelineOut(**result)
+
+
+class ReplayDiffEntry(BaseModel):
+    field: str
+    before: Any
+    after: Any
+    delta: str
+
+
+class ReplayDiffOut(BaseModel):
+    found: bool
+    id: int
+    frozen_present: bool = False
+    frozen_captured_at_ms: Optional[int] = None
+    frozen_age_seconds: Optional[int] = None
+    live_computed_at_ms: Optional[int] = None
+    diffs: List[ReplayDiffEntry] = []
+    diff_count: Optional[int] = None
+    summary: str = ""
+
+
+@router.get("/research/investigations/{case_id}/replay/diff", response_model=ReplayDiffOut)
+async def investigation_replay_diff_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayDiffOut:
+    result = _research.investigation_replay_diff(db, case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return ReplayDiffOut(**result)
+
+
+class ReplayPropagationFrame(BaseModel):
+    ts_ms: int
+    per_symbol_count: dict
+    total_count: int
+
+
+class ReplayPropagationEdge(BaseModel):
+    edge_from: str
+    edge_to: str
+    confidence_score: Optional[float] = None
+    confidence_label: Optional[str] = None
+    count: Optional[int] = None
+    avg_lead_ms: Optional[float] = None
+
+
+class ReplayPropagationOut(BaseModel):
+    found: bool
+    id: int
+    anchor_ms: Optional[int] = None
+    window_start_ms: Optional[int] = None
+    window_end_ms: Optional[int] = None
+    bucket_ms: Optional[int] = None
+    symbols: List[str] = []
+    frames: List[ReplayPropagationFrame] = []
+    frame_count: int = 0
+    edges: List[ReplayPropagationEdge] = []
+    rationale_note: Optional[str] = None
+
+
+@router.get("/research/investigations/{case_id}/replay/propagation", response_model=ReplayPropagationOut)
+async def investigation_replay_propagation_endpoint(
+    case_id: int,
+    pre_window_h: int = Query(6, ge=1, le=72),
+    post_window_h: int = Query(6, ge=1, le=72),
+    bucket_minutes: int = Query(5, ge=1, le=60),
+    max_frames: int = Query(60, ge=10, le=240),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayPropagationOut:
+    result = _research.investigation_replay_propagation(
+        db, case_id,
+        pre_window_ms=pre_window_h * 3600 * 1000,
+        post_window_ms=post_window_h * 3600 * 1000,
+        bucket_ms=bucket_minutes * 60 * 1000,
+        max_frames=max_frames,
+    )
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    # Rename edge from/to to avoid Python reserved word in Pydantic.
+    edges = [
+        ReplayPropagationEdge(
+            edge_from=e["from"], edge_to=e["to"],
+            confidence_score=e.get("confidence_score"),
+            confidence_label=e.get("confidence_label"),
+            count=e.get("count"),
+            avg_lead_ms=e.get("avg_lead_ms"),
+        )
+        for e in result.get("edges") or []
+    ]
+    return ReplayPropagationOut(
+        found=True, id=result["id"],
+        anchor_ms=result.get("anchor_ms"),
+        window_start_ms=result.get("window_start_ms"),
+        window_end_ms=result.get("window_end_ms"),
+        bucket_ms=result.get("bucket_ms"),
+        symbols=result.get("symbols") or [],
+        frames=[ReplayPropagationFrame(**f) for f in result.get("frames") or []],
+        frame_count=result.get("frame_count", 0),
+        edges=edges,
+        rationale_note=result.get("rationale_note"),
+    )
+
+
 class WorkerHeartbeat(BaseModel):
     task: str
     last_tick_ms: Optional[int] = None

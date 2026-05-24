@@ -11,13 +11,18 @@
  * linked evidence. No auto-trading — every action is workflow.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addInvestigationNote,
+  captureInvestigationReplay,
   createInvestigation,
   getInvestigation,
   getInvestigationCausalTree,
   getInvestigationExport,
+  getInvestigationReplayDiff,
+  getInvestigationReplayPropagation,
+  getInvestigationReplayState,
+  getInvestigationReplayTimeline,
   getInvestigationSimilar,
   getInvestigationTimeline,
   investigationExportDownloadUrl,
@@ -36,6 +41,11 @@ import {
   type InvestigationStatus,
   type InvestigationTimeline,
   type InvestigationTree,
+  type ReplayDiff,
+  type ReplayKeyframe,
+  type ReplayPropagation,
+  type ReplayState,
+  type ReplayTimeline as ReplayTimelineT,
 } from "../lib/api";
 
 const REFRESH_MS = 60_000;
@@ -408,7 +418,7 @@ function CaseDrawer({
   const [tree, setTree] = useState<InvestigationTree | null>(null);
   const [similar, setSimilar] = useState<InvestigationSimilar | null>(null);
   const [exportData, setExportData] = useState<InvestigationExport | null>(null);
-  const [tab, setTab] = useState<"evidence" | "notes" | "timeline" | "tree" | "similar" | "export">("evidence");
+  const [tab, setTab] = useState<"evidence" | "notes" | "timeline" | "tree" | "similar" | "export" | "replay">("evidence");
   const [error, setError] = useState<string | null>(null);
 
   const refresh = () => {
@@ -461,7 +471,7 @@ function CaseDrawer({
       />
 
       <div className="flex items-baseline gap-2 mt-2.5 mb-2 text-[10px] uppercase tracking-[0.16em] flex-wrap">
-        {(["evidence", "notes", "timeline", "tree", "similar", "export"] as const).map((t) => (
+        {(["evidence", "notes", "timeline", "tree", "similar", "replay", "export"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -505,6 +515,9 @@ function CaseDrawer({
       )}
       {tab === "export" && (
         <ExportPanel caseId={caseId} exp={exportData} />
+      )}
+      {tab === "replay" && (
+        <ReplayPanel caseId={caseId} />
       )}
     </div>
   );
@@ -1058,5 +1071,730 @@ function TimelinePanel({ timeline }: { timeline: InvestigationTimeline | null })
         </li>
       ))}
     </ul>
+  );
+}
+
+// ── Phase 19 Pass B — Replay surface ─────────────────────────────────
+//
+// Lazy-mounted forensic replay inside the INV drawer. Composes four
+// endpoints: capture / state(frozen) / state(live, at_ms) / timeline /
+// diff / propagation. NO cinematic animation — the only moving element
+// is the cursor when `playing=true`, advanced by requestAnimationFrame
+// against wall-clock time × speed factor. Everything else (overlays,
+// mini-charts, propagation frames) is deterministic + cached against
+// the cursor position.
+//
+// Performance: every fetch is one-shot per case open; the cursor moves
+// purely client-side over already-fetched keyframes/frames. No polling.
+
+const KEYFRAME_COLOR: Record<string, string> = {
+  critical: "rgba(221, 99, 99, 0.9)",
+  warn:     "rgba(227, 180, 87, 0.9)",
+  info:     "rgba(140, 170, 235, 0.8)",
+};
+
+const KEYFRAME_SOURCE_COLOR: Record<string, string> = {
+  operator_priority: "rgba(140, 170, 235, 0.95)",
+  alert:             "rgba(227, 180, 87, 0.95)",
+  anomaly:           "rgba(221, 99, 99, 0.95)",
+  case:              "rgba(125, 125, 125, 0.85)",
+};
+
+const REPLAY_SPEEDS = [0.5, 1, 2, 4, 8, 16] as const;
+type ReplaySpeed = typeof REPLAY_SPEEDS[number];
+
+function ReplayPanel({ caseId }: { caseId: number }) {
+  const [state, setState] = useState<ReplayState | null>(null);
+  const [liveAtCursor, setLiveAtCursor] = useState<ReplayState | null>(null);
+  const [timeline, setTimeline] = useState<ReplayTimelineT | null>(null);
+  const [diff, setDiff] = useState<ReplayDiff | null>(null);
+  const [propagation, setPropagation] = useState<ReplayPropagation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Source-overlay toggles. Default all on.
+  const [overlayOn, setOverlayOn] = useState<Record<string, boolean>>({
+    operator_priority: true,
+    alert: true,
+    anomaly: true,
+    case: true,
+  });
+
+  // Scrubber state.
+  const [cursorMs, setCursorMs] = useState<number | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState<ReplaySpeed>(1);
+  const [showFrozenOnly, setShowFrozenOnly] = useState(false);
+
+  // Lazy-load all replay data on mount.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    Promise.all([
+      getInvestigationReplayState(caseId, { mode: "frozen" }),
+      getInvestigationReplayTimeline(caseId),
+      getInvestigationReplayDiff(caseId),
+      getInvestigationReplayPropagation(caseId),
+    ])
+      .then(([st, tl, df, pr]) => {
+        if (cancelled) return;
+        setState(st);
+        setTimeline(tl);
+        setDiff(df);
+        setPropagation(pr);
+        const anchor = tl.anchor_ms ?? st.anchor_ms ?? null;
+        if (anchor != null) setCursorMs(anchor);
+      })
+      .catch((e: any) => { if (!cancelled) setError(e?.message ?? "replay load failed"); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [caseId]);
+
+  // Re-fetch the per-cursor live reconstruction when cursor settles.
+  // Debounced so scrubbing doesn't spam the backend.
+  useEffect(() => {
+    if (cursorMs == null) return;
+    const timer = window.setTimeout(() => {
+      getInvestigationReplayState(caseId, { mode: "live", at_ms: cursorMs })
+        .then(setLiveAtCursor)
+        .catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [cursorMs, caseId]);
+
+  // Play loop. RAF-based; speed multiplies wall-clock progression.
+  const lastTickRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!playing || cursorMs == null || timeline == null) return;
+    let raf = 0;
+    const step = (now: number) => {
+      if (lastTickRef.current == null) lastTickRef.current = now;
+      const dtMs = now - lastTickRef.current;
+      lastTickRef.current = now;
+      // Map 1s wall ≈ 1 minute of case time at speed=1. So at speed=8,
+      // 1s wall ≈ 8 minutes case time. Cap to window_end.
+      const advance = dtMs * 60 * speed;
+      setCursorMs((prev) => {
+        if (prev == null) return prev;
+        const next = prev + advance;
+        if (timeline.window_end_ms != null && next >= timeline.window_end_ms) {
+          setPlaying(false);
+          lastTickRef.current = null;
+          return timeline.window_end_ms;
+        }
+        return next;
+      });
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => {
+      cancelAnimationFrame(raf);
+      lastTickRef.current = null;
+    };
+  }, [playing, speed, timeline, cursorMs == null]);
+
+  if (loading) return <div className="text-[11px] text-muted">loading replay surface…</div>;
+  if (error) return <div className="text-[11px] text-red-300">{error}</div>;
+  if (!timeline?.found) {
+    return <div className="text-[11px] text-muted">No replay anchor yet — set a replay anchor on the case to enable forensic replay.</div>;
+  }
+
+  const visibleKeyframes = timeline.keyframes.filter((k) => overlayOn[k.source]);
+
+  return (
+    <div className="space-y-3">
+      <ReplayDiffBanner
+        diff={diff}
+        onRecapture={async () => {
+          if (!confirm("Overwrite the frozen snapshot with current engine state? This is the only write that mutates the frozen reference.")) return;
+          try {
+            await captureInvestigationReplay(caseId, { force: true });
+            const [st, df] = await Promise.all([
+              getInvestigationReplayState(caseId, { mode: "frozen" }),
+              getInvestigationReplayDiff(caseId),
+            ]);
+            setState(st); setDiff(df);
+          } catch (e: any) { alert(e?.message ?? "recapture failed"); }
+        }}
+      />
+
+      <ReplayScrubber
+        timeline={timeline}
+        cursorMs={cursorMs}
+        setCursorMs={setCursorMs}
+        playing={playing}
+        setPlaying={setPlaying}
+        speed={speed}
+        setSpeed={setSpeed}
+        visibleKeyframes={visibleKeyframes}
+        overlayOn={overlayOn}
+        setOverlayOn={setOverlayOn}
+      />
+
+      <ReplayCursorSnapshot
+        showFrozenOnly={showFrozenOnly}
+        setShowFrozenOnly={setShowFrozenOnly}
+        frozen={state}
+        live={liveAtCursor}
+        cursorMs={cursorMs}
+      />
+
+      <ReplayStateEvolution
+        timeline={timeline}
+        propagation={propagation}
+        cursorMs={cursorMs}
+      />
+
+      <ReplayPropagationPlayback
+        propagation={propagation}
+        cursorMs={cursorMs}
+      />
+    </div>
+  );
+}
+
+function ReplayDiffBanner({ diff, onRecapture }: { diff: ReplayDiff | null; onRecapture: () => void }) {
+  if (diff == null) return null;
+  if (!diff.frozen_present) {
+    return (
+      <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2 flex items-baseline gap-3 flex-wrap">
+        <span className="text-[11px] uppercase tracking-[0.22em] text-muted">● frozen vs live</span>
+        <span className="text-[11px] text-muted flex-1">No frozen snapshot — open the case from scratch or click recapture.</span>
+        <button
+          onClick={onRecapture}
+          className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-accent/60 text-accent hover:bg-accent/10"
+        >capture</button>
+      </div>
+    );
+  }
+  const driftCount = diff.diff_count ?? 0;
+  const color =
+    driftCount === 0 ? "rgba(82, 185, 122, 0.85)"
+    : driftCount <= 2 ? "rgba(140, 170, 235, 0.85)"
+    : driftCount <= 5 ? "rgba(227, 180, 87, 0.9)"
+    : "rgba(221, 99, 99, 0.95)";
+  return (
+    <div
+      className="rounded-lg border bg-bg/40 px-3 py-2"
+      style={{ borderColor: color.replace(/0\.95\)$|0\.9\)$|0\.85\)$/, "0.55)") }}
+    >
+      <div className="flex items-baseline gap-3 flex-wrap mb-1.5">
+        <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color }}>
+          ● frozen vs live
+        </span>
+        <span className="text-[10px] text-muted">
+          frozen {Math.round((diff.frozen_age_seconds ?? 0) / 60)}m ago
+        </span>
+        <span className="text-[11px] text-zinc-200 flex-1">{diff.summary}</span>
+        <button
+          onClick={onRecapture}
+          title="overwrite frozen reference with current engine state"
+          className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200 hover:border-zinc-400"
+        >recapture</button>
+      </div>
+      {diff.diffs.length > 0 && (
+        <ul className="text-[10px] text-zinc-200 space-y-0.5 font-mono">
+          {diff.diffs.slice(0, 8).map((d, i) => (
+            <li key={i} className="truncate">
+              <span className="text-muted mr-2">{d.field}</span>
+              {d.delta}
+            </li>
+          ))}
+          {diff.diffs.length > 8 && (
+            <li className="text-muted">…+{diff.diffs.length - 8} more</li>
+          )}
+        </ul>
+      )}
+      <div className="text-[9px] text-muted italic mt-1.5">
+        Forensic comparison — &ldquo;what the engine knew then vs now&rdquo;. Not a retroactive correction.
+      </div>
+    </div>
+  );
+}
+
+function ReplayScrubber({
+  timeline,
+  cursorMs,
+  setCursorMs,
+  playing,
+  setPlaying,
+  speed,
+  setSpeed,
+  visibleKeyframes,
+  overlayOn,
+  setOverlayOn,
+}: {
+  timeline: ReplayTimelineT;
+  cursorMs: number | null;
+  setCursorMs: (n: number | null) => void;
+  playing: boolean;
+  setPlaying: (p: boolean) => void;
+  speed: ReplaySpeed;
+  setSpeed: (s: ReplaySpeed) => void;
+  visibleKeyframes: ReplayKeyframe[];
+  overlayOn: Record<string, boolean>;
+  setOverlayOn: (next: Record<string, boolean>) => void;
+}) {
+  const ws = timeline.window_start_ms ?? 0;
+  const we = timeline.window_end_ms ?? ws + 1;
+  const span = Math.max(1, we - ws);
+  const cursorPct = cursorMs != null ? ((cursorMs - ws) / span) * 100 : 0;
+  const anchorPct = timeline.anchor_ms != null ? ((timeline.anchor_ms - ws) / span) * 100 : 0;
+
+  // Critical keyframes for prev/next navigation: anything not severity=info.
+  const criticalKfs = useMemo(
+    () => visibleKeyframes.filter((k) => k.severity_hint && k.severity_hint !== "info" && k.severity_hint !== "INFO"),
+    [visibleKeyframes],
+  );
+
+  const jumpCritical = (dir: 1 | -1) => {
+    if (cursorMs == null || criticalKfs.length === 0) return;
+    const sorted = [...criticalKfs].sort((a, b) => a.ts_ms - b.ts_ms);
+    const next = dir > 0
+      ? sorted.find((k) => k.ts_ms > cursorMs)
+      : [...sorted].reverse().find((k) => k.ts_ms < cursorMs);
+    if (next) setCursorMs(next.ts_ms);
+  };
+
+  const stepBy = (dir: 1 | -1) => {
+    if (cursorMs == null) return;
+    const sorted = [...visibleKeyframes].sort((a, b) => a.ts_ms - b.ts_ms);
+    const next = dir > 0
+      ? sorted.find((k) => k.ts_ms > cursorMs)
+      : [...sorted].reverse().find((k) => k.ts_ms < cursorMs);
+    if (next) setCursorMs(next.ts_ms);
+  };
+
+  return (
+    <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
+      {/* Transport controls. */}
+      <div className="flex items-baseline gap-2 flex-wrap mb-2 text-[10px]">
+        <button
+          onClick={() => setPlaying(!playing)}
+          className="uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-accent/60 text-accent hover:bg-accent/10 w-14 text-center"
+        >{playing ? "pause" : "play"}</button>
+        <button onClick={() => jumpCritical(-1)}
+                className="uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+                title="previous critical keyframe">«crit</button>
+        <button onClick={() => stepBy(-1)}
+                className="uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+                title="previous keyframe">‹step</button>
+        <button onClick={() => stepBy(1)}
+                className="uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+                title="next keyframe">step›</button>
+        <button onClick={() => jumpCritical(1)}
+                className="uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+                title="next critical keyframe">crit»</button>
+        <button
+          onClick={() => timeline.anchor_ms != null && setCursorMs(timeline.anchor_ms)}
+          className="uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+          title="jump to case anchor"
+        >anchor</button>
+        <span className="text-muted ml-2 uppercase tracking-[0.14em]">speed</span>
+        {REPLAY_SPEEDS.map((s) => (
+          <button
+            key={s}
+            onClick={() => setSpeed(s)}
+            className={`px-1.5 py-0.5 rounded border tabular-nums ${
+              speed === s ? "border-accent text-accent" : "border-border/50 text-muted hover:text-zinc-200"
+            }`}
+          >{s}×</button>
+        ))}
+        <span className="ml-auto text-muted tabular-nums">
+          {cursorMs != null ? fmtTs(cursorMs) : "—"}
+        </span>
+      </div>
+
+      {/* Scrubber strip — SVG, dense but cheap. */}
+      <div className="relative h-12 select-none">
+        <svg
+          width="100%" height="48" viewBox="0 0 1000 48" preserveAspectRatio="none"
+          onClick={(ev) => {
+            const rect = (ev.currentTarget as SVGSVGElement).getBoundingClientRect();
+            const pct = (ev.clientX - rect.left) / rect.width;
+            setCursorMs(ws + Math.max(0, Math.min(1, pct)) * span);
+          }}
+          className="cursor-crosshair"
+        >
+          {/* Background rail. */}
+          <rect x={0} y={20} width={1000} height={8} fill="rgba(255,255,255,0.04)" />
+          {/* Anchor mark. */}
+          <line x1={anchorPct * 10} x2={anchorPct * 10} y1={4} y2={44}
+                stroke="rgba(140,170,235,0.7)" strokeWidth={1} strokeDasharray="2 2" />
+          {/* Keyframes. */}
+          {visibleKeyframes.map((k, i) => {
+            const x = ((k.ts_ms - ws) / span) * 1000;
+            const c = KEYFRAME_COLOR[k.severity_hint ?? "info"] ?? KEYFRAME_SOURCE_COLOR[k.source] ?? "rgba(140,170,235,0.7)";
+            const isCrit = k.severity_hint && k.severity_hint !== "info" && k.severity_hint !== "INFO";
+            return (
+              <line
+                key={i}
+                x1={x} x2={x}
+                y1={isCrit ? 8 : 16} y2={isCrit ? 40 : 32}
+                stroke={c} strokeWidth={isCrit ? 1.6 : 1.0}
+              >
+                <title>{`${fmtTs(k.ts_ms)} · ${k.source}/${k.kind}\n${k.label}`}</title>
+              </line>
+            );
+          })}
+          {/* Cursor. */}
+          {cursorMs != null && (
+            <line x1={cursorPct * 10} x2={cursorPct * 10} y1={0} y2={48}
+                  stroke="rgba(255,255,255,0.85)" strokeWidth={1.3} />
+          )}
+        </svg>
+      </div>
+
+      <div className="flex items-baseline gap-3 mt-2 text-[9px] uppercase tracking-[0.14em] flex-wrap">
+        <span className="text-muted">
+          {fmtTs(ws)} → {fmtTs(we)} · {visibleKeyframes.length} keyframe(s)
+        </span>
+        <span className="text-muted ml-2">overlays:</span>
+        {(["operator_priority", "alert", "anomaly", "case"] as const).map((src) => {
+          const on = overlayOn[src];
+          const color = KEYFRAME_SOURCE_COLOR[src];
+          return (
+            <button
+              key={src}
+              onClick={() => setOverlayOn({ ...overlayOn, [src]: !on })}
+              className="px-1.5 py-0.5 rounded border tabular-nums"
+              style={{
+                color: on ? color : "rgba(125,125,125,0.7)",
+                borderColor: on ? color.replace(/0\.95\)$/, "0.5)") : "rgba(125,125,125,0.3)",
+                background: on ? color.replace(/0\.95\)$/, "0.10)") : "transparent",
+              }}
+              title={`toggle ${src} overlay`}
+            >{src.replace("_", " ")}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ReplayCursorSnapshot({
+  showFrozenOnly,
+  setShowFrozenOnly,
+  frozen,
+  live,
+  cursorMs,
+}: {
+  showFrozenOnly: boolean;
+  setShowFrozenOnly: (b: boolean) => void;
+  frozen: ReplayState | null;
+  live: ReplayState | null;
+  cursorMs: number | null;
+}) {
+  return (
+    <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
+      <div className="flex items-baseline gap-3 mb-2 flex-wrap">
+        <span className="text-[11px] uppercase tracking-[0.22em] text-zinc-200">● cursor snapshot</span>
+        <span className="text-[10px] text-muted">{cursorMs != null ? fmtTs(cursorMs) : "—"}</span>
+        <div className="ml-auto flex gap-1 text-[10px] uppercase tracking-[0.14em]">
+          <button
+            onClick={() => setShowFrozenOnly(false)}
+            className={`px-2 py-0.5 rounded border ${!showFrozenOnly ? "border-accent text-accent" : "border-border/50 text-muted"}`}
+          >live @ cursor</button>
+          <button
+            onClick={() => setShowFrozenOnly(true)}
+            className={`px-2 py-0.5 rounded border ${showFrozenOnly ? "border-accent text-accent" : "border-border/50 text-muted"}`}
+          >frozen</button>
+        </div>
+      </div>
+      {showFrozenOnly ? (
+        <FrozenSnapshotSummary state={frozen} />
+      ) : (
+        <LiveReconstructionSummary state={live} />
+      )}
+    </div>
+  );
+}
+
+function FrozenSnapshotSummary({ state }: { state: ReplayState | null }) {
+  if (state == null) return <div className="text-[11px] text-muted">loading frozen…</div>;
+  if (!state.snapshot_present) return <div className="text-[11px] text-muted">no frozen snapshot.</div>;
+  const p = (state.payload ?? {}) as Record<string, any>;
+  const cg = p.crisis_genesis ?? {};
+  const sa = p.sanity_audit ?? {};
+  const op = p.operator_priorities ?? {};
+  const ad = p.adaptation_state ?? {};
+  const nc = p.narrative_causality ?? {};
+  return (
+    <div className="grid grid-cols-2 gap-2 text-[10px]">
+      <SnapField label="genesis verdict" value={cg.verdict} />
+      <SnapField label="genesis score" value={cg.genesis_score != null ? Math.round(cg.genesis_score) : "—"} />
+      <SnapField label="sanity" value={sa.overall_state} />
+      <SnapField label="queue total" value={op.total_items} />
+      <SnapField label="queue critical" value={(op.escalation_counts ?? {}).CRITICAL ?? 0} />
+      <SnapField label="adapt narrative_conf" value={(ad.modifiers ?? {}).narrative_confidence_modifier?.toFixed?.(2)} />
+      <SnapField label="adapt alert_sens" value={(ad.modifiers ?? {}).alert_sensitivity_modifier?.toFixed?.(2)} />
+      <SnapField label="adapt discovery_suppress" value={(ad.modifiers ?? {}).discovery_suppression_modifier?.toFixed?.(2)} />
+      {nc.headline && (
+        <div className="col-span-2 text-[10px] text-muted italic mt-1">&ldquo;{nc.headline}&rdquo;</div>
+      )}
+      <div className="col-span-2 text-[9px] text-muted">
+        captured {state.captured_at_ms != null ? fmtTs(state.captured_at_ms) : "—"} · kind {state.captured_kind ?? "—"} · {state.payload_size?.toLocaleString()} bytes
+      </div>
+    </div>
+  );
+}
+
+function LiveReconstructionSummary({ state }: { state: ReplayState | null }) {
+  if (state == null) return <div className="text-[11px] text-muted">loading reconstruction…</div>;
+  const rec = state.reconstructed;
+  if (rec == null) return <div className="text-[11px] text-muted">no reconstruction available.</div>;
+
+  const intelQ = rec.intel_snapshot?.data_quality;
+  const intel = rec.intel_snapshot?.value;
+  const intelColor =
+    intelQ === "HIGH" ? "rgba(82, 185, 122, 0.85)"
+    : intelQ === "PARTIAL" ? "rgba(227, 180, 87, 0.85)"
+    : intelQ === "PRUNED" ? "rgba(221, 99, 99, 0.85)"
+    : "rgba(125, 125, 125, 0.7)";
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-2 text-[10px]">
+        <SnapField label="intel quality" value={intelQ ?? "—"} valueColor={intelColor} />
+        <SnapField label="stress" value={intel?.synthesized_stress?.toFixed?.(0) ?? "—"} />
+        <SnapField label="state" value={intel?.coordinated_state ?? "—"} />
+        <SnapField label="meta confidence" value={intel?.meta_confidence_score?.toFixed?.(0) ?? "—"} />
+        <SnapField label="break score" value={intel?.structural_break_score?.toFixed?.(0) ?? "—"} />
+        <SnapField label="risk state" value={intel?.risk_state_score?.toFixed?.(0) ?? "—"} />
+      </div>
+      <ReconSection
+        title={`active operator priorities (${rec.active_operator_priorities?.length ?? 0})`}
+        items={(rec.active_operator_priorities ?? []).slice(0, 5).map((r: any) => ({
+          label: `${r.priority_key.slice(0, 64)}`,
+          right: `${Math.round(r.priority_score)} · ${r.current_escalation}`,
+        }))}
+      />
+      <ReconSection
+        title={`alerts in window (${rec.alerts?.rows?.length ?? 0}, ${rec.alerts?.data_quality})`}
+        items={(rec.alerts?.rows ?? []).slice(0, 5).map((a: any) => ({
+          label: `${a.symbol} · ${a.kind}`,
+          right: `${a.severity} · ${a.priority?.toFixed?.(0)}`,
+        }))}
+      />
+      <ReconSection
+        title={`anomalies in window (${rec.anomalies?.rows?.length ?? 0}, ${rec.anomalies?.data_quality})`}
+        items={(rec.anomalies?.rows ?? []).slice(0, 5).map((a: any) => ({
+          label: `${a.kind}`,
+          right: `${a.severity} · novelty ${Math.round(a.novelty_score)}`,
+        }))}
+      />
+      <div className="text-[9px] text-muted">
+        live reconstruction at {state.at_ms != null ? fmtTs(state.at_ms) : "—"} ·
+        each section publishes its own data_quality. PRUNED = window past retention.
+      </div>
+    </div>
+  );
+}
+
+function SnapField({ label, value, valueColor }: { label: string; value: any; valueColor?: string }) {
+  return (
+    <div className="flex items-baseline justify-between border-b border-border/20 pb-0.5">
+      <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{label}</span>
+      <span className="text-[11px] text-zinc-200 tabular-nums" style={valueColor ? { color: valueColor } : undefined}>
+        {value ?? "—"}
+      </span>
+    </div>
+  );
+}
+
+function ReconSection({ title, items }: { title: string; items: { label: string; right: string }[] }) {
+  return (
+    <div>
+      <div className="text-[9px] uppercase tracking-[0.14em] text-muted mb-0.5">{title}</div>
+      {items.length === 0 ? (
+        <div className="text-[10px] text-muted italic pl-2">— none —</div>
+      ) : (
+        <ul className="space-y-0.5">
+          {items.map((it, i) => (
+            <li key={i} className="text-[10px] text-zinc-200 flex items-baseline gap-2">
+              <span className="truncate flex-1">{it.label}</span>
+              <span className="text-muted tabular-nums">{it.right}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ReplayStateEvolution({
+  timeline,
+  propagation,
+  cursorMs,
+}: {
+  timeline: ReplayTimelineT;
+  propagation: ReplayPropagation | null;
+  cursorMs: number | null;
+}) {
+  // We don't have a dedicated per-frame state-evolution endpoint in
+  // Pass A (would require sampling intel_history across the window).
+  // For now derive a few cheap series from data we already have:
+  //   * keyframe density per bucket — operator activity proxy
+  //   * propagation total per bucket — market activity proxy
+  // Both are real (no invention). Replay-position-aware (cursor line).
+  const ws = timeline.window_start_ms ?? 0;
+  const we = timeline.window_end_ms ?? ws + 1;
+  const span = Math.max(1, we - ws);
+
+  const buckets = 60;
+  const bucketMs = Math.max(1, Math.floor(span / buckets));
+
+  const kfSeries = useMemo(() => {
+    const counts = new Array(buckets).fill(0);
+    for (const k of timeline.keyframes) {
+      const idx = Math.min(buckets - 1, Math.max(0, Math.floor((k.ts_ms - ws) / bucketMs)));
+      counts[idx] += 1;
+    }
+    return counts;
+  }, [timeline, ws, bucketMs]);
+
+  const propSeries = useMemo(() => {
+    if (!propagation?.frames) return new Array(buckets).fill(0);
+    const counts = new Array(buckets).fill(0);
+    for (const f of propagation.frames) {
+      const idx = Math.min(buckets - 1, Math.max(0, Math.floor((f.ts_ms - ws) / bucketMs)));
+      counts[idx] += f.total_count;
+    }
+    return counts;
+  }, [propagation, ws, bucketMs]);
+
+  const cursorPct = cursorMs != null ? ((cursorMs - ws) / span) : null;
+
+  return (
+    <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
+      <div className="text-[11px] uppercase tracking-[0.22em] text-zinc-200 mb-2">● state evolution</div>
+      <Sparkline label="keyframe density" series={kfSeries} cursorPct={cursorPct} color="rgba(140,170,235,0.95)" />
+      <Sparkline label="alert activity (per bucket)" series={propSeries} cursorPct={cursorPct} color="rgba(227,180,87,0.95)" />
+      <div className="text-[9px] text-muted italic mt-1.5">
+        Series derived from already-fetched keyframes + propagation frames. No interpolation, no smoothing.
+        For per-bucket synthesized stress / structural break / genesis score, capture-time history sampling lands later.
+      </div>
+    </div>
+  );
+}
+
+function Sparkline({ label, series, cursorPct, color }: { label: string; series: number[]; cursorPct: number | null; color: string }) {
+  const max = Math.max(1, ...series);
+  const w = 1000;
+  const h = 36;
+  const step = w / Math.max(1, series.length);
+  const points = series.map((v, i) => `${(i + 0.5) * step},${h - (v / max) * (h - 4) - 2}`).join(" ");
+  return (
+    <div className="mb-1.5">
+      <div className="flex items-baseline justify-between mb-0.5">
+        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{label}</span>
+        <span className="text-[9px] text-muted tabular-nums">max {max}</span>
+      </div>
+      <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="block">
+        <rect x={0} y={0} width={w} height={h} fill="rgba(255,255,255,0.02)" />
+        <polyline points={points} fill="none" stroke={color} strokeWidth={1.2} />
+        {cursorPct != null && (
+          <line x1={cursorPct * w} x2={cursorPct * w} y1={0} y2={h} stroke="rgba(255,255,255,0.6)" strokeWidth={1} />
+        )}
+      </svg>
+    </div>
+  );
+}
+
+function ReplayPropagationPlayback({
+  propagation,
+  cursorMs,
+}: {
+  propagation: ReplayPropagation | null;
+  cursorMs: number | null;
+}) {
+  if (propagation == null) return null;
+  if (!propagation.found || propagation.frames.length === 0) {
+    return (
+      <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
+        <div className="text-[11px] uppercase tracking-[0.22em] text-zinc-200 mb-1">● propagation playback</div>
+        <div className="text-[10px] text-muted">No alerts inside the case window — nothing to playback.</div>
+      </div>
+    );
+  }
+
+  // Find the active frame whose [ts, ts+bucket) contains cursor; if
+  // cursor is before window start show the first frame.
+  const bucket = propagation.bucket_ms ?? 1;
+  const activeIdx = useMemo(() => {
+    if (cursorMs == null) return 0;
+    for (let i = 0; i < propagation.frames.length; i++) {
+      const f = propagation.frames[i];
+      if (cursorMs >= f.ts_ms && cursorMs < f.ts_ms + bucket) return i;
+    }
+    return propagation.frames.length - 1;
+  }, [cursorMs, propagation, bucket]);
+
+  const active = propagation.frames[activeIdx];
+  const maxFrameTotal = Math.max(1, ...propagation.frames.map((f) => f.total_count));
+
+  return (
+    <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
+      <div className="flex items-baseline gap-3 mb-2 flex-wrap">
+        <span className="text-[11px] uppercase tracking-[0.22em] text-zinc-200">● propagation playback</span>
+        <span className="text-[10px] text-muted">
+          frame {activeIdx + 1}/{propagation.frame_count} · bucket {Math.round(bucket / 60000)}m
+        </span>
+        <span className="text-[10px] text-muted ml-auto">
+          {fmtTs(active.ts_ms)} → {fmtTs(active.ts_ms + bucket)}
+        </span>
+      </div>
+
+      {/* Active frame: per-symbol activation bars. */}
+      <div className="space-y-1">
+        {propagation.symbols.map((sym) => {
+          const count = active.per_symbol_count[sym] ?? 0;
+          const pct = (count / Math.max(1, maxFrameTotal)) * 100;
+          return (
+            <div key={sym} className="flex items-baseline gap-2">
+              <span className="text-[10px] text-muted font-mono w-20 truncate">{sym}</span>
+              <div className="flex-1 h-3 rounded bg-bg/60 border border-border/30 relative overflow-hidden">
+                <div
+                  className="h-full"
+                  style={{
+                    width: `${pct}%`,
+                    background: count > 0 ? "rgba(227,180,87,0.5)" : "transparent",
+                    borderRight: count > 0 ? "1px solid rgba(227,180,87,0.9)" : "none",
+                    transition: "width 120ms linear",
+                  }}
+                />
+              </div>
+              <span className="text-[10px] text-muted tabular-nums w-8 text-right">{count}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Static lead-lag edges from propagation_graph. */}
+      {propagation.edges.length > 0 && (
+        <div className="mt-2 pt-2 border-t border-border/30">
+          <div className="text-[9px] uppercase tracking-[0.14em] text-muted mb-1">
+            historical lead-lag edges ({propagation.edges.length}) — static, not per-frame
+          </div>
+          <ul className="space-y-0.5 text-[10px] font-mono">
+            {propagation.edges.slice(0, 8).map((e, i) => (
+              <li key={i} className="flex items-baseline gap-2">
+                <span className="text-zinc-200">{e.edge_from}</span>
+                <span className="text-muted">→</span>
+                <span className="text-zinc-200">{e.edge_to}</span>
+                <span className="text-muted tabular-nums ml-auto">
+                  {e.confidence_label ?? "—"} · conf {(e.confidence_score ?? 0).toFixed(2)} · {e.count ?? 0} ev
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {propagation.rationale_note && (
+        <div className="text-[9px] text-muted italic mt-1.5">{propagation.rationale_note}</div>
+      )}
+    </div>
   );
 }
