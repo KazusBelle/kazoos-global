@@ -596,6 +596,13 @@ class Investigation(Base):
     # Free-text summary required when status transitions to RESOLVED.
     resolution_summary: Mapped[Optional[str]] = mapped_column(Text)
     resolved_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # Async-capture state (Integrity Repair Pass): PENDING | CAPTURED | FAILED.
+    # PENDING = case created, frozen snapshot not yet written. The worker
+    # `investigation-capture` loop drains the queue. Existing rows
+    # default to CAPTURED so backfill is a no-op.
+    capture_status: Mapped[str] = mapped_column(String(16), default="CAPTURED", server_default="CAPTURED")
+    capture_error: Mapped[Optional[str]] = mapped_column(Text)
+    capture_attempted_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
     created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
@@ -679,18 +686,32 @@ class InvestigationReplaySnapshot(Base):
     operator's forensic signal of "what the engine knew then vs. what
     hindsight now shows".
 
-    One row per case (UPSERT). Recapture is explicit — the prior
-    captured_at_ms / payload are overwritten only when the operator
-    or worker calls replay_capture with `force=True`.
+    Integrity Repair Pass (2026-05-24): the snapshot table is now
+    APPEND-ONLY. Each capture inserts a new row with an incrementing
+    `revision`; `is_active=True` marks the current active snapshot.
+    Recapture flips the prior active row to `is_active=False` and
+    inserts a new active row. Prior payloads are never destroyed —
+    the FROZEN audit primitive now has a preserved history. Reads that
+    want "the current frozen" filter on `is_active=True`.
     """
 
     __tablename__ = "investigation_replay_snapshots"
     __table_args__ = (
-        UniqueConstraint("investigation_id", name="uq_inv_replay_snapshot_case"),
+        # Replaces the previous unique-on-investigation_id constraint.
+        # Uniqueness is now on the (case, revision) pair so revisions
+        # are addressable and ordered.
+        UniqueConstraint("investigation_id", "revision", name="uq_inv_replay_snapshot_revision"),
+        Index("ix_inv_replay_snapshot_case_active", "investigation_id", "is_active"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     investigation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Monotonic 1..N per case. Starts at 1 on first capture, ++ on each
+    # recapture. Stable identifier for diff_revisions.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    # Exactly one active row per case (the most recent capture). Older
+    # revisions stay forever with is_active=False as audit evidence.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     captured_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # The "case time" the snapshot represents. Typically the
     # investigation's replay_anchor_ms; may diverge if the operator
@@ -704,6 +725,9 @@ class InvestigationReplaySnapshot(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     # Bytes of payload — surfaced so the operator can see storage cost.
     payload_size: Mapped[int] = mapped_column(Integer, default=0)
+    # Section names that errored at capture time (review §3.6).
+    # Empty / NULL = clean capture.
+    sections_with_errors_json: Mapped[Optional[str]] = mapped_column(Text)
 
 
 class InvestigationEvent(Base):

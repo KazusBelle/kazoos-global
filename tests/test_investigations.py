@@ -385,50 +385,154 @@ def test_export_404_for_missing(db):
 # ─── Pass A: Phase 19 Replay Intelligence ─────────────────────────────
 
 
-def test_auto_capture_on_create(db):
+def test_create_leaves_case_in_pending_status(db):
+    """Integrity Repair Pass §4: case creation no longer captures
+    inline; lands in PENDING for the worker to drain."""
     case = research.investigation_create(db, title="t", created_by=1)
-    # Auto-capture should have fired at creation time.
-    snap = research._replay_load_snapshot(db, case["id"])
+    assert case["capture_status"] == "PENDING"
+    # No snapshot row yet.
+    assert research._replay_load_snapshot(db, case["id"]) is None
+
+
+def test_capture_pending_drains_queue(db):
+    """Worker drain path: PENDING → CAPTURED + snapshot row created."""
+    case_a = research.investigation_create(db, title="a", created_by=1)
+    case_b = research.investigation_create(db, title="b", created_by=1)
+    result = research.investigation_capture_pending(db, limit=10)
+    assert set(result["captured_ids"]) >= {case_a["id"], case_b["id"]}
+    detail = research.investigation_detail(db, case_a["id"])
+    assert detail["capture_status"] == "CAPTURED"
+    snap = research._replay_load_snapshot(db, case_a["id"])
     assert snap is not None
-    assert snap["captured_kind"] == "auto_create"
-    assert snap["payload_size"] > 0
-    # Sections are present even if upstream surfaces return empty dicts.
-    payload = snap["payload"]
+    assert snap["revision"] == 1
+    assert snap["is_active"] is True
+    # All sections present in payload.
     for sec in ("operator_priorities", "sanity_audit", "crisis_genesis",
                 "adaptation_state", "narrative_causality"):
-        assert sec in payload
+        assert sec in snap["payload"]
 
 
 def test_capture_idempotent_without_force(db):
     case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
     again = research.investigation_replay_capture(db, case["id"])
     assert again["captured"] is False
-    assert "already exists" in (again.get("reason") or "")
+    assert "active snapshot exists" in (again.get("reason") or "")
 
 
-def test_recapture_with_force_overwrites_and_logs_event(db):
+def test_recapture_with_force_is_append_only(db):
+    """Integrity Repair Pass §1: recapture must NEVER destroy prior
+    payload. New revision is inserted; old revision is preserved with
+    is_active=False."""
     case = research.investigation_create(db, title="t", created_by=1)
-    first = research._replay_load_snapshot(db, case["id"])
-    import time as _t; _t.sleep(0.01)  # ensure captured_at_ms moves
+    research.investigation_capture_pending(db)
+    rev1 = research._replay_load_snapshot(db, case["id"])
+    assert rev1["revision"] == 1
+    assert rev1["is_active"] is True
+
     forced = research.investigation_replay_capture(db, case["id"], force=True, captured_by=2)
     assert forced["captured"] is True
-    second = research._replay_load_snapshot(db, case["id"])
-    assert second["captured_at_ms"] >= first["captured_at_ms"]
-    # Event log records the recapture.
+    assert forced["revision"] == 2
+
+    # Active snapshot is now rev2.
+    rev2 = research._replay_load_snapshot(db, case["id"])
+    assert rev2["revision"] == 2
+    assert rev2["is_active"] is True
+
+    # Old rev1 is preserved (append-only invariant).
+    rev1_after = research._replay_load_snapshot(db, case["id"], revision=1)
+    assert rev1_after is not None
+    assert rev1_after["is_active"] is False
+    assert rev1_after["payload"] is not None
+
+    # Event log records both captures.
     Ev = __import__("kazus_db.models", fromlist=["InvestigationEvent"]).InvestigationEvent
     types = [e.event_type for e in db.query(Ev).filter_by(investigation_id=case["id"]).all()]
     assert "replay_captured" in types
     assert "replay_recaptured" in types
 
 
+def test_replay_history_lists_all_revisions(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
+    research.investigation_replay_capture(db, case["id"], force=True, captured_by=2)
+    research.investigation_replay_capture(db, case["id"], force=True, captured_by=3)
+    hist = research.investigation_replay_history(db, case["id"])
+    assert hist["found"] is True
+    assert hist["total_revisions"] == 3
+    assert hist["active_revision"] == 3
+    revs = [r["revision"] for r in hist["revisions"]]
+    assert revs == [1, 2, 3]
+    actives = [r["is_active"] for r in hist["revisions"]]
+    assert actives == [False, False, True]
+
+
+def test_replay_diff_revisions_uses_same_delta(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
+    research.investigation_replay_capture(db, case["id"], force=True)
+    diff = research.investigation_replay_diff_revisions(db, case["id"])
+    assert diff["found"] is True
+    assert diff["comparison_mode"] == "frozen_vs_frozen"
+    assert diff["from_revision"] == 1
+    assert diff["to_revision"] == 2
+    # Same revision == empty diff.
+    same = research.investigation_replay_diff_revisions(
+        db, case["id"], from_revision=1, to_revision=1,
+    )
+    assert same["diff_count"] == 0
+
+
+def test_replay_diff_carries_explicit_comparison_mode(db):
+    """Integrity Repair Pass §2: diff response must declare
+    comparison_mode so the UI cannot mis-label the comparison source."""
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
+    diff = research.investigation_replay_diff(db, case["id"])
+    assert diff["comparison_mode"] == "frozen_vs_now"
+
+
+def test_capture_retry_resets_failed_to_pending(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    # Simulate a failed capture.
+    from kazus_db.models import Investigation
+    row = db.query(Investigation).filter_by(id=case["id"]).first()
+    row.capture_status = "FAILED"
+    row.capture_error = "synthetic failure"
+    db.commit()
+    out = research.investigation_capture_retry(db, case["id"])
+    assert out["requeued"] is True
+    refreshed = research.investigation_detail(db, case["id"])
+    assert refreshed["capture_status"] == "PENDING"
+    assert refreshed["capture_error"] is None
+
+
 def test_state_frozen_returns_snapshot(db):
     case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
     state = research.investigation_replay_state(db, case["id"], mode="frozen")
     assert state["found"] is True
     assert state["mode"] == "frozen"
     assert state["is_frozen"] is True
     assert state["snapshot_present"] is True
     assert state["payload"] is not None
+    assert state["revision"] == 1
+    assert state["is_active"] is True
+
+
+def test_state_frozen_by_revision(db):
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
+    research.investigation_replay_capture(db, case["id"], force=True)
+    # Load archived revision 1 explicitly.
+    s = research.investigation_replay_state(db, case["id"], mode="frozen", revision=1)
+    assert s["snapshot_present"] is True
+    assert s["revision"] == 1
+    assert s["is_active"] is False
+    # Bogus revision → snapshot_present=False with explicit warning.
+    s_missing = research.investigation_replay_state(db, case["id"], mode="frozen", revision=999)
+    assert s_missing["snapshot_present"] is False
+    assert "revision 999" in (s_missing.get("warning") or "")
 
 
 def test_state_live_reconstructs_at_anchor(db):
@@ -464,22 +568,82 @@ def test_replay_timeline_includes_case_events_in_window(db):
 
 def test_replay_diff_no_drift_immediately_after_capture(db):
     case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_capture_pending(db)
     diff = research.investigation_replay_diff(db, case["id"])
     assert diff["found"] is True
     assert diff["frozen_present"] is True
+    assert diff["comparison_mode"] == "frozen_vs_now"
     # Right after capture, no drift expected (live surfaces == frozen).
     assert diff["diff_count"] == 0
 
 
 def test_replay_diff_without_snapshot(db):
+    """PENDING case (not yet captured) → frozen_present=False."""
     case = research.investigation_create(db, title="t", created_by=1)
-    # Remove the auto-captured snapshot to simulate the no-snapshot case.
-    from kazus_db.models import InvestigationReplaySnapshot
-    db.query(InvestigationReplaySnapshot).filter_by(investigation_id=case["id"]).delete()
-    db.commit()
     diff = research.investigation_replay_diff(db, case["id"])
     assert diff["found"] is True
     assert diff["frozen_present"] is False
+    assert diff["comparison_mode"] == "frozen_vs_now"
+
+
+def test_evidence_link_auto_snapshots_upstream(db):
+    """Integrity Repair Pass §3: evidence link without explicit
+    snapshot auto-fetches the upstream row's content so the case
+    retains forensic continuity past retention prune."""
+    # Pre-populate an upstream alert.
+    from kazus_db.models import LiquidityAlertHistory, InvestigationEvidence
+    db.add(LiquidityAlertHistory(
+        alert_id="alert-x", symbol="BTCUSDT", kind="loss_spike",
+        severity="warn", regime="normal", confidence=0.7, priority=55.0,
+        trigger="t", started_at_ms=1000, last_seen_at_ms=2000,
+    ))
+    db.flush()
+    upstream_id = db.query(LiquidityAlertHistory).first().id
+
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_link_evidence(
+        db, case["id"], evidence_type="alert", ref_key=f"alert-{upstream_id}",
+        ref_id=upstream_id,  # no explicit snapshot
+    )
+    ev = (
+        db.query(InvestigationEvidence)
+        .filter_by(investigation_id=case["id"], evidence_type="alert")
+        .first()
+    )
+    assert ev.snapshot_json is not None
+    import json as _json
+    snap = _json.loads(ev.snapshot_json)
+    assert snap["_snapshot_kind"] == "alert"
+    assert snap["symbol"] == "BTCUSDT"
+    assert snap["kind"] == "loss_spike"
+
+
+def test_timeline_marks_pruned_upstream(db):
+    """If linked alert row is deleted (simulating retention prune),
+    timeline must surface the snapshot fallback with is_pruned=True
+    instead of silently dropping the event."""
+    from kazus_db.models import LiquidityAlertHistory
+    db.add(LiquidityAlertHistory(
+        alert_id="alert-y", symbol="ETHUSDT", kind="liquidation_burst",
+        severity="critical", regime="normal", confidence=0.8, priority=80.0,
+        trigger="x", started_at_ms=500, last_seen_at_ms=600,
+    ))
+    db.flush()
+    aid = db.query(LiquidityAlertHistory).first().id
+    case = research.investigation_create(db, title="t", created_by=1)
+    research.investigation_link_evidence(
+        db, case["id"], evidence_type="alert", ref_key=f"alert-{aid}", ref_id=aid,
+    )
+    # Now prune the upstream row.
+    db.query(LiquidityAlertHistory).filter_by(id=aid).delete()
+    db.commit()
+    tl = research.investigation_timeline(db, case["id"])
+    pruned_events = [e for e in tl["events"] if e.get("is_pruned")]
+    assert len(pruned_events) == 1
+    p = pruned_events[0]
+    assert p["source"] == "alert"
+    assert p["payload"]["symbol"] == "ETHUSDT"
+    assert "pruned upstream" in (p.get("note") or "")
 
 
 def test_replay_propagation_returns_frames(db):

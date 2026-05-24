@@ -3546,6 +3546,12 @@ class InvestigationOut(BaseModel):
     last_touched_at_ms: Optional[int] = None
     resolution_summary: Optional[str] = None
     resolved_at_ms: Optional[int] = None
+    # Integrity Repair Pass: async-capture state. PENDING right after
+    # create, CAPTURED once the worker has written a frozen snapshot,
+    # FAILED on capture error (operator can retry).
+    capture_status: str = "CAPTURED"
+    capture_error: Optional[str] = None
+    capture_attempted_at_ms: Optional[int] = None
     created_at_ms: int
     updated_at_ms: int
 
@@ -3967,12 +3973,15 @@ class ReplayCaptureIn(BaseModel):
 class ReplayCaptureOut(BaseModel):
     captured: bool
     investigation_id: int
+    revision: Optional[int] = None
+    is_active: Optional[bool] = None
     captured_at_ms: Optional[int] = None
     anchor_ms: Optional[int] = None
     captured_kind: Optional[str] = None
     captured_by: Optional[int] = None
     payload_size: Optional[int] = None
     sections: Optional[List[str]] = None
+    sections_with_errors: Optional[List[str]] = None
     reason: Optional[str] = None
 
 
@@ -4004,11 +4013,14 @@ class ReplayStateOut(BaseModel):
     mode: Optional[str] = None
     is_frozen: Optional[bool] = None
     snapshot_present: Optional[bool] = None
+    revision: Optional[int] = None
+    is_active: Optional[bool] = None
     captured_at_ms: Optional[int] = None
     anchor_ms: Optional[int] = None
     captured_kind: Optional[str] = None
     captured_by: Optional[int] = None
     payload_size: Optional[int] = None
+    sections_with_errors: Optional[List[str]] = None
     payload: Optional[dict] = None
     warning: Optional[str] = None
     at_ms: Optional[int] = None
@@ -4020,17 +4032,75 @@ async def investigation_replay_state_endpoint(
     case_id: int,
     mode: str = Query("frozen"),
     at_ms: Optional[int] = Query(None),
+    revision: Optional[int] = Query(None, ge=1),
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> ReplayStateOut:
     if mode not in ("frozen", "live"):
         raise HTTPException(status_code=400, detail=f"unknown mode: {mode}")
     result = _research.investigation_replay_state(
-        db, case_id, mode=mode, at_ms=at_ms,
+        db, case_id, mode=mode, at_ms=at_ms, revision=revision,
     )
     if not result.get("found"):
         raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
     return ReplayStateOut(**result)
+
+
+class ReplaySnapshotRevision(BaseModel):
+    revision: int
+    is_active: bool
+    captured_at_ms: int
+    anchor_ms: Optional[int] = None
+    captured_kind: str
+    captured_by: Optional[int] = None
+    payload_size: int
+    sections_with_errors: List[str] = []
+
+
+class ReplayHistoryOut(BaseModel):
+    found: bool
+    id: int
+    revisions: List[ReplaySnapshotRevision] = []
+    active_revision: Optional[int] = None
+    total_revisions: int = 0
+
+
+@router.get("/research/investigations/{case_id}/replay/history", response_model=ReplayHistoryOut)
+async def investigation_replay_history_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayHistoryOut:
+    """Append-only snapshot history (Integrity Repair Pass §1). Lists
+    every revision ever captured for the case, with the active pointer
+    explicit. Payloads are NOT included — use /replay/state?revision=N
+    to fetch any individual revision."""
+    result = _research.investigation_replay_history(db, case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return ReplayHistoryOut(**result)
+
+
+class ReplayCaptureRetryOut(BaseModel):
+    status: str
+    requeued: bool
+    reason: Optional[str] = None
+
+
+@router.post("/research/investigations/{case_id}/replay/retry", response_model=ReplayCaptureRetryOut)
+async def investigation_replay_retry_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayCaptureRetryOut:
+    """Operator-initiated retry of a FAILED capture. Resets
+    capture_status to PENDING; the worker capture loop picks it up
+    on next tick."""
+    try:
+        result = _research.investigation_capture_retry(db, case_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ReplayCaptureRetryOut(**result)
 
 
 class ReplayKeyframe(BaseModel):
@@ -4083,10 +4153,19 @@ class ReplayDiffEntry(BaseModel):
 class ReplayDiffOut(BaseModel):
     found: bool
     id: int
+    # Integrity Repair Pass: explicit comparison source. UI must read
+    # this and label accordingly. Never silently render as a temporal
+    # cursor comparison.
+    comparison_mode: str = "frozen_vs_now"
     frozen_present: bool = False
+    frozen_revision: Optional[int] = None
     frozen_captured_at_ms: Optional[int] = None
     frozen_age_seconds: Optional[int] = None
     live_computed_at_ms: Optional[int] = None
+    from_revision: Optional[int] = None
+    to_revision: Optional[int] = None
+    from_captured_at_ms: Optional[int] = None
+    to_captured_at_ms: Optional[int] = None
     diffs: List[ReplayDiffEntry] = []
     diff_count: Optional[int] = None
     summary: str = ""
@@ -4098,7 +4177,29 @@ async def investigation_replay_diff_endpoint(
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> ReplayDiffOut:
+    """FROZEN-vs-NOW diff at the case anchor. The response carries
+    `comparison_mode='frozen_vs_now'` explicitly — the operator UI
+    must label accordingly and not render it as a cursor comparison."""
     result = _research.investigation_replay_diff(db, case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return ReplayDiffOut(**result)
+
+
+@router.get("/research/investigations/{case_id}/replay/diff/revisions", response_model=ReplayDiffOut)
+async def investigation_replay_diff_revisions_endpoint(
+    case_id: int,
+    from_revision: Optional[int] = Query(None, ge=1),
+    to_revision: Optional[int] = Query(None, ge=1),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> ReplayDiffOut:
+    """FROZEN-vs-FROZEN diff between two snapshot revisions. Defaults
+    to revision 1 vs the active revision. Response carries
+    `comparison_mode='frozen_vs_frozen'`."""
+    result = _research.investigation_replay_diff_revisions(
+        db, case_id, from_revision=from_revision, to_revision=to_revision,
+    )
     if not result.get("found"):
         raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
     return ReplayDiffOut(**result)

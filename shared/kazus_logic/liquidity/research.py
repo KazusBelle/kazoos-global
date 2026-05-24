@@ -8140,6 +8140,9 @@ def _inv_to_dict(row) -> dict:
         "last_touched_at_ms": row.last_touched_at_ms,
         "resolution_summary": row.resolution_summary,
         "resolved_at_ms": row.resolved_at_ms,
+        "capture_status": getattr(row, "capture_status", "CAPTURED") or "CAPTURED",
+        "capture_error": getattr(row, "capture_error", None),
+        "capture_attempted_at_ms": getattr(row, "capture_attempted_at_ms", None),
         "created_at_ms": row.created_at_ms,
         "updated_at_ms": row.updated_at_ms,
     }
@@ -8274,6 +8277,11 @@ def investigation_create(
         collaborators_json=_inv_serialize_collaborators(collaborators),
         last_touched_by=created_by,
         last_touched_at_ms=now_ms,
+        # Async-capture queue: case lands as PENDING; the worker
+        # `investigation-capture` loop drains it.
+        capture_status="PENDING",
+        capture_error=None,
+        capture_attempted_at_ms=None,
         created_at_ms=now_ms,
         updated_at_ms=now_ms,
     )
@@ -8308,20 +8316,11 @@ def investigation_create(
     db.commit()
     db.refresh(row)
 
-    # Phase-19 auto-capture: freeze the engine surface at case-opening
-    # time so the FROZEN vs LIVE diff is anchored to "what the engine
-    # was saying when we noticed this". Failure is non-fatal — the case
-    # is already created and the operator can recapture manually.
-    try:
-        investigation_replay_capture(
-            db, row.id,
-            captured_kind=("auto_draft" if origin_kind == "auto_pre_cascade" else "auto_create"),
-            captured_by=created_by,
-            anchor_ms=replay_anchor_ms,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
+    # Integrity Repair Pass (2026-05-24): auto-capture moved out of the
+    # create-request path. The case is now PENDING and the worker
+    # `investigation-capture` loop picks it up on its next tick. This
+    # keeps case creation fast (no inline 8-layer intelligence cascade)
+    # and decouples create-success from cache warmth.
     return _inv_to_dict(row)
 
 
@@ -8639,6 +8638,79 @@ def investigation_add_note(
     }
 
 
+def _investigation_snapshot_upstream(
+    db: Session,
+    *,
+    evidence_type: str,
+    ref_id: Optional[int],
+    ref_key: str,
+) -> Optional[dict]:
+    """Best-effort fetch of the upstream row's content for retention
+    safety (Integrity Repair Pass §3). Called at evidence-link time
+    when no operator-supplied snapshot is provided. Returns a plain
+    dict suitable for `evidence.snapshot_json`, or None if no upstream
+    backing exists (e.g. `symbol` evidence has no row to snapshot).
+
+    Failures swallow — partial snapshot is better than blocking the
+    link. Caller decides whether to populate `snapshot_json`."""
+    from kazus_db.models import (
+        LiquidityAlertHistory,
+        LiquidityAnomalyMemory,
+        OperatorPriorityHistory,
+    )
+    try:
+        if evidence_type == "alert" and ref_id is not None:
+            r = db.query(LiquidityAlertHistory).filter(LiquidityAlertHistory.id == ref_id).first()
+            if r is None:
+                return None
+            return {
+                "_snapshot_kind": "alert",
+                "id": r.id, "alert_id": r.alert_id, "symbol": r.symbol,
+                "kind": r.kind, "severity": r.severity, "regime": r.regime,
+                "confidence": r.confidence, "priority": r.priority,
+                "trigger": r.trigger, "started_at_ms": r.started_at_ms,
+                "last_seen_at_ms": r.last_seen_at_ms,
+                "validated_outcome": r.validated_outcome,
+            }
+        if evidence_type == "anomaly" and ref_id is not None:
+            r = db.query(LiquidityAnomalyMemory).filter(LiquidityAnomalyMemory.id == ref_id).first()
+            if r is None:
+                return None
+            return {
+                "_snapshot_kind": "anomaly",
+                "id": r.id, "kind": r.kind, "severity": r.severity,
+                "occurred_at_ms": r.occurred_at_ms,
+                "novelty_score": r.novelty_score,
+                "recurrence_count": r.recurrence_count,
+                "notes": r.notes,
+            }
+        if evidence_type == "operator_priority":
+            r = (
+                db.query(OperatorPriorityHistory)
+                .filter(OperatorPriorityHistory.priority_key == ref_key)
+                .first()
+            )
+            if r is None:
+                return None
+            return {
+                "_snapshot_kind": "operator_priority",
+                "priority_key": r.priority_key,
+                "source_layer": r.source_layer, "kind": r.kind,
+                "headline": r.headline, "detail": r.detail,
+                "priority_score": r.priority_score,
+                "current_escalation": r.current_escalation,
+                "current_lifecycle": r.current_lifecycle,
+                "current_status": r.current_status,
+                "first_seen_at_ms": r.first_seen_at_ms,
+                "last_seen_at_ms": r.last_seen_at_ms,
+                "peak_priority_score": r.peak_priority_score,
+                "peak_escalation": r.peak_escalation,
+            }
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _investigation_link_evidence_inner(
     db: Session,
     *,
@@ -8669,12 +8741,21 @@ def _investigation_link_evidence_inner(
     )
     if existing is not None:
         return existing.id
+    # Retention-safe property (Integrity Repair Pass §3): if the caller
+    # didn't pass a snapshot, fetch the upstream row content NOW so
+    # the case retains the evidence even after the upstream table is
+    # pruned. Best-effort — None means "no upstream row to snapshot".
+    effective_snapshot = snapshot
+    if effective_snapshot is None:
+        effective_snapshot = _investigation_snapshot_upstream(
+            db, evidence_type=evidence_type, ref_id=ref_id, ref_key=ref_key_clean,
+        )
     ev = InvestigationEvidence(
         investigation_id=case_id,
         evidence_type=evidence_type,
         ref_id=ref_id,
         ref_key=ref_key_clean,
-        snapshot_json=_json.dumps(snapshot) if snapshot is not None else None,
+        snapshot_json=_json.dumps(effective_snapshot) if effective_snapshot is not None else None,
         note=note,
         linked_at_ms=_inv_now_ms(),
         linked_by=linked_by,
@@ -8683,7 +8764,12 @@ def _investigation_link_evidence_inner(
     db.flush()
     _inv_log_event(db, case_id=case_id, event_type="evidence_linked",
                    actor_id=linked_by,
-                   payload={"evidence_type": evidence_type, "ref_key": ref_key_clean, "ref_id": ref_id},
+                   payload={
+                       "evidence_type": evidence_type,
+                       "ref_key": ref_key_clean,
+                       "ref_id": ref_id,
+                       "snapshot_captured": effective_snapshot is not None,
+                   },
                    note=note)
     return ev.id
 
@@ -8839,6 +8925,7 @@ def investigation_timeline(
                 "source": "operator_priority",
                 "event_type": oe.event_type,
                 "actor_id": None,
+                "is_pruned": False,
                 "payload": {
                     "priority_key": oe.priority_key,
                     "source_layer": oe.source_layer,
@@ -8850,24 +8937,58 @@ def investigation_timeline(
                 "note": oe.note,
             })
 
+    # Retention-safe fallback (Integrity Repair Pass §3): for each
+    # linked evidence whose live upstream row is missing (pruned),
+    # surface the snapshot stored in evidence.snapshot_json as a
+    # timeline entry with `is_pruned=True` so the operator sees the
+    # gap explicitly rather than a silently-shrinking timeline.
+    import json as _json
     if alert_ids:
         alerts = (
             db.query(LiquidityAlertHistory)
             .filter(LiquidityAlertHistory.id.in_(alert_ids))
             .all()
         )
+        live_alert_ids = {a.id for a in alerts}
         for a in alerts:
             events.append({
                 "ts_ms": a.started_at_ms,
                 "source": "alert",
                 "event_type": f"alert:{a.kind}",
                 "actor_id": None,
+                "is_pruned": False,
                 "payload": {
                     "alert_id": a.id, "symbol": a.symbol, "severity": a.severity,
                     "confidence": a.confidence, "priority": a.priority,
                     "validated_outcome": a.validated_outcome,
                 },
                 "note": (a.trigger or None),
+            })
+        # Pruned alerts: use evidence.snapshot_json fallback.
+        for ev_row in [e for e in evidence if e.evidence_type == "alert"
+                       and e.ref_id is not None and e.ref_id not in live_alert_ids]:
+            try:
+                snap = _json.loads(ev_row.snapshot_json) if ev_row.snapshot_json else None
+            except Exception:  # noqa: BLE001
+                snap = None
+            ts = (snap or {}).get("started_at_ms") or ev_row.linked_at_ms
+            events.append({
+                "ts_ms": ts,
+                "source": "alert",
+                "event_type": f"alert:{(snap or {}).get('kind', 'unknown')}",
+                "actor_id": None,
+                "is_pruned": True,
+                "payload": {
+                    "alert_id": ev_row.ref_id,
+                    "symbol": (snap or {}).get("symbol"),
+                    "severity": (snap or {}).get("severity"),
+                    "source": "evidence_snapshot",
+                },
+                "note": (
+                    "(pruned upstream; reconstructed from evidence snapshot)"
+                    if snap is not None else
+                    "(pruned upstream; no snapshot was captured at link time)"
+                ),
             })
 
     if anomaly_ids:
@@ -8876,18 +8997,44 @@ def investigation_timeline(
             .filter(LiquidityAnomalyMemory.id.in_(anomaly_ids))
             .all()
         )
+        live_anom_ids = {a.id for a in anoms}
         for an in anoms:
             events.append({
                 "ts_ms": an.occurred_at_ms,
                 "source": "anomaly",
                 "event_type": f"anomaly:{an.kind}",
                 "actor_id": None,
+                "is_pruned": False,
                 "payload": {
                     "anomaly_id": an.id, "severity": an.severity,
                     "novelty_score": an.novelty_score,
                     "recurrence_count": an.recurrence_count,
                 },
                 "note": an.notes,
+            })
+        for ev_row in [e for e in evidence if e.evidence_type == "anomaly"
+                       and e.ref_id is not None and e.ref_id not in live_anom_ids]:
+            try:
+                snap = _json.loads(ev_row.snapshot_json) if ev_row.snapshot_json else None
+            except Exception:  # noqa: BLE001
+                snap = None
+            ts = (snap or {}).get("occurred_at_ms") or ev_row.linked_at_ms
+            events.append({
+                "ts_ms": ts,
+                "source": "anomaly",
+                "event_type": f"anomaly:{(snap or {}).get('kind', 'unknown')}",
+                "actor_id": None,
+                "is_pruned": True,
+                "payload": {
+                    "anomaly_id": ev_row.ref_id,
+                    "severity": (snap or {}).get("severity"),
+                    "source": "evidence_snapshot",
+                },
+                "note": (
+                    "(pruned upstream; reconstructed from evidence snapshot)"
+                    if snap is not None else
+                    "(pruned upstream; no snapshot was captured at link time)"
+                ),
             })
 
     if symbols:
@@ -9739,15 +9886,22 @@ def investigation_replay_capture(
 ) -> dict:
     """Capture (or recapture) the frozen replay snapshot for a case.
 
-    If a snapshot already exists and `force=False`, returns the existing
-    row unchanged. With `force=True` the payload is overwritten and a
-    `replay_recaptured` event is logged on the case. This is the only
-    write path for `investigation_replay_snapshots`.
+    Integrity Repair Pass (2026-05-24): APPEND-ONLY. Each capture
+    inserts a new row with the next `revision` (1..N) and marks it
+    `is_active=True`. The previously-active row is flipped to
+    `is_active=False` but its payload is preserved forever — the
+    FROZEN audit primitive now has a chain of revisions you can diff
+    and audit, not a destructive overwrite.
+
+    If `force=False` and an active snapshot already exists, returns
+    that existing row unchanged (this is what auto-capture does to be
+    idempotent on retry). With `force=True` a new revision is always
+    written, even on top of an identical payload — the operator is
+    explicitly choosing to mark "I've re-validated as of now".
 
     `captured_kind` is one of: 'auto_create' | 'auto_draft' |
-    'operator_recapture'. Auto-capture from `investigation_create` uses
-    'auto_create'; the worker's auto-draft uses 'auto_draft' via the
-    create function; operator-triggered recapture uses the default.
+    'operator_recapture'. The worker capture loop uses 'auto_create'
+    when draining the PENDING queue.
     """
     import json as _json
     from kazus_db.models import Investigation, InvestigationReplaySnapshot
@@ -9756,89 +9910,353 @@ def investigation_replay_capture(
         raise LookupError(f"investigation {case_id} not found")
     if captured_kind not in ("auto_create", "auto_draft", "operator_recapture"):
         raise ValueError(f"unknown captured_kind: {captured_kind}")
-    existing = (
+
+    active_existing = (
         db.query(InvestigationReplaySnapshot)
         .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+        .filter(InvestigationReplaySnapshot.is_active == True)  # noqa: E712
         .first()
     )
-    if existing is not None and not force:
+    if active_existing is not None and not force:
         return {
             "captured": False,
-            "reason": "snapshot already exists; pass force=true to recapture",
+            "reason": "active snapshot exists; pass force=true to write a new revision",
             "investigation_id": case_id,
-            "captured_at_ms": existing.captured_at_ms,
-            "captured_kind": existing.captured_kind,
-            "payload_size": existing.payload_size,
+            "revision": active_existing.revision,
+            "captured_at_ms": active_existing.captured_at_ms,
+            "captured_kind": active_existing.captured_kind,
+            "payload_size": active_existing.payload_size,
+            "is_active": True,
         }
 
     payload = _replay_capture_payload(db)
+    sections_with_errors = sorted(
+        k for k, v in payload.items()
+        if isinstance(v, dict) and "error" in v and k not in ("version", "captured_at_ms")
+    )
     blob = _json.dumps(payload, separators=(",", ":"))
     now_ms = _inv_now_ms()
     eff_anchor = anchor_ms if anchor_ms is not None else case.replay_anchor_ms
 
-    if existing is None:
-        row = InvestigationReplaySnapshot(
-            investigation_id=case_id,
-            captured_at_ms=now_ms,
-            anchor_ms=eff_anchor,
-            captured_kind=captured_kind,
-            captured_by=captured_by,
-            payload_json=blob,
-            payload_size=len(blob),
-        )
-        db.add(row)
-        _inv_log_event(db, case_id=case_id, event_type="replay_captured",
-                       actor_id=captured_by,
-                       payload={"captured_kind": captured_kind,
-                                "payload_size": len(blob)})
-    else:
-        existing.captured_at_ms = now_ms
-        existing.anchor_ms = eff_anchor
-        existing.captured_kind = captured_kind
-        existing.captured_by = captured_by
-        existing.payload_json = blob
-        existing.payload_size = len(blob)
-        _inv_log_event(db, case_id=case_id, event_type="replay_recaptured",
-                       actor_id=captured_by,
-                       payload={"captured_kind": captured_kind,
-                                "payload_size": len(blob),
-                                "previous_captured_at_ms": existing.captured_at_ms})
+    # Determine the next revision and flip the prior active row, if any.
+    max_rev = (
+        db.query(InvestigationReplaySnapshot)
+        .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+        .order_by(InvestigationReplaySnapshot.revision.desc())
+        .first()
+    )
+    next_rev = (max_rev.revision + 1) if max_rev is not None else 1
+
+    if active_existing is not None:
+        # Force=true path: retire the prior active.
+        active_existing.is_active = False
+
+    row = InvestigationReplaySnapshot(
+        investigation_id=case_id,
+        revision=next_rev,
+        is_active=True,
+        captured_at_ms=now_ms,
+        anchor_ms=eff_anchor,
+        captured_kind=captured_kind,
+        captured_by=captured_by,
+        payload_json=blob,
+        payload_size=len(blob),
+        sections_with_errors_json=_json.dumps(sections_with_errors) if sections_with_errors else None,
+    )
+    db.add(row)
+    _inv_log_event(
+        db, case_id=case_id,
+        event_type=("replay_recaptured" if active_existing is not None else "replay_captured"),
+        actor_id=captured_by,
+        payload={
+            "revision": next_rev,
+            "captured_kind": captured_kind,
+            "payload_size": len(blob),
+            "sections_with_errors": sections_with_errors,
+            "previous_revision": (active_existing.revision if active_existing is not None else None),
+        },
+    )
+
+    # Async-capture status bookkeeping: success marks CAPTURED + clears error.
+    case.capture_status = "CAPTURED"
+    case.capture_error = None
+    case.capture_attempted_at_ms = now_ms
 
     db.commit()
     return {
         "captured": True,
         "investigation_id": case_id,
+        "revision": next_rev,
         "captured_at_ms": now_ms,
         "anchor_ms": eff_anchor,
         "captured_kind": captured_kind,
         "captured_by": captured_by,
         "payload_size": len(blob),
         "sections": [k for k in payload if k not in ("version", "captured_at_ms")],
+        "sections_with_errors": sections_with_errors,
+        "is_active": True,
     }
 
 
-def _replay_load_snapshot(db: Session, case_id: int) -> Optional[dict]:
+def investigation_capture_pending(db: Session, limit: int = 20) -> dict:
+    """Worker entry point: drain the PENDING capture queue.
+
+    Called by the worker `investigation-capture` loop. Picks oldest
+    PENDING cases first (so a backlog drains in FIFO order). Each
+    capture is committed independently so a single bad case does not
+    block the queue. Failures flip `capture_status` to FAILED with
+    `capture_error` recorded — re-enqueue is an explicit operator
+    action (no silent infinite retry).
+    """
+    from kazus_db.models import Investigation
+    cases = (
+        db.query(Investigation)
+        .filter(Investigation.capture_status == "PENDING")
+        .order_by(Investigation.created_at_ms.asc())
+        .limit(max(1, min(100, limit)))
+        .all()
+    )
+    captured_ids: List[int] = []
+    failed_ids: List[int] = []
+    for c in cases:
+        try:
+            investigation_replay_capture(
+                db, c.id,
+                captured_kind=("auto_draft" if c.origin_kind == "auto_pre_cascade" else "auto_create"),
+                captured_by=c.created_by,
+                anchor_ms=c.replay_anchor_ms,
+            )
+            captured_ids.append(c.id)
+        except Exception as exc:  # noqa: BLE001
+            c.capture_status = "FAILED"
+            c.capture_error = str(exc)[:1024]
+            c.capture_attempted_at_ms = _inv_now_ms()
+            db.commit()
+            failed_ids.append(c.id)
+    return {
+        "drained": len(cases),
+        "captured_ids": captured_ids,
+        "failed_ids": failed_ids,
+    }
+
+
+def investigation_capture_retry(db: Session, case_id: int) -> dict:
+    """Operator-initiated retry of a FAILED capture. Resets status to
+    PENDING; the worker picks it up on next tick (or the operator can
+    POST /replay/capture force=true to do it inline)."""
+    from kazus_db.models import Investigation
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        raise LookupError(f"investigation {case_id} not found")
+    if case.capture_status not in ("FAILED", "PENDING"):
+        return {"status": case.capture_status, "requeued": False,
+                "reason": f"capture_status is {case.capture_status}; nothing to retry"}
+    case.capture_status = "PENDING"
+    case.capture_error = None
+    db.commit()
+    return {"status": "PENDING", "requeued": True}
+
+
+def _replay_load_snapshot(
+    db: Session, case_id: int, *, revision: Optional[int] = None,
+) -> Optional[dict]:
+    """Load a snapshot row for a case. Default: the currently-active
+    revision. Pass `revision=N` to load an archived revision."""
     import json as _json
     from kazus_db.models import InvestigationReplaySnapshot
-    row = (
+    q = (
         db.query(InvestigationReplaySnapshot)
         .filter(InvestigationReplaySnapshot.investigation_id == case_id)
-        .first()
     )
+    if revision is not None:
+        q = q.filter(InvestigationReplaySnapshot.revision == revision)
+    else:
+        q = q.filter(InvestigationReplaySnapshot.is_active == True)  # noqa: E712
+    row = q.first()
     if row is None:
         return None
     try:
         payload = _json.loads(row.payload_json)
     except Exception:  # noqa: BLE001
         payload = {"error": "snapshot payload could not be parsed"}
+    try:
+        sections_with_errors = (
+            _json.loads(row.sections_with_errors_json) if row.sections_with_errors_json else []
+        )
+    except Exception:  # noqa: BLE001
+        sections_with_errors = []
     return {
         "investigation_id": case_id,
+        "revision": row.revision,
+        "is_active": row.is_active,
         "captured_at_ms": row.captured_at_ms,
         "anchor_ms": row.anchor_ms,
         "captured_kind": row.captured_kind,
         "captured_by": row.captured_by,
         "payload_size": row.payload_size,
         "payload": payload,
+        "sections_with_errors": sections_with_errors,
+    }
+
+
+def investigation_replay_history(db: Session, case_id: int) -> dict:
+    """Return the full append-only snapshot history for a case.
+
+    Reads the snapshot table only — no payload deserialization, just
+    metadata so the operator (and audit tooling) can see the chain of
+    captures. Use `investigation_replay_state(mode='frozen',
+    revision=N)` to fetch a specific revision's payload."""
+    from kazus_db.models import Investigation, InvestigationReplaySnapshot
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "revisions": []}
+    rows = (
+        db.query(InvestigationReplaySnapshot)
+        .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+        .order_by(InvestigationReplaySnapshot.revision.asc())
+        .all()
+    )
+    import json as _json
+    revisions = []
+    for r in rows:
+        try:
+            sections_with_errors = (
+                _json.loads(r.sections_with_errors_json) if r.sections_with_errors_json else []
+            )
+        except Exception:  # noqa: BLE001
+            sections_with_errors = []
+        revisions.append({
+            "revision": r.revision,
+            "is_active": r.is_active,
+            "captured_at_ms": r.captured_at_ms,
+            "anchor_ms": r.anchor_ms,
+            "captured_kind": r.captured_kind,
+            "captured_by": r.captured_by,
+            "payload_size": r.payload_size,
+            "sections_with_errors": sections_with_errors,
+        })
+    active_rev = next((r["revision"] for r in revisions if r["is_active"]), None)
+    return {
+        "found": True,
+        "id": case_id,
+        "revisions": revisions,
+        "active_revision": active_rev,
+        "total_revisions": len(revisions),
+    }
+
+
+def _replay_payload_delta(before: dict, after: dict) -> List[dict]:
+    """Shared semantic-delta logic used by both vs-now diff and
+    revision-vs-revision diff. Same fields, same thresholds — keeps
+    operator semantics identical regardless of comparison source."""
+    diffs: List[dict] = []
+
+    def _add(field: str, b, a, delta: str) -> None:
+        diffs.append({"field": field, "before": b, "after": a, "delta": delta})
+
+    # crisis_genesis verdict + score
+    fg = before.get("crisis_genesis") or {}
+    lg = after.get("crisis_genesis") or {}
+    if isinstance(fg, dict) and isinstance(lg, dict):
+        if fg.get("verdict") != lg.get("verdict"):
+            _add("crisis_genesis.verdict", fg.get("verdict"), lg.get("verdict"),
+                 f"{fg.get('verdict')} → {lg.get('verdict')}")
+        fs, ls = fg.get("genesis_score"), lg.get("genesis_score")
+        if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and abs(ls - fs) >= 5:
+            _add("crisis_genesis.genesis_score", fs, ls, f"{fs:.0f} → {ls:.0f} ({ls - fs:+.0f})")
+
+    fs_a = before.get("sanity_audit") or {}
+    ls_a = after.get("sanity_audit") or {}
+    if fs_a.get("overall_state") != ls_a.get("overall_state"):
+        _add("sanity_audit.overall_state",
+             fs_a.get("overall_state"), ls_a.get("overall_state"),
+             f"{fs_a.get('overall_state')} → {ls_a.get('overall_state')}")
+
+    fa = (before.get("adaptation_state") or {}).get("modifiers") or {}
+    la = (after.get("adaptation_state") or {}).get("modifiers") or {}
+    for mod_name in set(fa) | set(la):
+        f_val = fa.get(mod_name)
+        l_val = la.get(mod_name)
+        if (isinstance(f_val, (int, float)) and isinstance(l_val, (int, float))
+                and abs(l_val - f_val) >= 0.05):
+            _add(f"adaptation.{mod_name}", round(f_val, 2), round(l_val, 2),
+                 f"{f_val:.2f} → {l_val:.2f}")
+
+    fop = before.get("operator_priorities") or {}
+    lop = after.get("operator_priorities") or {}
+    if fop.get("total_items") != lop.get("total_items"):
+        _add("operator_priorities.total_items",
+             fop.get("total_items"), lop.get("total_items"),
+             f"{fop.get('total_items')} → {lop.get('total_items')}")
+    fec = fop.get("escalation_counts") or {}
+    lec = lop.get("escalation_counts") or {}
+    for lvl in ("CRITICAL", "IMPORTANT", "WATCH"):
+        if fec.get(lvl, 0) != lec.get(lvl, 0):
+            _add(f"operator_priorities.escalation.{lvl}",
+                 fec.get(lvl, 0), lec.get(lvl, 0),
+                 f"{fec.get(lvl, 0)} → {lec.get(lvl, 0)}")
+
+    fn = before.get("narrative_causality") or {}
+    ln = after.get("narrative_causality") or {}
+    if fn.get("headline") and ln.get("headline") and fn["headline"] != ln["headline"]:
+        _add("narrative.headline", fn["headline"], ln["headline"], "headline changed")
+
+    return diffs
+
+
+def investigation_replay_diff_revisions(
+    db: Session,
+    case_id: int,
+    *,
+    from_revision: Optional[int] = None,
+    to_revision: Optional[int] = None,
+) -> dict:
+    """FROZEN-vs-FROZEN diff between two snapshot revisions of the
+    same case. Uses the identical semantic-delta as the vs-now diff
+    (`_replay_payload_delta`), so the operator sees the same fields
+    in the same wording — only the comparison source differs.
+
+    Defaults: `from_revision`=1 (oldest), `to_revision`=active. Both
+    revisions must exist; the active revision is always present after
+    the first capture."""
+    history = investigation_replay_history(db, case_id)
+    if not history.get("found"):
+        return {"found": False, "id": case_id, "comparison_mode": "frozen_vs_frozen",
+                "diffs": [], "diff_count": 0, "summary": "case not found"}
+    revisions = history["revisions"]
+    if not revisions:
+        return {"found": True, "id": case_id, "comparison_mode": "frozen_vs_frozen",
+                "diffs": [], "diff_count": 0, "summary": "no snapshots yet"}
+    eff_from = from_revision if from_revision is not None else revisions[0]["revision"]
+    eff_to = to_revision if to_revision is not None else (history.get("active_revision") or revisions[-1]["revision"])
+    if eff_from == eff_to:
+        return {"found": True, "id": case_id, "comparison_mode": "frozen_vs_frozen",
+                "from_revision": eff_from, "to_revision": eff_to,
+                "diffs": [], "diff_count": 0, "summary": "same revision — diff is empty by construction"}
+    snap_from = _replay_load_snapshot(db, case_id, revision=eff_from)
+    snap_to = _replay_load_snapshot(db, case_id, revision=eff_to)
+    if snap_from is None or snap_to is None:
+        missing = [r for r, s in ((eff_from, snap_from), (eff_to, snap_to)) if s is None]
+        return {"found": True, "id": case_id, "comparison_mode": "frozen_vs_frozen",
+                "from_revision": eff_from, "to_revision": eff_to,
+                "diffs": [], "diff_count": 0,
+                "summary": f"revision(s) {missing} not found"}
+    diffs = _replay_payload_delta(snap_from["payload"] or {}, snap_to["payload"] or {})
+    return {
+        "found": True,
+        "id": case_id,
+        "comparison_mode": "frozen_vs_frozen",
+        "from_revision": eff_from,
+        "to_revision": eff_to,
+        "from_captured_at_ms": snap_from["captured_at_ms"],
+        "to_captured_at_ms": snap_to["captured_at_ms"],
+        "diffs": diffs,
+        "diff_count": len(diffs),
+        "summary": (
+            f"{len(diffs)} material drift(s) between revision {eff_from} and {eff_to}."
+            if diffs else
+            f"no material drift between revision {eff_from} and {eff_to}."
+        ),
     }
 
 
@@ -9999,12 +10417,14 @@ def investigation_replay_state(
     *,
     at_ms: Optional[int] = None,
     mode: str = "frozen",
+    revision: Optional[int] = None,
 ) -> dict:
-    """Return the engine's intelligence surface for a case at `at_ms`.
+    """Return the engine's intelligence surface for a case.
 
     Modes:
-      * `frozen` — read the frozen snapshot (typically captured at
-        anchor). `at_ms` is ignored; FROZEN is a single moment by design.
+      * `frozen` — read a frozen snapshot. Default is the currently
+        active revision; pass `revision=N` to read an archived one.
+        `at_ms` is ignored for frozen reads.
       * `live`   — reconstruct on the fly from history tables. `at_ms`
         defaults to the case's `replay_anchor_ms`.
 
@@ -10020,22 +10440,29 @@ def investigation_replay_state(
         raise ValueError(f"unknown mode: {mode}")
 
     if mode == "frozen":
-        snap = _replay_load_snapshot(db, case_id)
+        snap = _replay_load_snapshot(db, case_id, revision=revision)
         if snap is None:
             return {
                 "found": True, "id": case_id, "mode": "frozen",
                 "is_frozen": True, "snapshot_present": False,
                 "captured_at_ms": None, "payload": None,
-                "warning": "no frozen snapshot — call /replay/capture first",
+                "warning": (
+                    f"frozen revision {revision} not found"
+                    if revision is not None
+                    else "no frozen snapshot — call /replay/capture first"
+                ),
             }
         return {
             "found": True, "id": case_id, "mode": "frozen",
             "is_frozen": True, "snapshot_present": True,
+            "revision": snap["revision"],
+            "is_active": snap["is_active"],
             "captured_at_ms": snap["captured_at_ms"],
             "anchor_ms": snap["anchor_ms"],
             "captured_kind": snap["captured_kind"],
             "captured_by": snap["captured_by"],
             "payload_size": snap["payload_size"],
+            "sections_with_errors": snap.get("sections_with_errors") or [],
             "payload": snap["payload"],
         }
 
@@ -10176,116 +10603,67 @@ def investigation_replay_timeline(
 
 
 def investigation_replay_diff(db: Session, case_id: int) -> dict:
-    """Compute the FROZEN vs LIVE diff at the case anchor. This is the
-    forensic comparison the operator opens to see what changed in
-    interpretation since the snapshot.
+    """FROZEN-vs-NOW diff at the case anchor.
 
-    Diff scope is intentionally narrow — we compare a few semantically
-    meaningful fields (verdict labels, escalation counts, modifier
-    values), not raw JSON. Anything that drifts naturally with time
-    (timestamps, captured_at_ms) is ignored. Every reported drift
-    carries `before` + `after` + a human-readable `delta`.
+    EXPLICIT semantics (Integrity Repair Pass 2026-05-24): this
+    function compares the frozen snapshot's payload against the
+    engine's CURRENT live surface (recomputed right now). It is NOT
+    a comparison against the scrubber cursor — the replay surface
+    exposes a cursor snapshot endpoint separately for that.
+
+    Every response carries `comparison_mode = "frozen_vs_now"` so the
+    UI cannot accidentally render it as a temporal cursor comparison.
+    For revision-vs-revision diff use `investigation_replay_diff_revisions`.
     """
     from kazus_db.models import Investigation
     case = db.query(Investigation).filter(Investigation.id == case_id).first()
     if case is None:
-        return {"found": False, "id": case_id}
+        return {"found": False, "id": case_id, "comparison_mode": "frozen_vs_now"}
 
     frozen = investigation_replay_state(db, case_id, mode="frozen")
     if not frozen.get("snapshot_present"):
         return {
             "found": True, "id": case_id,
+            "comparison_mode": "frozen_vs_now",
             "frozen_present": False,
             "diffs": [],
             "summary": "no frozen snapshot — capture one to enable diff",
         }
     fp = frozen.get("payload") or {}
 
-    def _live(name: str, fn):
+    def _live(fn):
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)[:240]}
 
     live = {
-        "operator_priorities": _live("operator_priorities", lambda: operator_priorities(db)),
-        "sanity_audit":        _live("sanity_audit", lambda: sanity_audit(db)),
-        "crisis_genesis":      _live("crisis_genesis", lambda: crisis_genesis(db)),
-        "adaptation_state":    _live("adaptation_state", lambda: adaptation_state(db)),
-        "narrative_causality": _live("narrative_causality", lambda: narrative_causality(db)),
+        "operator_priorities": _live(lambda: operator_priorities(db)),
+        "sanity_audit":        _live(lambda: sanity_audit(db)),
+        "crisis_genesis":      _live(lambda: crisis_genesis(db)),
+        "adaptation_state":    _live(lambda: adaptation_state(db)),
+        "narrative_causality": _live(lambda: narrative_causality(db)),
     }
 
-    diffs: List[dict] = []
-
-    def _add(field: str, before, after, delta: str) -> None:
-        diffs.append({"field": field, "before": before, "after": after, "delta": delta})
-
-    # crisis_genesis verdict + score
-    fg = fp.get("crisis_genesis") or {}
-    lg = live.get("crisis_genesis") or {}
-    if isinstance(fg, dict) and isinstance(lg, dict):
-        if fg.get("verdict") != lg.get("verdict"):
-            _add("crisis_genesis.verdict", fg.get("verdict"), lg.get("verdict"),
-                 f"{fg.get('verdict')} → {lg.get('verdict')}")
-        fs, ls = fg.get("genesis_score"), lg.get("genesis_score")
-        if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and abs(ls - fs) >= 5:
-            _add("crisis_genesis.genesis_score", fs, ls, f"{fs:.0f} → {ls:.0f} ({ls - fs:+.0f})")
-
-    # sanity_audit overall state
-    fs_a = fp.get("sanity_audit") or {}
-    ls_a = live.get("sanity_audit") or {}
-    if fs_a.get("overall_state") != ls_a.get("overall_state"):
-        _add("sanity_audit.overall_state",
-             fs_a.get("overall_state"), ls_a.get("overall_state"),
-             f"{fs_a.get('overall_state')} → {ls_a.get('overall_state')}")
-
-    # adaptation_state modifier values
-    fa = (fp.get("adaptation_state") or {}).get("modifiers") or {}
-    la = (live.get("adaptation_state") or {}).get("modifiers") or {}
-    for mod_name in set(fa) | set(la):
-        f_val = fa.get(mod_name)
-        l_val = la.get(mod_name)
-        if (isinstance(f_val, (int, float)) and isinstance(l_val, (int, float))
-                and abs(l_val - f_val) >= 0.05):
-            _add(f"adaptation.{mod_name}", round(f_val, 2), round(l_val, 2),
-                 f"{f_val:.2f} → {l_val:.2f}")
-
-    # operator queue: total + escalation counts
-    fop = fp.get("operator_priorities") or {}
-    lop = live.get("operator_priorities") or {}
-    if fop.get("total_items") != lop.get("total_items"):
-        _add("operator_priorities.total_items",
-             fop.get("total_items"), lop.get("total_items"),
-             f"{fop.get('total_items')} → {lop.get('total_items')}")
-    fec = fop.get("escalation_counts") or {}
-    lec = lop.get("escalation_counts") or {}
-    for lvl in ("CRITICAL", "IMPORTANT", "WATCH"):
-        if fec.get(lvl, 0) != lec.get(lvl, 0):
-            _add(f"operator_priorities.escalation.{lvl}",
-                 fec.get(lvl, 0), lec.get(lvl, 0),
-                 f"{fec.get(lvl, 0)} → {lec.get(lvl, 0)}")
-
-    # narrative headline
-    fn = fp.get("narrative_causality") or {}
-    ln = live.get("narrative_causality") or {}
-    if fn.get("headline") and ln.get("headline") and fn["headline"] != ln["headline"]:
-        _add("narrative.headline", fn["headline"], ln["headline"], "headline changed")
-
+    diffs = _replay_payload_delta(fp, live)
     captured_at_ms = (frozen.get("captured_at_ms") or 0)
     age_seconds = max(0, (_inv_now_ms() - captured_at_ms) // 1000) if captured_at_ms else 0
     return {
         "found": True, "id": case_id,
+        "comparison_mode": "frozen_vs_now",
         "frozen_present": True,
+        "frozen_revision": frozen.get("revision"),
         "frozen_captured_at_ms": captured_at_ms,
         "frozen_age_seconds": age_seconds,
         "live_computed_at_ms": _inv_now_ms(),
         "diffs": diffs,
         "diff_count": len(diffs),
         "summary": (
-            f"{len(diffs)} material drift(s) since frozen snapshot "
-            f"({age_seconds // 60} minutes ago)."
+            f"{len(diffs)} material drift(s) between frozen revision {frozen.get('revision')} "
+            f"and current engine view ({age_seconds // 60} minutes since capture)."
             if diffs else
-            "no material drift since frozen snapshot."
+            f"no material drift between frozen revision {frozen.get('revision')} "
+            f"and current engine view."
         ),
     }
 

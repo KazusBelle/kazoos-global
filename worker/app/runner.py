@@ -346,6 +346,10 @@ def _due_timeframes(boundary: datetime) -> Set[str]:
 _ANOMALY_INTERVAL_S = 300
 _INTEL_SNAPSHOT_INTERVAL_S = 300
 _INVESTIGATION_AUTODRAFT_INTERVAL_S = 300
+# Integrity Repair Pass: PENDING-capture drain runs faster than auto-draft
+# so freshly-created cases get a frozen snapshot within ~30s rather than
+# waiting up to 5 minutes for the autodraft tick.
+_INVESTIGATION_CAPTURE_INTERVAL_S = 30
 
 
 async def _anomaly_loop(stop_event: asyncio.Event) -> None:
@@ -400,6 +404,40 @@ async def _intel_snapshot_loop(stop_event: asyncio.Event) -> None:
             logger.exception("intel snapshot failed: %s", exc)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=_INTEL_SNAPSHOT_INTERVAL_S)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _investigation_capture_loop(stop_event: asyncio.Event) -> None:
+    """Integrity Repair Pass: drain the PENDING capture queue on a
+    fast cadence (30s). Decouples case creation from the 8-layer
+    intelligence-surface cascade — case creation is now a single
+    insert, and frozen snapshot lands a few seconds later in the
+    background. Failures are recorded on the case (FAILED status +
+    capture_error); operator can retry via the API."""
+    from kazus_logic.liquidity.research import investigation_capture_pending
+
+    # Brief delay so the first tick doesn't fight the initial cycle.
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+    while not stop_event.is_set():
+        try:
+            with SessionLocal() as db:
+                result = investigation_capture_pending(db, limit=20)
+            if result.get("captured_ids") or result.get("failed_ids"):
+                logger.info(
+                    "investigation capture drained: %d captured · %d failed",
+                    len(result.get("captured_ids") or []),
+                    len(result.get("failed_ids") or []),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("investigation capture drain failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=_INVESTIGATION_CAPTURE_INTERVAL_S)
             break
         except asyncio.TimeoutError:
             continue
@@ -490,6 +528,10 @@ async def main() -> None:
     investigation_task = asyncio.create_task(
         _investigation_autodraft_loop(stop_event), name="investigation-autodraft"
     )
+    # Integrity Repair Pass: fast-cadence PENDING-capture drain.
+    investigation_capture_task = asyncio.create_task(
+        _investigation_capture_loop(stop_event), name="investigation-capture"
+    )
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -524,7 +566,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task):
+        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task):
             t.cancel()
             try:
                 await t

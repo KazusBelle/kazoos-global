@@ -2173,6 +2173,8 @@ export type InvestigationNoteType =
   | "note" | "hypothesis" | "conclusion" | "false_positive"
   | "needs_monitoring" | "confirmed_structural" | "coincidence" | "comment";
 
+export type InvestigationCaptureStatus = "PENDING" | "CAPTURED" | "FAILED";
+
 export type Investigation = {
   id: number;
   title: string;
@@ -2194,6 +2196,9 @@ export type Investigation = {
   last_touched_at_ms: number | null;
   resolution_summary: string | null;
   resolved_at_ms: number | null;
+  capture_status: InvestigationCaptureStatus;
+  capture_error: string | null;
+  capture_attempted_at_ms: number | null;
   created_at_ms: number;
   updated_at_ms: number;
 };
@@ -2490,10 +2495,11 @@ export type ReplayState = {
   } | null;
 };
 
-export async function getInvestigationReplayState(case_id: number, opts: { mode?: "frozen" | "live"; at_ms?: number } = {}) {
+export async function getInvestigationReplayState(case_id: number, opts: { mode?: "frozen" | "live"; at_ms?: number; revision?: number } = {}) {
   const usp = new URLSearchParams();
   if (opts.mode) usp.set("mode", opts.mode);
   if (opts.at_ms != null) usp.set("at_ms", String(opts.at_ms));
+  if (opts.revision != null) usp.set("revision", String(opts.revision));
   const qs = usp.toString();
   return request<ReplayState>(
     `/liquidity/research/investigations/${case_id}/replay/state${qs ? `?${qs}` : ""}`,
@@ -2541,10 +2547,17 @@ export type ReplayDiffEntry = {
 export type ReplayDiff = {
   found: boolean;
   id: number;
+  // Integrity Repair Pass: explicit comparison source. UI labels off this.
+  comparison_mode: "frozen_vs_now" | "frozen_vs_frozen";
   frozen_present: boolean;
+  frozen_revision: number | null;
   frozen_captured_at_ms: number | null;
   frozen_age_seconds: number | null;
   live_computed_at_ms: number | null;
+  from_revision: number | null;
+  to_revision: number | null;
+  from_captured_at_ms: number | null;
+  to_captured_at_ms: number | null;
   diffs: ReplayDiffEntry[];
   diff_count: number | null;
   summary: string;
@@ -2553,6 +2566,51 @@ export type ReplayDiff = {
 export async function getInvestigationReplayDiff(case_id: number) {
   return request<ReplayDiff>(
     `/liquidity/research/investigations/${case_id}/replay/diff`,
+  );
+}
+
+export async function getInvestigationReplayDiffRevisions(
+  case_id: number,
+  opts: { from_revision?: number; to_revision?: number } = {},
+) {
+  const usp = new URLSearchParams();
+  if (opts.from_revision != null) usp.set("from_revision", String(opts.from_revision));
+  if (opts.to_revision != null) usp.set("to_revision", String(opts.to_revision));
+  const qs = usp.toString();
+  return request<ReplayDiff>(
+    `/liquidity/research/investigations/${case_id}/replay/diff/revisions${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type ReplaySnapshotRevision = {
+  revision: number;
+  is_active: boolean;
+  captured_at_ms: number;
+  anchor_ms: number | null;
+  captured_kind: string;
+  captured_by: number | null;
+  payload_size: number;
+  sections_with_errors: string[];
+};
+
+export type ReplayHistory = {
+  found: boolean;
+  id: number;
+  revisions: ReplaySnapshotRevision[];
+  active_revision: number | null;
+  total_revisions: number;
+};
+
+export async function getInvestigationReplayHistory(case_id: number) {
+  return request<ReplayHistory>(
+    `/liquidity/research/investigations/${case_id}/replay/history`,
+  );
+}
+
+export async function retryInvestigationReplayCapture(case_id: number) {
+  return request<{ status: string; requeued: boolean; reason?: string }>(
+    `/liquidity/research/investigations/${case_id}/replay/retry`,
+    { method: "POST" },
   );
 }
 

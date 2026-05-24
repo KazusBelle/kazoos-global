@@ -330,6 +330,25 @@ _ADDITIVE_MIGRATIONS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_inv_replay_snapshot_captured ON investigation_replay_snapshots (captured_at_ms)",
+    # ── Integrity Repair Pass (2026-05-24) ───────────────────────────
+    # Async capture: PENDING|CAPTURED|FAILED queue state on investigations.
+    # Default CAPTURED so existing rows are treated as already captured.
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS capture_status VARCHAR(16) NOT NULL DEFAULT 'CAPTURED'",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS capture_error TEXT",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS capture_attempted_at_ms BIGINT",
+    "CREATE INDEX IF NOT EXISTS ix_investigations_capture_status ON investigations (capture_status)",
+    # Append-only snapshot history. Existing single-row-per-case rows
+    # become revision=1, is_active=true; the old unique-on-(case)
+    # constraint is dropped in favor of a new unique-on-(case, revision).
+    "ALTER TABLE investigation_replay_snapshots ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE investigation_replay_snapshots ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE investigation_replay_snapshots ADD COLUMN IF NOT EXISTS sections_with_errors_json TEXT",
+    # Drop the old per-case unique constraint (now we want many rows per case).
+    "ALTER TABLE investigation_replay_snapshots DROP CONSTRAINT IF EXISTS uq_inv_replay_snapshot_case",
+    # Add the new uniqueness on (case, revision) so revisions are addressable.
+    "ALTER TABLE investigation_replay_snapshots DROP CONSTRAINT IF EXISTS uq_inv_replay_snapshot_revision",
+    "ALTER TABLE investigation_replay_snapshots ADD CONSTRAINT uq_inv_replay_snapshot_revision UNIQUE (investigation_id, revision)",
+    "CREATE INDEX IF NOT EXISTS ix_inv_replay_snapshot_case_active ON investigation_replay_snapshots (investigation_id, is_active)",
 ]
 
 

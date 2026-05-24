@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addInvestigationNote,
   captureInvestigationReplay,
+  retryInvestigationReplayCapture,
   createInvestigation,
   getInvestigation,
   getInvestigationCausalTree,
@@ -301,6 +302,16 @@ function CaseRow({
             auto-draft
           </span>
         )}
+        {c.capture_status === "PENDING" && (
+          <span className="text-[9px] uppercase tracking-[0.14em] text-[#8caaeb]" title="frozen snapshot capture queued; worker drains every 30s">
+            capturing…
+          </span>
+        )}
+        {c.capture_status === "FAILED" && (
+          <span className="text-[9px] uppercase tracking-[0.14em] text-[#dd6363]" title={c.capture_error || "capture failed; open the case to retry"}>
+            capture failed
+          </span>
+        )}
         {c.tags.map((t) => (
           <span key={t} className="text-[9px] uppercase tracking-[0.14em] text-muted">
             #{t}
@@ -562,6 +573,23 @@ function CaseHeader({
         </select>
         {c.origin_kind === "auto_pre_cascade" && (
           <span className="text-[9px] uppercase tracking-[0.14em] text-[#e3b457]">auto-draft</span>
+        )}
+        {c.capture_status === "PENDING" && (
+          <span className="text-[9px] uppercase tracking-[0.14em] text-[#8caaeb]">capturing snapshot…</span>
+        )}
+        {c.capture_status === "FAILED" && (
+          <button
+            onClick={async () => {
+              try {
+                await retryInvestigationReplayCapture(c.id);
+                alert("Capture re-queued. Worker drains every 30s.");
+              } catch (e: any) {
+                alert(e?.message ?? "retry failed");
+              }
+            }}
+            title={c.capture_error || "capture failed; click to re-queue"}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-[#dd6363]/60 text-[#dd6363] hover:bg-[#dd6363]/10"
+          >capture failed · retry</button>
         )}
         {c.replay_anchor_ms != null && (
           <button
@@ -1207,7 +1235,7 @@ function ReplayPanel({ caseId }: { caseId: number }) {
       <ReplayDiffBanner
         diff={diff}
         onRecapture={async () => {
-          if (!confirm("Overwrite the frozen snapshot with current engine state? This is the only write that mutates the frozen reference.")) return;
+          if (!confirm("Write a new frozen-snapshot revision from the current engine state? Snapshot history is append-only — the prior revision is preserved.")) return;
           try {
             await captureInvestigationReplay(caseId, { force: true });
             const [st, df] = await Promise.all([
@@ -1256,11 +1284,20 @@ function ReplayPanel({ caseId }: { caseId: number }) {
 
 function ReplayDiffBanner({ diff, onRecapture }: { diff: ReplayDiff | null; onRecapture: () => void }) {
   if (diff == null) return null;
+  // Integrity Repair Pass §2: explicit labels per comparison_mode.
+  // We never call this "FROZEN vs LIVE" — cursor snapshot is a
+  // separate panel with different semantics.
+  const isFrozenFrozen = diff.comparison_mode === "frozen_vs_frozen";
+  const headerLabel = isFrozenFrozen
+    ? `● frozen rev ${diff.from_revision} vs rev ${diff.to_revision}`
+    : "● frozen vs now (engine current view)";
   if (!diff.frozen_present) {
     return (
       <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2 flex items-baseline gap-3 flex-wrap">
-        <span className="text-[11px] uppercase tracking-[0.22em] text-muted">● frozen vs live</span>
-        <span className="text-[11px] text-muted flex-1">No frozen snapshot — open the case from scratch or click recapture.</span>
+        <span className="text-[11px] uppercase tracking-[0.22em] text-muted">{headerLabel}</span>
+        <span className="text-[11px] text-muted flex-1">
+          No frozen snapshot yet — capture lands shortly after case creation, or click recapture.
+        </span>
         <button
           onClick={onRecapture}
           className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-accent/60 text-accent hover:bg-accent/10"
@@ -1274,6 +1311,7 @@ function ReplayDiffBanner({ diff, onRecapture }: { diff: ReplayDiff | null; onRe
     : driftCount <= 2 ? "rgba(140, 170, 235, 0.85)"
     : driftCount <= 5 ? "rgba(227, 180, 87, 0.9)"
     : "rgba(221, 99, 99, 0.95)";
+  const ageMinutes = Math.round((diff.frozen_age_seconds ?? 0) / 60);
   return (
     <div
       className="rounded-lg border bg-bg/40 px-3 py-2"
@@ -1281,17 +1319,21 @@ function ReplayDiffBanner({ diff, onRecapture }: { diff: ReplayDiff | null; onRe
     >
       <div className="flex items-baseline gap-3 flex-wrap mb-1.5">
         <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color }}>
-          ● frozen vs live
+          {headerLabel}
         </span>
-        <span className="text-[10px] text-muted">
-          frozen {Math.round((diff.frozen_age_seconds ?? 0) / 60)}m ago
-        </span>
+        {!isFrozenFrozen && diff.frozen_revision != null && (
+          <span className="text-[9px] uppercase tracking-[0.14em] text-muted">
+            frozen rev {diff.frozen_revision} · {ageMinutes}m ago
+          </span>
+        )}
         <span className="text-[11px] text-zinc-200 flex-1">{diff.summary}</span>
-        <button
-          onClick={onRecapture}
-          title="overwrite frozen reference with current engine state"
-          className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200 hover:border-zinc-400"
-        >recapture</button>
+        {!isFrozenFrozen && (
+          <button
+            onClick={onRecapture}
+            title="append-only: writes a new snapshot revision; prior revisions are preserved"
+            className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200 hover:border-zinc-400"
+          >recapture</button>
+        )}
       </div>
       {diff.diffs.length > 0 && (
         <ul className="text-[10px] text-zinc-200 space-y-0.5 font-mono">
@@ -1307,7 +1349,9 @@ function ReplayDiffBanner({ diff, onRecapture }: { diff: ReplayDiff | null; onRe
         </ul>
       )}
       <div className="text-[9px] text-muted italic mt-1.5">
-        Forensic comparison — &ldquo;what the engine knew then vs now&rdquo;. Not a retroactive correction.
+        {isFrozenFrozen
+          ? "Diff between two preserved frozen revisions — append-only history."
+          : "Comparison source: frozen snapshot vs engine view recomputed right now. NOT a cursor comparison."}
       </div>
     </div>
   );
