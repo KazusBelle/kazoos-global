@@ -8063,6 +8063,1606 @@ def operator_digest(db: Session, window_hours: int = 24) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Phase 18 — Investigation & Casework Layer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Operator-owned cases. Aggregates evidence + notes + lifecycle on top of
+# the upstream intelligence layers. No auto-trading. Append-only history
+# everywhere — notes and lifecycle events are never edited or deleted, only
+# superseded. Auto-draft is the only place the engine creates cases on its
+# own, and only for crisis_genesis verdict=PRE_CASCADE.
+#
+# Design properties (mirroring Phase 17):
+#   * NOT TTL-cached — every call writes lifecycle events + notes.
+#   * Append-only — investigation_notes and investigation_events grow only.
+#   * Replayable — replay_anchor_ms always set on auto-draft; manual cases
+#     can opt-in via the create payload.
+#   * Hybrid timeline — evidence is materialized in investigation_evidence
+#     with FK-style refs; the rest of the timeline is JOINed at read time
+#     from upstream tables. Cuts duplication, keeps single source of truth.
+
+INVESTIGATION_STATUSES = ("OPEN", "INVESTIGATING", "MONITORING", "RESOLVED", "ARCHIVED")
+INVESTIGATION_SEVERITIES = ("info", "warn", "critical")
+INVESTIGATION_EVIDENCE_TYPES = (
+    "alert", "anomaly", "operator_priority", "propagation_edge",
+    "causal_chain", "narrative_section", "symbol", "transition",
+    "dependency_cluster", "file",
+)
+INVESTIGATION_NOTE_TYPES = (
+    "note", "hypothesis", "conclusion", "false_positive",
+    "needs_monitoring", "confirmed_structural", "coincidence", "comment",
+)
+
+
+def _inv_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _inv_serialize_tags(tags: Optional[List[str]]) -> Optional[str]:
+    import json as _json
+    if not tags:
+        return None
+    clean = [str(t).strip() for t in tags if str(t).strip()]
+    return _json.dumps(clean) if clean else None
+
+
+def _inv_deserialize_tags(raw: Optional[str]) -> List[str]:
+    import json as _json
+    if not raw:
+        return []
+    try:
+        v = _json.loads(raw)
+        return [str(t) for t in v] if isinstance(v, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _inv_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "title": row.title,
+        "description": row.description,
+        "severity": row.severity,
+        "status": row.status,
+        "tags": _inv_deserialize_tags(row.tags_json),
+        "created_by": row.created_by,
+        "assigned_to": row.assigned_to,
+        "origin_kind": row.origin_kind,
+        "origin_fingerprint": row.origin_fingerprint,
+        "replay_anchor_ms": row.replay_anchor_ms,
+        "replay_window_start_ms": row.replay_window_start_ms,
+        "replay_window_end_ms": row.replay_window_end_ms,
+        "primary_symbol": row.primary_symbol,
+        "related_symbols": _inv_deserialize_tags(row.related_symbols_json),
+        "collaborators": _inv_deserialize_collaborators(row.collaborators_json),
+        "last_touched_by": row.last_touched_by,
+        "last_touched_at_ms": row.last_touched_at_ms,
+        "resolution_summary": row.resolution_summary,
+        "resolved_at_ms": row.resolved_at_ms,
+        "created_at_ms": row.created_at_ms,
+        "updated_at_ms": row.updated_at_ms,
+    }
+
+
+def _inv_deserialize_collaborators(raw: Optional[str]) -> List[int]:
+    import json as _json
+    if not raw:
+        return []
+    try:
+        v = _json.loads(raw)
+        out: List[int] = []
+        for x in (v if isinstance(v, list) else []):
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _inv_serialize_collaborators(ids: Optional[List[int]]) -> Optional[str]:
+    import json as _json
+    if not ids:
+        return None
+    clean = sorted({int(i) for i in ids})
+    return _json.dumps(clean) if clean else None
+
+
+_MENTION_RE = None  # lazy-compiled in _inv_extract_mentions
+
+
+def _inv_extract_mentions(body: str) -> List[str]:
+    """Parse @username mentions from a note body. Returns lowercased
+    distinct handles. Used for the multi-operator mention-event hook —
+    user resolution happens at the API layer where the users table is
+    available; this function just extracts handles."""
+    import re
+    global _MENTION_RE
+    if _MENTION_RE is None:
+        _MENTION_RE = re.compile(r"(?<![\w])@([A-Za-z0-9_]{1,32})")
+    if not body:
+        return []
+    seen = []
+    for m in _MENTION_RE.findall(body):
+        h = m.lower()
+        if h not in seen:
+            seen.append(h)
+    return seen
+
+
+def _inv_log_event(
+    db: Session,
+    *,
+    case_id: int,
+    event_type: str,
+    actor_id: Optional[int],
+    payload: Optional[dict] = None,
+    note: Optional[str] = None,
+) -> None:
+    import json as _json
+    from kazus_db.models import Investigation, InvestigationEvent
+    now_ms = _inv_now_ms()
+    db.add(InvestigationEvent(
+        investigation_id=case_id,
+        ts_ms=now_ms,
+        event_type=event_type,
+        actor_id=actor_id,
+        payload_json=_json.dumps(payload) if payload else None,
+        note=note,
+    ))
+    # Update last_touched_{by,at} on the case so the list view can show
+    # "last touched by X N minutes ago" without a window query.
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is not None:
+        case.last_touched_at_ms = now_ms
+        if actor_id is not None:
+            case.last_touched_by = actor_id
+
+
+def investigation_create(
+    db: Session,
+    *,
+    title: str,
+    description: str = "",
+    severity: str = "warn",
+    tags: Optional[List[str]] = None,
+    created_by: Optional[int] = None,
+    assigned_to: Optional[int] = None,
+    origin_kind: str = "manual",
+    origin_fingerprint: Optional[str] = None,
+    replay_anchor_ms: Optional[int] = None,
+    replay_window_start_ms: Optional[int] = None,
+    replay_window_end_ms: Optional[int] = None,
+    primary_symbol: Optional[str] = None,
+    related_symbols: Optional[List[str]] = None,
+    collaborators: Optional[List[int]] = None,
+    initial_evidence: Optional[List[dict]] = None,
+) -> dict:
+    """Create a new investigation case.
+
+    `initial_evidence` is a list of dicts with the same shape as the
+    arguments to `investigation_link_evidence` (minus case_id). They are
+    linked in the same transaction so the case has context from the
+    moment it appears.
+    """
+    from kazus_db.models import Investigation
+    if severity not in INVESTIGATION_SEVERITIES:
+        raise ValueError(f"unknown severity: {severity}")
+    title_clean = (title or "").strip()
+    if not title_clean:
+        raise ValueError("title required")
+    now_ms = _inv_now_ms()
+    row = Investigation(
+        title=title_clean[:240],
+        description=(description or "").strip(),
+        severity=severity,
+        status="OPEN",
+        tags_json=_inv_serialize_tags(tags),
+        created_by=created_by,
+        assigned_to=assigned_to,
+        origin_kind=origin_kind,
+        origin_fingerprint=origin_fingerprint,
+        replay_anchor_ms=replay_anchor_ms,
+        replay_window_start_ms=replay_window_start_ms,
+        replay_window_end_ms=replay_window_end_ms,
+        primary_symbol=(primary_symbol or None and primary_symbol.upper()[:32]),
+        related_symbols_json=_inv_serialize_tags(
+            [s.upper() for s in related_symbols] if related_symbols else None
+        ),
+        collaborators_json=_inv_serialize_collaborators(collaborators),
+        last_touched_by=created_by,
+        last_touched_at_ms=now_ms,
+        created_at_ms=now_ms,
+        updated_at_ms=now_ms,
+    )
+    db.add(row)
+    db.flush()  # populate row.id
+    _inv_log_event(
+        db, case_id=row.id, event_type="created",
+        actor_id=created_by,
+        payload={"title": row.title, "severity": severity, "origin_kind": origin_kind},
+    )
+    if origin_kind == "auto_pre_cascade":
+        _inv_log_event(
+            db, case_id=row.id, event_type="auto_drafted",
+            actor_id=None,
+            payload={"fingerprint": origin_fingerprint, "replay_anchor_ms": replay_anchor_ms},
+        )
+    # Link initial evidence (each call appends its own event).
+    for ev in (initial_evidence or []):
+        try:
+            _investigation_link_evidence_inner(
+                db,
+                case_id=row.id,
+                evidence_type=ev.get("evidence_type"),
+                ref_key=ev.get("ref_key"),
+                ref_id=ev.get("ref_id"),
+                snapshot=ev.get("snapshot"),
+                note=ev.get("note"),
+                linked_by=created_by,
+            )
+        except ValueError:
+            continue  # skip malformed; case still created
+    db.commit()
+    db.refresh(row)
+    return _inv_to_dict(row)
+
+
+def investigation_list(
+    db: Session,
+    *,
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    tag: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    """List investigation cases. Default filters return active cases
+    (not ARCHIVED) ordered by most-recently-updated."""
+    from kazus_db.models import Investigation
+    q = db.query(Investigation)
+    if status:
+        if status not in INVESTIGATION_STATUSES and status != "active":
+            raise ValueError(f"unknown status: {status}")
+        if status == "active":
+            q = q.filter(Investigation.status != "ARCHIVED")
+        else:
+            q = q.filter(Investigation.status == status)
+    else:
+        q = q.filter(Investigation.status != "ARCHIVED")
+    if severity:
+        if severity not in INVESTIGATION_SEVERITIES:
+            raise ValueError(f"unknown severity: {severity}")
+        q = q.filter(Investigation.severity == severity)
+    if search:
+        like = f"%{search.lower()}%"
+        q = q.filter(
+            (Investigation.title.ilike(like))
+            | (Investigation.description.ilike(like))
+        )
+    total = q.count()
+    rows = (
+        q.order_by(Investigation.updated_at_ms.desc())
+        .offset(max(0, offset))
+        .limit(max(1, min(500, limit)))
+        .all()
+    )
+    items = [_inv_to_dict(r) for r in rows]
+    if tag:
+        items = [it for it in items if tag in it["tags"]]
+    return {
+        "total": total,
+        "items": items,
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+def investigation_detail(db: Session, case_id: int) -> dict:
+    """Return full case payload: row + evidence + notes (newest first) +
+    timeline summary counts. The full timeline is a separate call so the
+    UI can render lazily."""
+    from kazus_db.models import (
+        Investigation, InvestigationEvidence,
+        InvestigationNote, InvestigationEvent,
+    )
+    import json as _json
+    row = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if row is None:
+        return {"found": False, "id": case_id}
+    evidence = (
+        db.query(InvestigationEvidence)
+        .filter(InvestigationEvidence.investigation_id == case_id)
+        .order_by(InvestigationEvidence.linked_at_ms.desc())
+        .all()
+    )
+    notes = (
+        db.query(InvestigationNote)
+        .filter(InvestigationNote.investigation_id == case_id)
+        .order_by(InvestigationNote.created_at_ms.desc())
+        .all()
+    )
+    event_count = (
+        db.query(InvestigationEvent)
+        .filter(InvestigationEvent.investigation_id == case_id)
+        .count()
+    )
+
+    def _ev_snapshot(raw: Optional[str]) -> Optional[dict]:
+        if not raw:
+            return None
+        try:
+            return _json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+
+    return {
+        "found": True,
+        **_inv_to_dict(row),
+        "evidence": [
+            {
+                "id": e.id,
+                "evidence_type": e.evidence_type,
+                "ref_id": e.ref_id,
+                "ref_key": e.ref_key,
+                "snapshot": _ev_snapshot(e.snapshot_json),
+                "note": e.note,
+                "linked_at_ms": e.linked_at_ms,
+                "linked_by": e.linked_by,
+            }
+            for e in evidence
+        ],
+        "notes": [
+            {
+                "id": n.id,
+                "note_type": n.note_type,
+                "body": n.body,
+                "author_id": n.author_id,
+                "created_at_ms": n.created_at_ms,
+            }
+            for n in notes
+        ],
+        "evidence_count": len(evidence),
+        "note_count": len(notes),
+        "event_count": event_count,
+    }
+
+
+def investigation_update(
+    db: Session,
+    case_id: int,
+    *,
+    actor_id: Optional[int] = None,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    severity: Optional[str] = None,
+    status: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    assigned_to: Optional[int] = None,
+    resolution_summary: Optional[str] = None,
+    primary_symbol: Optional[str] = None,
+    related_symbols: Optional[List[str]] = None,
+    collaborators: Optional[List[int]] = None,
+    replay_anchor_ms: Optional[int] = None,
+    replay_window_start_ms: Optional[int] = None,
+    replay_window_end_ms: Optional[int] = None,
+    handoff_note: Optional[str] = None,
+) -> dict:
+    """Patch case fields. Status transitions are validated; RESOLVED
+    requires a resolution_summary (either pre-existing or supplied in
+    this call). Each material change logs an event for the audit trail.
+    """
+    from kazus_db.models import Investigation
+    row = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if row is None:
+        raise LookupError(f"investigation {case_id} not found")
+    now_ms = _inv_now_ms()
+    changed = False
+    if title is not None:
+        new_title = title.strip()[:240]
+        if new_title and new_title != row.title:
+            _inv_log_event(db, case_id=case_id, event_type="title_change",
+                           actor_id=actor_id,
+                           payload={"from": row.title, "to": new_title})
+            row.title = new_title
+            changed = True
+    if description is not None and description != row.description:
+        _inv_log_event(db, case_id=case_id, event_type="description_change",
+                       actor_id=actor_id, payload={"length": len(description)})
+        row.description = description
+        changed = True
+    if severity is not None and severity != row.severity:
+        if severity not in INVESTIGATION_SEVERITIES:
+            raise ValueError(f"unknown severity: {severity}")
+        _inv_log_event(db, case_id=case_id, event_type="severity_change",
+                       actor_id=actor_id,
+                       payload={"from": row.severity, "to": severity})
+        row.severity = severity
+        changed = True
+    if tags is not None:
+        old_tags = _inv_deserialize_tags(row.tags_json)
+        if sorted(tags) != sorted(old_tags):
+            _inv_log_event(db, case_id=case_id, event_type="tags_change",
+                           actor_id=actor_id,
+                           payload={"from": old_tags, "to": list(tags)})
+            row.tags_json = _inv_serialize_tags(tags)
+            changed = True
+    if assigned_to is not None and assigned_to != row.assigned_to:
+        _inv_log_event(
+            db, case_id=case_id, event_type="assigned",
+            actor_id=actor_id,
+            payload={"from": row.assigned_to, "to": assigned_to},
+            note=handoff_note if handoff_note else None,
+        )
+        row.assigned_to = assigned_to
+        changed = True
+    if primary_symbol is not None:
+        new_sym = (primary_symbol or "").strip().upper()[:32] or None
+        if new_sym != row.primary_symbol:
+            _inv_log_event(db, case_id=case_id, event_type="primary_symbol_change",
+                           actor_id=actor_id,
+                           payload={"from": row.primary_symbol, "to": new_sym})
+            row.primary_symbol = new_sym
+            changed = True
+    if related_symbols is not None:
+        new_syms = sorted({s.upper().strip() for s in related_symbols if s and s.strip()})
+        old_syms = sorted(_inv_deserialize_tags(row.related_symbols_json))
+        if new_syms != old_syms:
+            _inv_log_event(db, case_id=case_id, event_type="related_symbols_change",
+                           actor_id=actor_id,
+                           payload={"from": old_syms, "to": new_syms})
+            row.related_symbols_json = _inv_serialize_tags(new_syms)
+            changed = True
+    if collaborators is not None:
+        new_coll = sorted({int(x) for x in collaborators})
+        old_coll = sorted(_inv_deserialize_collaborators(row.collaborators_json))
+        if new_coll != old_coll:
+            _inv_log_event(db, case_id=case_id, event_type="collaborators_change",
+                           actor_id=actor_id,
+                           payload={"from": old_coll, "to": new_coll})
+            row.collaborators_json = _inv_serialize_collaborators(new_coll)
+            changed = True
+    for field, val, evt in (
+        ("replay_anchor_ms", replay_anchor_ms, "replay_anchor_change"),
+        ("replay_window_start_ms", replay_window_start_ms, "replay_window_change"),
+        ("replay_window_end_ms", replay_window_end_ms, "replay_window_change"),
+    ):
+        if val is not None and val != getattr(row, field):
+            _inv_log_event(db, case_id=case_id, event_type=evt,
+                           actor_id=actor_id,
+                           payload={"field": field, "from": getattr(row, field), "to": val})
+            setattr(row, field, val)
+            changed = True
+    # Resolution summary on its own is allowed (e.g. updating before RESOLVE).
+    if resolution_summary is not None and resolution_summary != row.resolution_summary:
+        row.resolution_summary = resolution_summary
+        changed = True
+    if status is not None and status != row.status:
+        if status not in INVESTIGATION_STATUSES:
+            raise ValueError(f"unknown status: {status}")
+        # Forbid: ARCHIVED → anything via this endpoint (use explicit reopen flow).
+        if row.status == "ARCHIVED" and status != "ARCHIVED":
+            raise ValueError("archived cases must be reopened explicitly")
+        if status == "RESOLVED":
+            summary = (resolution_summary or row.resolution_summary or "").strip()
+            if not summary:
+                raise ValueError("resolution_summary required to RESOLVE")
+            row.resolution_summary = summary
+            row.resolved_at_ms = now_ms
+            _inv_log_event(db, case_id=case_id, event_type="resolved",
+                           actor_id=actor_id, note=summary[:200],
+                           payload={"from": row.status})
+        elif row.status == "RESOLVED" and status != "RESOLVED":
+            # Reopening a resolved case.
+            _inv_log_event(db, case_id=case_id, event_type="reopened",
+                           actor_id=actor_id, payload={"to": status})
+            row.resolved_at_ms = None
+        elif status == "ARCHIVED":
+            _inv_log_event(db, case_id=case_id, event_type="archived",
+                           actor_id=actor_id, payload={"from": row.status})
+        else:
+            _inv_log_event(db, case_id=case_id, event_type="status_change",
+                           actor_id=actor_id,
+                           payload={"from": row.status, "to": status})
+        row.status = status
+        changed = True
+    if changed:
+        row.updated_at_ms = now_ms
+        db.commit()
+        db.refresh(row)
+    return _inv_to_dict(row)
+
+
+def investigation_add_note(
+    db: Session,
+    case_id: int,
+    *,
+    body: str,
+    note_type: str = "note",
+    author_id: Optional[int] = None,
+) -> dict:
+    from kazus_db.models import Investigation, InvestigationNote
+    if note_type not in INVESTIGATION_NOTE_TYPES:
+        raise ValueError(f"unknown note_type: {note_type}")
+    body_clean = (body or "").strip()
+    if not body_clean:
+        raise ValueError("note body required")
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        raise LookupError(f"investigation {case_id} not found")
+    now_ms = _inv_now_ms()
+    note = InvestigationNote(
+        investigation_id=case_id,
+        note_type=note_type,
+        body=body_clean,
+        author_id=author_id,
+        created_at_ms=now_ms,
+    )
+    db.add(note)
+    db.flush()  # populate note.id for the mention-event payload
+    _inv_log_event(db, case_id=case_id, event_type="note_added",
+                   actor_id=author_id,
+                   payload={"note_id": note.id, "note_type": note_type, "length": len(body_clean)})
+    mentions = _inv_extract_mentions(body_clean)
+    if mentions:
+        _inv_log_event(db, case_id=case_id, event_type="mention",
+                       actor_id=author_id,
+                       payload={"handles": mentions, "note_id": note.id})
+    case.updated_at_ms = now_ms
+    db.commit()
+    db.refresh(note)
+    return {
+        "id": note.id,
+        "investigation_id": case_id,
+        "note_type": note.note_type,
+        "body": note.body,
+        "author_id": note.author_id,
+        "created_at_ms": note.created_at_ms,
+    }
+
+
+def _investigation_link_evidence_inner(
+    db: Session,
+    *,
+    case_id: int,
+    evidence_type: str,
+    ref_key: str,
+    ref_id: Optional[int] = None,
+    snapshot: Optional[dict] = None,
+    note: Optional[str] = None,
+    linked_by: Optional[int] = None,
+) -> int:
+    import json as _json
+    from kazus_db.models import InvestigationEvidence
+    if evidence_type not in INVESTIGATION_EVIDENCE_TYPES:
+        raise ValueError(f"unknown evidence_type: {evidence_type}")
+    if not ref_key or not str(ref_key).strip():
+        raise ValueError("ref_key required")
+    ref_key_clean = str(ref_key).strip()[:192]
+    # Idempotent: same (case, type, key) → reuse existing row.
+    existing = (
+        db.query(InvestigationEvidence)
+        .filter(
+            InvestigationEvidence.investigation_id == case_id,
+            InvestigationEvidence.evidence_type == evidence_type,
+            InvestigationEvidence.ref_key == ref_key_clean,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing.id
+    ev = InvestigationEvidence(
+        investigation_id=case_id,
+        evidence_type=evidence_type,
+        ref_id=ref_id,
+        ref_key=ref_key_clean,
+        snapshot_json=_json.dumps(snapshot) if snapshot is not None else None,
+        note=note,
+        linked_at_ms=_inv_now_ms(),
+        linked_by=linked_by,
+    )
+    db.add(ev)
+    db.flush()
+    _inv_log_event(db, case_id=case_id, event_type="evidence_linked",
+                   actor_id=linked_by,
+                   payload={"evidence_type": evidence_type, "ref_key": ref_key_clean, "ref_id": ref_id},
+                   note=note)
+    return ev.id
+
+
+def investigation_link_evidence(
+    db: Session,
+    case_id: int,
+    *,
+    evidence_type: str,
+    ref_key: str,
+    ref_id: Optional[int] = None,
+    snapshot: Optional[dict] = None,
+    note: Optional[str] = None,
+    linked_by: Optional[int] = None,
+) -> dict:
+    from kazus_db.models import Investigation, InvestigationEvidence
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        raise LookupError(f"investigation {case_id} not found")
+    ev_id = _investigation_link_evidence_inner(
+        db, case_id=case_id, evidence_type=evidence_type, ref_key=ref_key,
+        ref_id=ref_id, snapshot=snapshot, note=note, linked_by=linked_by,
+    )
+    case.updated_at_ms = _inv_now_ms()
+    db.commit()
+    ev = db.query(InvestigationEvidence).filter(InvestigationEvidence.id == ev_id).first()
+    return {
+        "id": ev.id,
+        "investigation_id": case_id,
+        "evidence_type": ev.evidence_type,
+        "ref_id": ev.ref_id,
+        "ref_key": ev.ref_key,
+        "note": ev.note,
+        "linked_at_ms": ev.linked_at_ms,
+        "linked_by": ev.linked_by,
+    }
+
+
+def investigation_unlink_evidence(
+    db: Session,
+    case_id: int,
+    evidence_id: int,
+    *,
+    actor_id: Optional[int] = None,
+) -> dict:
+    from kazus_db.models import Investigation, InvestigationEvidence
+    ev = (
+        db.query(InvestigationEvidence)
+        .filter(InvestigationEvidence.id == evidence_id,
+                InvestigationEvidence.investigation_id == case_id)
+        .first()
+    )
+    if ev is None:
+        raise LookupError(f"evidence {evidence_id} not found on case {case_id}")
+    payload = {
+        "evidence_type": ev.evidence_type,
+        "ref_key": ev.ref_key,
+        "ref_id": ev.ref_id,
+    }
+    db.delete(ev)
+    _inv_log_event(db, case_id=case_id, event_type="evidence_unlinked",
+                   actor_id=actor_id, payload=payload)
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is not None:
+        case.updated_at_ms = _inv_now_ms()
+    db.commit()
+    return {"removed": True, "evidence_id": evidence_id, **payload}
+
+
+def investigation_timeline(
+    db: Session,
+    case_id: int,
+    *,
+    limit: int = 200,
+) -> dict:
+    """Hybrid timeline: case-internal events (investigation_events) UNION
+    upstream events derived from linked evidence (operator_priority_events
+    keyed on operator_priority refs, alerts ordered by started_at, etc.).
+    On-read JOIN — no materialization. Returned chronological desc."""
+    from kazus_db.models import (
+        Investigation, InvestigationEvent, InvestigationEvidence,
+        OperatorPriorityEvent, LiquidityAlertHistory, LiquidityAnomalyMemory,
+        InvestigationNote,
+    )
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "events": []}
+
+    events: List[dict] = []
+
+    # Case-internal lifecycle events (investigation_events).
+    for e in (
+        db.query(InvestigationEvent)
+        .filter(InvestigationEvent.investigation_id == case_id)
+        .order_by(InvestigationEvent.ts_ms.desc())
+        .limit(limit)
+        .all()
+    ):
+        import json as _json
+        try:
+            payload = _json.loads(e.payload_json) if e.payload_json else None
+        except Exception:  # noqa: BLE001
+            payload = None
+        events.append({
+            "ts_ms": e.ts_ms,
+            "source": "case",
+            "event_type": e.event_type,
+            "actor_id": e.actor_id,
+            "payload": payload,
+            "note": e.note,
+        })
+
+    # Notes treated as a separate timeline source (cleaner UX than mixing
+    # with lifecycle events).
+    for n in (
+        db.query(InvestigationNote)
+        .filter(InvestigationNote.investigation_id == case_id)
+        .order_by(InvestigationNote.created_at_ms.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append({
+            "ts_ms": n.created_at_ms,
+            "source": "note",
+            "event_type": n.note_type,
+            "actor_id": n.author_id,
+            "payload": {"note_id": n.id, "body": n.body[:240]},
+            "note": None,
+        })
+
+    # ── Upstream events derived from linked evidence ─────────────────
+    evidence = (
+        db.query(InvestigationEvidence)
+        .filter(InvestigationEvidence.investigation_id == case_id)
+        .all()
+    )
+    op_keys = [e.ref_key for e in evidence if e.evidence_type == "operator_priority"]
+    symbols = {e.ref_key.split("::")[0] for e in evidence if e.evidence_type == "symbol"}
+    alert_ids = [e.ref_id for e in evidence if e.evidence_type == "alert" and e.ref_id]
+    anomaly_ids = [e.ref_id for e in evidence if e.evidence_type == "anomaly" and e.ref_id]
+
+    if op_keys:
+        op_events = (
+            db.query(OperatorPriorityEvent)
+            .filter(OperatorPriorityEvent.priority_key.in_(op_keys))
+            .order_by(OperatorPriorityEvent.ts_ms.desc())
+            .limit(limit)
+            .all()
+        )
+        for oe in op_events:
+            events.append({
+                "ts_ms": oe.ts_ms,
+                "source": "operator_priority",
+                "event_type": oe.event_type,
+                "actor_id": None,
+                "payload": {
+                    "priority_key": oe.priority_key,
+                    "source_layer": oe.source_layer,
+                    "priority_before": oe.priority_before,
+                    "priority_after": oe.priority_after,
+                    "escalation_before": oe.escalation_before,
+                    "escalation_after": oe.escalation_after,
+                },
+                "note": oe.note,
+            })
+
+    if alert_ids:
+        alerts = (
+            db.query(LiquidityAlertHistory)
+            .filter(LiquidityAlertHistory.id.in_(alert_ids))
+            .all()
+        )
+        for a in alerts:
+            events.append({
+                "ts_ms": a.started_at_ms,
+                "source": "alert",
+                "event_type": f"alert:{a.kind}",
+                "actor_id": None,
+                "payload": {
+                    "alert_id": a.id, "symbol": a.symbol, "severity": a.severity,
+                    "confidence": a.confidence, "priority": a.priority,
+                    "validated_outcome": a.validated_outcome,
+                },
+                "note": (a.trigger or None),
+            })
+
+    if anomaly_ids:
+        anoms = (
+            db.query(LiquidityAnomalyMemory)
+            .filter(LiquidityAnomalyMemory.id.in_(anomaly_ids))
+            .all()
+        )
+        for an in anoms:
+            events.append({
+                "ts_ms": an.occurred_at_ms,
+                "source": "anomaly",
+                "event_type": f"anomaly:{an.kind}",
+                "actor_id": None,
+                "payload": {
+                    "anomaly_id": an.id, "severity": an.severity,
+                    "novelty_score": an.novelty_score,
+                    "recurrence_count": an.recurrence_count,
+                },
+                "note": an.notes,
+            })
+
+    if symbols:
+        # Symbol evidence pulls the per-symbol alert history in the case window.
+        case_floor_ms = case.created_at_ms - 3600 * 1000 * 24  # 1d pre-context
+        sym_alerts = (
+            db.query(LiquidityAlertHistory)
+            .filter(LiquidityAlertHistory.symbol.in_(list(symbols)))
+            .filter(LiquidityAlertHistory.started_at_ms >= case_floor_ms)
+            .order_by(LiquidityAlertHistory.started_at_ms.desc())
+            .limit(limit)
+            .all()
+        )
+        for a in sym_alerts:
+            if a.id in alert_ids:
+                continue  # already linked directly
+            events.append({
+                "ts_ms": a.started_at_ms,
+                "source": "symbol_alert",
+                "event_type": f"alert:{a.kind}",
+                "actor_id": None,
+                "payload": {
+                    "alert_id": a.id, "symbol": a.symbol, "severity": a.severity,
+                    "confidence": a.confidence, "priority": a.priority,
+                },
+                "note": None,
+            })
+
+    events.sort(key=lambda e: -e["ts_ms"])
+    events = events[:limit]
+
+    return {
+        "found": True,
+        "id": case_id,
+        "title": case.title,
+        "status": case.status,
+        "events": events,
+        "event_count": len(events),
+        "limit": limit,
+    }
+
+
+def investigation_auto_draft_from_genesis(
+    db: Session,
+    genesis: dict,
+) -> Optional[dict]:
+    """Called by the worker after each crisis_genesis snapshot. If the
+    verdict is PRE_CASCADE and no active case exists for the same
+    fingerprint, create a draft case with the genesis snapshot linked as
+    evidence. Returns the created case dict, or None if no-op.
+
+    Dedup fingerprint = sorted list of contributing probe names ("how the
+    cascade looks"). Two PRE_CASCADE windows with the same composition
+    share a fingerprint and resolve into the same case. A genuinely new
+    composition opens a new case.
+    """
+    from kazus_db.models import Investigation
+    verdict = (genesis or {}).get("verdict")
+    if verdict != "PRE_CASCADE":
+        return None
+    probes = genesis.get("probes") or []
+    contributing = sorted(
+        p.get("kind") for p in probes
+        if (p.get("contributing") and p.get("kind"))
+    )
+    if not contributing:
+        return None
+    fingerprint = "pre_cascade::" + "|".join(contributing)
+    # Already an active case for this fingerprint?
+    existing = (
+        db.query(Investigation)
+        .filter(Investigation.origin_fingerprint == fingerprint)
+        .filter(Investigation.status.in_(("OPEN", "INVESTIGATING", "MONITORING")))
+        .first()
+    )
+    if existing is not None:
+        return None  # case already open, don't spam
+    score = genesis.get("genesis_score") or 0.0
+    confidence = genesis.get("confidence") or 0.0
+    anchor_ms = genesis.get("fetched_at_ms") or _inv_now_ms()
+    title = f"PRE_CASCADE: {len(contributing)} probes ({contributing[0]}…)"
+    description = (
+        "Auto-drafted from crisis_genesis verdict=PRE_CASCADE. "
+        f"Score {score:.0f}/100, confidence {confidence:.2f}. "
+        f"Contributing probes: {', '.join(contributing)}."
+    )
+    case = investigation_create(
+        db,
+        title=title[:240],
+        description=description,
+        severity="critical",
+        tags=["auto-draft", "pre-cascade"],
+        created_by=None,
+        origin_kind="auto_pre_cascade",
+        origin_fingerprint=fingerprint,
+        replay_anchor_ms=anchor_ms,
+        initial_evidence=[{
+            "evidence_type": "narrative_section",
+            "ref_key": f"crisis_genesis::{anchor_ms}",
+            "snapshot": {
+                "verdict": verdict,
+                "genesis_score": score,
+                "confidence": confidence,
+                "probes": [
+                    {"kind": p.get("kind"), "score": p.get("score"),
+                     "contributing": p.get("contributing")}
+                    for p in probes
+                ],
+            },
+            "note": "auto-linked genesis snapshot at case creation",
+        }],
+    )
+    return case
+
+
+def investigation_auto_draft_tick(db: Session) -> Optional[dict]:
+    """Convenience wrapper: pull a fresh genesis snapshot and dispatch
+    to investigation_auto_draft_from_genesis. Called by the worker loop."""
+    try:
+        g = crisis_genesis(db)
+    except Exception:  # noqa: BLE001
+        return None
+    return investigation_auto_draft_from_genesis(db, g)
+
+
+# ── Phase 18 Pass B — causal tree, similarity, export, collaboration ──
+
+
+def _inv_evidence_summary(case_id: int, db: Session) -> dict:
+    """Extract the salient sets from a case's linked evidence for use by
+    causal_tree + similarity. Plain dict, no scoring."""
+    from kazus_db.models import InvestigationEvidence
+    rows = (
+        db.query(InvestigationEvidence)
+        .filter(InvestigationEvidence.investigation_id == case_id)
+        .all()
+    )
+    by_type: Dict[str, List[dict]] = defaultdict(list)
+    for r in rows:
+        by_type[r.evidence_type].append({
+            "id": r.id, "ref_id": r.ref_id, "ref_key": r.ref_key,
+        })
+    symbols: set = set()
+    for e in by_type.get("symbol", []):
+        symbols.add(e["ref_key"].split("::")[0].upper())
+    for e in by_type.get("alert", []):
+        # alert ref_key may be "alert-id" or "BTCUSDT::…"; try to extract.
+        head = e["ref_key"].split("::")[0]
+        if head.isalpha() or head.endswith("USDT"):
+            symbols.add(head.upper())
+    op_keys = {e["ref_key"] for e in by_type.get("operator_priority", [])}
+    alert_ids = {e["ref_id"] for e in by_type.get("alert", []) if e["ref_id"]}
+    anomaly_ids = {e["ref_id"] for e in by_type.get("anomaly", []) if e["ref_id"]}
+    return {
+        "by_type": by_type,
+        "symbols": symbols,
+        "op_keys": op_keys,
+        "alert_ids": alert_ids,
+        "anomaly_ids": anomaly_ids,
+    }
+
+
+def investigation_causal_tree(
+    db: Session,
+    case_id: int,
+    *,
+    lookback_days: int = 7,
+    max_nodes: int = 60,
+) -> dict:
+    """Investigation-support causal/dependency tree.
+
+    Builds a typed graph over the case's linked evidence by joining four
+    upstream sources:
+
+      * `liquidity_anomaly_edges`       — explicit anomaly genealogy
+      * `propagation_graph(db)`         — directional symbol→symbol edges
+      * `structural_dependencies(db)`   — chains / drivers / clusters
+      * `market_state_transitions(db)`  — recent state transitions
+
+    Every edge carries a typed kind, a confidence in [0,1] (from the
+    upstream source's own decomposition — never invented), and a free-text
+    `rationale` describing WHY the relationship holds. This is forensic
+    support, not a deterministic truth engine — operators MUST be able to
+    read the rationale and judge for themselves. Nothing here suggests
+    trade actions.
+    """
+    from kazus_db.models import (
+        Investigation,
+        InvestigationEvent,
+        LiquidityAnomalyEdge,
+        LiquidityAnomalyMemory,
+    )
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id}
+
+    summary = _inv_evidence_summary(case_id, db)
+    seed_symbols: set = set(summary["symbols"])
+    if case.primary_symbol:
+        seed_symbols.add(case.primary_symbol)
+    seed_symbols.update(_inv_deserialize_tags(case.related_symbols_json))
+
+    nodes: Dict[str, dict] = {}
+    edges: List[dict] = []
+
+    def _add_node(node_id: str, kind: str, label: str, **extra) -> None:
+        if node_id in nodes:
+            return
+        if len(nodes) >= max_nodes:
+            return
+        nodes[node_id] = {"id": node_id, "kind": kind, "label": label, **extra}
+
+    # Seed nodes from case evidence ───────────────────────────────────
+    _add_node(f"case::{case.id}", "case",
+              f"case #{case.id}: {case.title[:60]}",
+              status=case.status, severity=case.severity)
+    for sym in sorted(seed_symbols):
+        _add_node(f"sym::{sym}", "symbol", sym)
+        edges.append({
+            "from": f"case::{case.id}", "to": f"sym::{sym}",
+            "kind": "case_subject", "confidence": 1.0,
+            "rationale": "symbol linked as evidence on this case",
+        })
+    for op_key in sorted(summary["op_keys"]):
+        _add_node(f"ops::{op_key}", "operator_priority", op_key[:60])
+        edges.append({
+            "from": f"case::{case.id}", "to": f"ops::{op_key}",
+            "kind": "case_finding", "confidence": 1.0,
+            "rationale": "operator priority linked as evidence",
+        })
+
+    # ── Anomaly memory edges (Phase 13 genealogy) ────────────────────
+    if summary["anomaly_ids"]:
+        seed_ids = list(summary["anomaly_ids"])
+        edge_rows = (
+            db.query(LiquidityAnomalyEdge)
+            .filter(
+                (LiquidityAnomalyEdge.from_id.in_(seed_ids))
+                | (LiquidityAnomalyEdge.to_id.in_(seed_ids))
+            )
+            .all()
+        )
+        anom_ids = set(seed_ids)
+        for e in edge_rows:
+            anom_ids.add(e.from_id)
+            anom_ids.add(e.to_id)
+        anoms = {
+            a.id: a for a in
+            db.query(LiquidityAnomalyMemory)
+            .filter(LiquidityAnomalyMemory.id.in_(list(anom_ids)))
+            .all()
+        }
+        for a in anoms.values():
+            _add_node(f"anom::{a.id}", "anomaly",
+                      f"{a.kind}", severity=a.severity,
+                      occurred_at_ms=a.occurred_at_ms)
+        for e in edge_rows:
+            if e.from_id not in anoms or e.to_id not in anoms:
+                continue
+            edges.append({
+                "from": f"anom::{e.from_id}",
+                "to": f"anom::{e.to_id}",
+                "kind": e.kind,                                # caused_by / evolved_into / etc.
+                "confidence": float(e.weight or 1.0),
+                "rationale": (
+                    f"anomaly-genealogy edge ({e.kind}); "
+                    f"weight={float(e.weight or 1.0):.2f} from auto-linker"
+                ),
+            })
+
+    # ── Propagation edges (Phase 14) — only the seed symbols ─────────
+    try:
+        prop = propagation_graph(db, lookback_days=lookback_days)
+        for e in (prop.get("edges") or []):
+            a = e.get("from"); b = e.get("to")
+            if not a or not b:
+                continue
+            if a not in seed_symbols and b not in seed_symbols:
+                continue
+            _add_node(f"sym::{a}", "symbol", a)
+            _add_node(f"sym::{b}", "symbol", b)
+            edges.append({
+                "from": f"sym::{a}", "to": f"sym::{b}",
+                "kind": "propagation",
+                "confidence": float(e.get("confidence_score") or 0.0),
+                "rationale": (
+                    f"propagation edge {a}→{b}: count={e.get('count')}, "
+                    f"avg_lead={e.get('avg_lead_ms')}ms, "
+                    f"label={e.get('confidence_label')}"
+                ),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Causal verdicts — directional, with explicit rationale ───────
+    try:
+        cp = causal_propagation(db, lookback_days=lookback_days)
+        for e in (cp.get("edges") or []):
+            a = e.get("from"); b = e.get("to")
+            if not a or not b:
+                continue
+            if a not in seed_symbols and b not in seed_symbols:
+                continue
+            verdict = e.get("verdict") or "UNDER_EVIDENCED"
+            _add_node(f"sym::{a}", "symbol", a)
+            _add_node(f"sym::{b}", "symbol", b)
+            edges.append({
+                "from": f"sym::{a}", "to": f"sym::{b}",
+                "kind": f"causal_{verdict.lower()}",
+                "confidence": float(e.get("causal_confidence") or 0.0),
+                "rationale": (
+                    f"causal verdict {verdict}: "
+                    f"asymmetry={float(e.get('asymmetry') or 0):.2f}, "
+                    f"evidence_count={e.get('evidence_count')}, "
+                    f"data_quality={e.get('data_quality')}"
+                ),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Structural dependencies (chains / drivers / clusters) ───────
+    try:
+        sd = structural_dependencies(db, lookback_days=lookback_days)
+        # Influence chains involving any seed symbol.
+        for chain in (sd.get("influence_chains") or []):
+            path = chain.get("path") or []
+            if not any(p in seed_symbols for p in path):
+                continue
+            for sym in path:
+                _add_node(f"sym::{sym}", "symbol", sym)
+            for i in range(len(path) - 1):
+                edges.append({
+                    "from": f"sym::{path[i]}", "to": f"sym::{path[i+1]}",
+                    "kind": "influence_chain",
+                    "confidence": float(chain.get("confidence") or 0.0),
+                    "rationale": (
+                        f"structural influence chain depth={len(path)}; "
+                        f"chain confidence={float(chain.get('confidence') or 0):.2f}"
+                    ),
+                })
+        # Dominant drivers — driver → followers.
+        for drv in (sd.get("dominant_drivers") or []):
+            d = drv.get("driver")
+            followers = drv.get("followers") or []
+            if d not in seed_symbols and not any(f in seed_symbols for f in followers):
+                continue
+            _add_node(f"sym::{d}", "symbol", d)
+            for f in followers:
+                _add_node(f"sym::{f}", "symbol", f)
+                edges.append({
+                    "from": f"sym::{d}", "to": f"sym::{f}",
+                    "kind": "dominant_driver",
+                    "confidence": float(drv.get("confidence") or 0.0),
+                    "rationale": (
+                        f"{d} identified as dominant driver of {f} "
+                        f"(driver dominance score={float(drv.get('dominance_score') or 0):.2f})"
+                    ),
+                })
+        # Co-driver clusters — symmetric link within cluster.
+        for cl in (sd.get("co_driver_clusters") or []):
+            members = cl.get("members") or []
+            if not any(m in seed_symbols for m in members):
+                continue
+            for m in members:
+                _add_node(f"sym::{m}", "symbol", m)
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    edges.append({
+                        "from": f"sym::{a}", "to": f"sym::{b}",
+                        "kind": "co_driver",
+                        "confidence": float(cl.get("cohesion") or 0.0),
+                        "rationale": (
+                            f"co-driver cluster size={len(members)}; "
+                            f"cohesion={float(cl.get('cohesion') or 0):.2f}"
+                        ),
+                    })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Recent transitions on seed symbols (PERSISTENT/REVERSED/etc.) ─
+    try:
+        tr = market_state_transitions(db, lookback_days=lookback_days)
+        for t in (tr.get("transitions") or []):
+            sym = t.get("symbol")
+            if sym not in seed_symbols:
+                continue
+            tr_id = f"tr::{sym}::{t.get('ts_ms', 0)}"
+            _add_node(tr_id, "transition",
+                      f"{sym} {t.get('from_state')}→{t.get('to_state')}",
+                      verdict=t.get("verdict"))
+            edges.append({
+                "from": f"sym::{sym}", "to": tr_id,
+                "kind": "transition",
+                "confidence": float(t.get("confidence") or 0.0),
+                "rationale": (
+                    f"state transition {t.get('from_state')}→{t.get('to_state')}: "
+                    f"verdict={t.get('verdict')}, "
+                    f"persistence={t.get('persistence')}"
+                ),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Cross-case references — direct case→case edges ───────────────
+    refs = _inv_extract_case_refs(case, db)
+    for other_case_id, why in refs:
+        _add_node(f"case::{other_case_id}", "case", f"case #{other_case_id}")
+        edges.append({
+            "from": f"case::{case.id}", "to": f"case::{other_case_id}",
+            "kind": "case_reference",
+            "confidence": 1.0,
+            "rationale": why,
+        })
+
+    # Deterministic dedup of (from, to, kind) edges — keep first.
+    seen_edge = set()
+    deduped = []
+    for e in edges:
+        sig = (e["from"], e["to"], e["kind"])
+        if sig in seen_edge:
+            continue
+        seen_edge.add(sig)
+        deduped.append(e)
+
+    return {
+        "found": True,
+        "id": case_id,
+        "case_status": case.status,
+        "primary_symbol": case.primary_symbol,
+        "lookback_days": lookback_days,
+        "nodes": list(nodes.values()),
+        "edges": deduped,
+        "node_count": len(nodes),
+        "edge_count": len(deduped),
+        "rationale_note": (
+            "Investigation-support graph. Every edge's kind + confidence + "
+            "rationale comes from a specific upstream source. The graph is "
+            "diagnostic, not a deterministic causality engine."
+        ),
+    }
+
+
+def _inv_extract_case_refs(case, db: Session) -> List[Tuple[int, str]]:
+    """Pull cross-case references from the description / notes via the
+    pattern `#<digits>`. Stays explicit — no fuzzy text similarity."""
+    import re
+    from kazus_db.models import Investigation, InvestigationNote
+    out: List[Tuple[int, str]] = []
+    seen: set = set()
+    text_blobs: List[Tuple[str, str]] = []
+    if case.description:
+        text_blobs.append(("description", case.description))
+    notes = (
+        db.query(InvestigationNote)
+        .filter(InvestigationNote.investigation_id == case.id)
+        .all()
+    )
+    for n in notes:
+        text_blobs.append((f"note #{n.id}", n.body))
+    pat = re.compile(r"#(\d{1,6})")
+    for source, blob in text_blobs:
+        for m in pat.findall(blob):
+            try:
+                other = int(m)
+            except ValueError:
+                continue
+            if other == case.id or other in seen:
+                continue
+            ex = db.query(Investigation).filter(Investigation.id == other).first()
+            if ex is None:
+                continue
+            seen.add(other)
+            out.append((other, f"explicitly referenced in {source}"))
+    return out
+
+
+def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[str]]:
+    """Compare case `a` (already-summarised dict) to another row. Returns
+    (score in [0,100], list of reasons). Deterministic — no hidden ML."""
+    reasons: List[str] = []
+    score = 0.0
+
+    b_tags = set(_inv_deserialize_tags(b_row.tags_json))
+    b_related = set(_inv_deserialize_tags(b_row.related_symbols_json))
+    b_summary = _inv_evidence_summary(b_row.id, db)
+    b_symbols = set(b_summary["symbols"])
+    if b_row.primary_symbol:
+        b_symbols.add(b_row.primary_symbol)
+    b_symbols.update(b_related)
+
+    # 1) Exact origin_fingerprint match — strongest signal (recurring archetype).
+    if a["origin_fingerprint"] and a["origin_fingerprint"] == b_row.origin_fingerprint:
+        score += 40
+        reasons.append(
+            f"same origin fingerprint ({a['origin_fingerprint']}) — "
+            f"recurring genesis-probe composition"
+        )
+
+    # 2) Symbol overlap (Jaccard × 25).
+    if a["symbols"] and b_symbols:
+        overlap = a["symbols"] & b_symbols
+        union = a["symbols"] | b_symbols
+        if overlap:
+            j = len(overlap) / len(union)
+            inc = round(25 * j, 1)
+            score += inc
+            reasons.append(
+                f"{len(overlap)}/{len(union)} symbol overlap "
+                f"({', '.join(sorted(overlap)[:4])}) — Jaccard {j:.2f}"
+            )
+
+    # 3) Operator-priority key overlap × 15.
+    if a["op_keys"] and b_summary["op_keys"]:
+        overlap = a["op_keys"] & b_summary["op_keys"]
+        if overlap:
+            j = len(overlap) / max(1, len(a["op_keys"] | b_summary["op_keys"]))
+            inc = round(15 * j, 1)
+            score += inc
+            reasons.append(
+                f"{len(overlap)} shared operator-priority key(s) "
+                f"({sorted(overlap)[0][:40]}…)"
+            )
+
+    # 4) Tag overlap × 10.
+    if a["tags"] and b_tags:
+        overlap = a["tags"] & b_tags
+        if overlap:
+            inc = round(10 * (len(overlap) / max(1, len(a["tags"] | b_tags))), 1)
+            score += inc
+            reasons.append(f"shared tags: {', '.join(sorted(overlap))}")
+
+    # 5) Same severity × 5.
+    if a["severity"] == b_row.severity:
+        score += 5
+        reasons.append(f"same severity ({b_row.severity})")
+
+    # 6) Same origin_kind × 5 (auto vs manual genesis).
+    if a["origin_kind"] == b_row.origin_kind:
+        score += 5
+        reasons.append(f"same origin_kind ({b_row.origin_kind})")
+
+    # Saturate at 100.
+    score = min(100.0, score)
+    return score, reasons
+
+
+def investigation_similar(
+    db: Session,
+    case_id: int,
+    *,
+    limit: int = 10,
+    min_score: float = 10.0,
+) -> dict:
+    """Find historical cases that resemble this one.
+
+    Deterministic — every contribution to the score is exposed in
+    `reasons`. No hidden ML, no embeddings, no learned weights. The
+    weighting is documented in `_inv_similarity_compare`. Search scope
+    excludes the case itself and its ARCHIVED siblings (RESOLVED cases
+    ARE included — they're the most useful "we've seen this before"
+    signal)."""
+    from kazus_db.models import Investigation
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "similar": []}
+
+    summary = _inv_evidence_summary(case_id, db)
+    symbols = set(summary["symbols"])
+    if case.primary_symbol:
+        symbols.add(case.primary_symbol)
+    symbols.update(_inv_deserialize_tags(case.related_symbols_json))
+    a = {
+        "id": case.id,
+        "tags": set(_inv_deserialize_tags(case.tags_json)),
+        "symbols": symbols,
+        "op_keys": set(summary["op_keys"]),
+        "origin_fingerprint": case.origin_fingerprint,
+        "origin_kind": case.origin_kind,
+        "severity": case.severity,
+    }
+
+    others = (
+        db.query(Investigation)
+        .filter(Investigation.id != case_id)
+        .filter(Investigation.status != "ARCHIVED")
+        .all()
+    )
+    scored: List[dict] = []
+    for other in others:
+        s, reasons = _inv_similarity_compare(a, other, db)
+        if s < min_score or not reasons:
+            continue
+        scored.append({
+            "id": other.id,
+            "title": other.title,
+            "status": other.status,
+            "severity": other.severity,
+            "origin_kind": other.origin_kind,
+            "resolved_at_ms": other.resolved_at_ms,
+            "updated_at_ms": other.updated_at_ms,
+            "similarity_score": round(s, 1),
+            "reasons": reasons,
+        })
+    scored.sort(key=lambda r: -r["similarity_score"])
+    return {
+        "found": True,
+        "id": case_id,
+        "similar": scored[:limit],
+        "candidates_compared": len(others),
+        "min_score": min_score,
+    }
+
+
+def investigation_export_markdown(db: Session, case_id: int) -> dict:
+    """Render a complete, audit-friendly markdown export of a case.
+
+    Stable structure (do NOT reorder — downstream audit tooling may
+    parse it). Sections always appear, even if empty, so a diff against
+    a previous export is meaningful. No layer-internal data is included
+    beyond what's reachable through Pass A endpoints — by construction
+    the export is reproducible without any cached state.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from kazus_db.models import Investigation
+    case = db.query(Investigation).filter(Investigation.id == case_id).first()
+    if case is None:
+        return {"found": False, "id": case_id, "markdown": ""}
+    detail = investigation_detail(db, case_id)
+    timeline = investigation_timeline(db, case_id, limit=500)
+    tree = investigation_causal_tree(db, case_id)
+    similar = investigation_similar(db, case_id, limit=5)
+
+    def _iso(ms: Optional[int]) -> str:
+        if ms is None:
+            return "—"
+        return _dt.fromtimestamp(ms / 1000, tz=_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines: List[str] = []
+    lines.append(f"# Investigation #{case.id}: {case.title}")
+    lines.append("")
+    lines.append(f"_Exported at {_iso(_inv_now_ms())}_")
+    lines.append("")
+
+    # ── 1. Summary ───────────────────────────────────────────────────
+    lines.append("## 1. Summary")
+    lines.append("")
+    lines.append(f"- **Status:** {case.status}")
+    lines.append(f"- **Severity:** {case.severity}")
+    lines.append(f"- **Origin:** {case.origin_kind}"
+                 + (f" (fingerprint `{case.origin_fingerprint}`)" if case.origin_fingerprint else ""))
+    lines.append(f"- **Created:** {_iso(case.created_at_ms)} by user_id={case.created_by}")
+    lines.append(f"- **Updated:** {_iso(case.updated_at_ms)}")
+    if case.assigned_to is not None:
+        lines.append(f"- **Assigned to:** user_id={case.assigned_to}")
+    coll = _inv_deserialize_collaborators(case.collaborators_json)
+    if coll:
+        lines.append(f"- **Collaborators:** {', '.join(f'user_id={c}' for c in coll)}")
+    tags = _inv_deserialize_tags(case.tags_json)
+    if tags:
+        lines.append(f"- **Tags:** {', '.join('`' + t + '`' for t in tags)}")
+    if case.primary_symbol:
+        lines.append(f"- **Primary symbol:** `{case.primary_symbol}`")
+    rel = _inv_deserialize_tags(case.related_symbols_json)
+    if rel:
+        lines.append(f"- **Related symbols:** {', '.join('`' + s + '`' for s in rel)}")
+    if case.replay_anchor_ms:
+        win = ""
+        if case.replay_window_start_ms and case.replay_window_end_ms:
+            win = f" (window {_iso(case.replay_window_start_ms)} → {_iso(case.replay_window_end_ms)})"
+        lines.append(f"- **Replay anchor:** {_iso(case.replay_anchor_ms)}{win}")
+    lines.append("")
+    if case.description:
+        lines.append("### Description")
+        lines.append("")
+        lines.append(case.description)
+        lines.append("")
+
+    # ── 2. Resolution ────────────────────────────────────────────────
+    lines.append("## 2. Resolution")
+    lines.append("")
+    if case.status == "RESOLVED":
+        lines.append(f"_Resolved {_iso(case.resolved_at_ms)}_")
+        lines.append("")
+        lines.append(case.resolution_summary or "_(no summary recorded)_")
+    else:
+        lines.append(f"_Not resolved (current status: {case.status})._")
+    lines.append("")
+
+    # ── 3. Evidence ─────────────────────────────────────────────────
+    lines.append(f"## 3. Linked evidence ({detail['evidence_count']})")
+    lines.append("")
+    if not detail["evidence"]:
+        lines.append("_None linked._")
+    else:
+        lines.append("| Linked at | Type | Ref | Note |")
+        lines.append("|---|---|---|---|")
+        for e in detail["evidence"]:
+            ref = e["ref_key"]
+            if e.get("ref_id"):
+                ref += f" (id={e['ref_id']})"
+            note = (e.get("note") or "").replace("\n", " ").replace("|", "\\|")
+            lines.append(f"| {_iso(e['linked_at_ms'])} | `{e['evidence_type']}` | `{ref}` | {note} |")
+    lines.append("")
+
+    # ── 4. Operator notes ────────────────────────────────────────────
+    lines.append(f"## 4. Operator notes ({detail['note_count']}, append-only)")
+    lines.append("")
+    if not detail["notes"]:
+        lines.append("_No notes recorded._")
+    else:
+        # Oldest-first in the export so the narrative reads chronologically.
+        for n in sorted(detail["notes"], key=lambda n: n["created_at_ms"]):
+            lines.append(f"### {_iso(n['created_at_ms'])} — `{n['note_type']}` (user_id={n['author_id']})")
+            lines.append("")
+            lines.append(n["body"])
+            lines.append("")
+
+    # ── 5. Causal / dependency tree ──────────────────────────────────
+    lines.append(f"## 5. Investigation tree ({tree.get('node_count', 0)} nodes, {tree.get('edge_count', 0)} edges)")
+    lines.append("")
+    if not tree.get("edges"):
+        lines.append("_No supporting structural edges found for the linked evidence._")
+    else:
+        lines.append("| Edge | Kind | Confidence | Rationale |")
+        lines.append("|---|---|---|---|")
+        for e in tree["edges"]:
+            rat = (e.get("rationale") or "").replace("|", "\\|")
+            lines.append(
+                f"| `{e['from']}` → `{e['to']}` | `{e['kind']}` "
+                f"| {float(e.get('confidence') or 0):.2f} | {rat} |"
+            )
+    lines.append("")
+    lines.append(
+        "> "
+        + (tree.get("rationale_note") or "Diagnostic graph, not a deterministic causality engine.")
+    )
+    lines.append("")
+
+    # ── 6. Timeline ──────────────────────────────────────────────────
+    lines.append(f"## 6. Timeline ({len(timeline.get('events', []))})")
+    lines.append("")
+    if not timeline.get("events"):
+        lines.append("_No timeline events._")
+    else:
+        lines.append("| When | Source | Event | Note |")
+        lines.append("|---|---|---|---|")
+        # Oldest-first for export readability.
+        for e in sorted(timeline["events"], key=lambda x: x["ts_ms"]):
+            note = (e.get("note") or "")
+            if not note and e.get("payload"):
+                pairs = list((e.get("payload") or {}).items())[:3]
+                note = ", ".join(f"{k}={v}" for k, v in pairs)
+            note = note.replace("\n", " ").replace("|", "\\|")[:200]
+            lines.append(f"| {_iso(e['ts_ms'])} | `{e['source']}` | `{e['event_type']}` | {note} |")
+    lines.append("")
+
+    # ── 7. Similar cases ─────────────────────────────────────────────
+    lines.append(f"## 7. Similar prior cases ({len(similar.get('similar') or [])})")
+    lines.append("")
+    if not similar.get("similar"):
+        lines.append("_No prior cases above the similarity floor._")
+    else:
+        for s in similar["similar"]:
+            lines.append(f"- **#{s['id']}** ({s['status']}, {s['severity']}, score {s['similarity_score']}) — {s['title']}")
+            for r in s["reasons"]:
+                lines.append(f"  - {r}")
+    lines.append("")
+
+    # ── 8. Audit footer ──────────────────────────────────────────────
+    lines.append("## 8. Audit metadata")
+    lines.append("")
+    lines.append(f"- last_touched_by: user_id={case.last_touched_by}")
+    lines.append(f"- last_touched_at: {_iso(case.last_touched_at_ms)}")
+    lines.append(f"- evidence_count: {detail['evidence_count']}")
+    lines.append(f"- note_count: {detail['note_count']}")
+    lines.append(f"- event_count: {detail['event_count']}")
+    lines.append("")
+    lines.append("_End of export._")
+
+    markdown = "\n".join(lines)
+    return {
+        "found": True,
+        "id": case_id,
+        "title": case.title,
+        "generated_at_ms": _inv_now_ms(),
+        "markdown": markdown,
+        "char_count": len(markdown),
+    }
+
+
 def sanity_audit(db: Session) -> dict:
     """Integrity-monitoring engine for the discovery layer.
 

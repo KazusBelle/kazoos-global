@@ -3499,6 +3499,463 @@ async def operator_digest_endpoint(
     return OperatorDigestOut(**_research.operator_digest(db, window_hours=window_hours))
 
 
+# ── Phase 18 — Investigation & Casework Layer ────────────────────────
+
+
+class InvestigationEvidenceLink(BaseModel):
+    evidence_type: str
+    ref_key: str
+    ref_id: Optional[int] = None
+    snapshot: Optional[dict] = None
+    note: Optional[str] = None
+
+
+class InvestigationCreateIn(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    severity: Optional[str] = "warn"
+    tags: Optional[List[str]] = None
+    assigned_to: Optional[int] = None
+    replay_anchor_ms: Optional[int] = None
+    replay_window_start_ms: Optional[int] = None
+    replay_window_end_ms: Optional[int] = None
+    primary_symbol: Optional[str] = None
+    related_symbols: Optional[List[str]] = None
+    collaborators: Optional[List[int]] = None
+    initial_evidence: Optional[List[InvestigationEvidenceLink]] = None
+
+
+class InvestigationOut(BaseModel):
+    id: int
+    title: str
+    description: str
+    severity: str
+    status: str
+    tags: List[str]
+    created_by: Optional[int] = None
+    assigned_to: Optional[int] = None
+    origin_kind: str
+    origin_fingerprint: Optional[str] = None
+    replay_anchor_ms: Optional[int] = None
+    replay_window_start_ms: Optional[int] = None
+    replay_window_end_ms: Optional[int] = None
+    primary_symbol: Optional[str] = None
+    related_symbols: List[str] = []
+    collaborators: List[int] = []
+    last_touched_by: Optional[int] = None
+    last_touched_at_ms: Optional[int] = None
+    resolution_summary: Optional[str] = None
+    resolved_at_ms: Optional[int] = None
+    created_at_ms: int
+    updated_at_ms: int
+
+
+class InvestigationListOut(BaseModel):
+    total: int
+    items: List[InvestigationOut]
+    offset: int
+    limit: int
+
+
+class InvestigationEvidenceOut(BaseModel):
+    id: int
+    evidence_type: str
+    ref_id: Optional[int] = None
+    ref_key: str
+    snapshot: Optional[dict] = None
+    note: Optional[str] = None
+    linked_at_ms: int
+    linked_by: Optional[int] = None
+
+
+class InvestigationNoteOut(BaseModel):
+    id: int
+    note_type: str
+    body: str
+    author_id: Optional[int] = None
+    created_at_ms: int
+
+
+class InvestigationDetailOut(InvestigationOut):
+    evidence: List[InvestigationEvidenceOut]
+    notes: List[InvestigationNoteOut]
+    evidence_count: int
+    note_count: int
+    event_count: int
+
+
+class InvestigationUpdateIn(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[str] = None
+    status: Optional[str] = None
+    tags: Optional[List[str]] = None
+    assigned_to: Optional[int] = None
+    resolution_summary: Optional[str] = None
+    primary_symbol: Optional[str] = None
+    related_symbols: Optional[List[str]] = None
+    collaborators: Optional[List[int]] = None
+    replay_anchor_ms: Optional[int] = None
+    replay_window_start_ms: Optional[int] = None
+    replay_window_end_ms: Optional[int] = None
+    handoff_note: Optional[str] = None
+
+
+class InvestigationNoteIn(BaseModel):
+    body: str
+    note_type: Optional[str] = "note"
+
+
+class InvestigationEvidenceCreateOut(BaseModel):
+    id: int
+    investigation_id: int
+    evidence_type: str
+    ref_id: Optional[int] = None
+    ref_key: str
+    note: Optional[str] = None
+    linked_at_ms: int
+    linked_by: Optional[int] = None
+
+
+class InvestigationTimelineEvent(BaseModel):
+    ts_ms: int
+    source: str
+    event_type: str
+    actor_id: Optional[int] = None
+    payload: Optional[dict] = None
+    note: Optional[str] = None
+
+
+class InvestigationTimelineOut(BaseModel):
+    found: bool
+    id: int
+    title: Optional[str] = None
+    status: Optional[str] = None
+    events: List[InvestigationTimelineEvent]
+    event_count: Optional[int] = None
+    limit: Optional[int] = None
+
+
+@router.post("/research/investigations", response_model=InvestigationOut)
+async def investigation_create_endpoint(
+    payload: InvestigationCreateIn = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InvestigationOut:
+    initial = None
+    if payload.initial_evidence:
+        initial = [e.model_dump() for e in payload.initial_evidence]
+    try:
+        case = _research.investigation_create(
+            db,
+            title=payload.title,
+            description=payload.description or "",
+            severity=payload.severity or "warn",
+            tags=payload.tags,
+            created_by=user.id,
+            assigned_to=payload.assigned_to,
+            origin_kind="manual",
+            replay_anchor_ms=payload.replay_anchor_ms,
+            replay_window_start_ms=payload.replay_window_start_ms,
+            replay_window_end_ms=payload.replay_window_end_ms,
+            primary_symbol=payload.primary_symbol,
+            related_symbols=payload.related_symbols,
+            collaborators=payload.collaborators,
+            initial_evidence=initial,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InvestigationOut(**case)
+
+
+@router.get("/research/investigations", response_model=InvestigationListOut)
+async def investigation_list_endpoint(
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationListOut:
+    try:
+        result = _research.investigation_list(
+            db, status=status, severity=severity, tag=tag,
+            search=search, limit=limit, offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InvestigationListOut(**result)
+
+
+@router.get("/research/investigations/{case_id}", response_model=InvestigationDetailOut)
+async def investigation_detail_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationDetailOut:
+    result = _research.investigation_detail(db, case_id=case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    result.pop("found", None)
+    return InvestigationDetailOut(**result)
+
+
+@router.patch("/research/investigations/{case_id}", response_model=InvestigationOut)
+async def investigation_update_endpoint(
+    case_id: int,
+    payload: InvestigationUpdateIn = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InvestigationOut:
+    try:
+        updated = _research.investigation_update(
+            db, case_id,
+            actor_id=user.id,
+            title=payload.title,
+            description=payload.description,
+            severity=payload.severity,
+            status=payload.status,
+            tags=payload.tags,
+            assigned_to=payload.assigned_to,
+            resolution_summary=payload.resolution_summary,
+            primary_symbol=payload.primary_symbol,
+            related_symbols=payload.related_symbols,
+            collaborators=payload.collaborators,
+            replay_anchor_ms=payload.replay_anchor_ms,
+            replay_window_start_ms=payload.replay_window_start_ms,
+            replay_window_end_ms=payload.replay_window_end_ms,
+            handoff_note=payload.handoff_note,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InvestigationOut(**updated)
+
+
+@router.post("/research/investigations/{case_id}/notes", response_model=InvestigationNoteOut)
+async def investigation_add_note_endpoint(
+    case_id: int,
+    payload: InvestigationNoteIn = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InvestigationNoteOut:
+    try:
+        note = _research.investigation_add_note(
+            db, case_id,
+            body=payload.body,
+            note_type=payload.note_type or "note",
+            author_id=user.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InvestigationNoteOut(**{
+        k: v for k, v in note.items() if k in {
+            "id", "note_type", "body", "author_id", "created_at_ms",
+        }
+    })
+
+
+@router.post("/research/investigations/{case_id}/evidence", response_model=InvestigationEvidenceCreateOut)
+async def investigation_link_evidence_endpoint(
+    case_id: int,
+    payload: InvestigationEvidenceLink = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> InvestigationEvidenceCreateOut:
+    try:
+        ev = _research.investigation_link_evidence(
+            db, case_id,
+            evidence_type=payload.evidence_type,
+            ref_key=payload.ref_key,
+            ref_id=payload.ref_id,
+            snapshot=payload.snapshot,
+            note=payload.note,
+            linked_by=user.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return InvestigationEvidenceCreateOut(**ev)
+
+
+@router.delete("/research/investigations/{case_id}/evidence/{evidence_id}")
+async def investigation_unlink_evidence_endpoint(
+    case_id: int,
+    evidence_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    try:
+        return _research.investigation_unlink_evidence(
+            db, case_id, evidence_id, actor_id=user.id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/research/investigations/{case_id}/timeline", response_model=InvestigationTimelineOut)
+async def investigation_timeline_endpoint(
+    case_id: int,
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationTimelineOut:
+    result = _research.investigation_timeline(db, case_id, limit=limit)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return InvestigationTimelineOut(**result)
+
+
+class InvestigationTreeNode(BaseModel):
+    id: str
+    kind: str
+    label: str
+    status: Optional[str] = None
+    severity: Optional[str] = None
+    occurred_at_ms: Optional[int] = None
+    verdict: Optional[str] = None
+
+
+class InvestigationTreeEdge(BaseModel):
+    edge_from: str
+    edge_to: str
+    kind: str
+    confidence: float
+    rationale: str
+
+
+class InvestigationTreeOut(BaseModel):
+    found: bool
+    id: int
+    case_status: Optional[str] = None
+    primary_symbol: Optional[str] = None
+    lookback_days: Optional[int] = None
+    nodes: List[InvestigationTreeNode] = []
+    edges: List[InvestigationTreeEdge] = []
+    node_count: int = 0
+    edge_count: int = 0
+    rationale_note: Optional[str] = None
+
+
+@router.get("/research/investigations/{case_id}/causal-tree", response_model=InvestigationTreeOut)
+async def investigation_causal_tree_endpoint(
+    case_id: int,
+    lookback_days: int = Query(7, ge=1, le=60),
+    max_nodes: int = Query(60, ge=10, le=200),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationTreeOut:
+    result = _research.investigation_causal_tree(
+        db, case_id, lookback_days=lookback_days, max_nodes=max_nodes,
+    )
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    # Rename `from`/`to` to avoid the Python reserved word in Pydantic.
+    edges = [
+        InvestigationTreeEdge(
+            edge_from=e["from"], edge_to=e["to"],
+            kind=e["kind"], confidence=e["confidence"], rationale=e["rationale"],
+        )
+        for e in result.get("edges") or []
+    ]
+    nodes = [InvestigationTreeNode(**n) for n in result.get("nodes") or []]
+    return InvestigationTreeOut(
+        found=True,
+        id=result["id"],
+        case_status=result.get("case_status"),
+        primary_symbol=result.get("primary_symbol"),
+        lookback_days=result.get("lookback_days"),
+        nodes=nodes,
+        edges=edges,
+        node_count=result.get("node_count", 0),
+        edge_count=result.get("edge_count", 0),
+        rationale_note=result.get("rationale_note"),
+    )
+
+
+class InvestigationSimilarItem(BaseModel):
+    id: int
+    title: str
+    status: str
+    severity: str
+    origin_kind: str
+    resolved_at_ms: Optional[int] = None
+    updated_at_ms: int
+    similarity_score: float
+    reasons: List[str]
+
+
+class InvestigationSimilarOut(BaseModel):
+    found: bool
+    id: int
+    similar: List[InvestigationSimilarItem] = []
+    candidates_compared: int = 0
+    min_score: float = 0.0
+
+
+@router.get("/research/investigations/{case_id}/similar", response_model=InvestigationSimilarOut)
+async def investigation_similar_endpoint(
+    case_id: int,
+    limit: int = Query(10, ge=1, le=50),
+    min_score: float = Query(10.0, ge=0.0, le=100.0),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationSimilarOut:
+    result = _research.investigation_similar(
+        db, case_id, limit=limit, min_score=min_score,
+    )
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return InvestigationSimilarOut(**result)
+
+
+class InvestigationExportOut(BaseModel):
+    found: bool
+    id: int
+    title: str
+    generated_at_ms: int
+    markdown: str
+    char_count: int
+
+
+@router.get("/research/investigations/{case_id}/export", response_model=InvestigationExportOut)
+async def investigation_export_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> InvestigationExportOut:
+    result = _research.investigation_export_markdown(db, case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return InvestigationExportOut(**result)
+
+
+@router.get("/research/investigations/{case_id}/export.md", response_class=Response)
+async def investigation_export_md_endpoint(
+    case_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> Response:
+    """Plain-text export, served as text/markdown. Useful for direct
+    download via the browser and audit pipelines that ingest .md files."""
+    result = _research.investigation_export_markdown(db, case_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"investigation {case_id} not found")
+    return Response(
+        content=result["markdown"],
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="investigation-{case_id}.md"',
+        },
+    )
+
+
 class WorkerHeartbeat(BaseModel):
     task: str
     last_tick_ms: Optional[int] = None

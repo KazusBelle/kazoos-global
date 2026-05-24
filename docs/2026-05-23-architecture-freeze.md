@@ -156,6 +156,22 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | TTL | 120s |
 | Reversibility | Pure read; turning the loop off = downstream stops reading the modifier |
 
+### Layer 11 — Investigation & Casework (Phase 18)
+
+| | |
+|---|---|
+| Code | `investigation_*` functions in `research.py` |
+| Purpose | Operator-owned forensic casework. Aggregates evidence + append-only notes + lifecycle history; renders causal trees, surfaces similar prior cases, exports audit-friendly markdown |
+| Tables | `investigations`, `investigation_evidence`, `investigation_notes`, `investigation_events` |
+| Lifecycle | OPEN · INVESTIGATING · MONITORING · RESOLVED · ARCHIVED (RESOLVED requires `resolution_summary`; ARCHIVED is one-way) |
+| Auto-draft | Worker opens a draft on `crisis_genesis` verdict=`PRE_CASCADE`, deduped by sorted-contributing-probes fingerprint. Worker loop cadence 300s |
+| Evidence types | alert · anomaly · operator_priority · propagation_edge · causal_chain · narrative_section · symbol · transition · dependency_cluster · file |
+| Causal tree | Joins linked evidence with `liquidity_anomaly_edges` + `propagation_graph` + `structural_dependencies` + `market_state_transitions`. Every edge carries explicit `kind` + `confidence` from upstream + free-text `rationale`. Not deterministic causality — investigation support |
+| Similarity | Deterministic scoring (origin_fingerprint=40, symbol Jaccard×25, op-priority overlap×15, tag overlap×10, severity=5, origin_kind=5). Every reason exposed in `reasons[]`. No ML, no embeddings |
+| Export | Stable 8-section markdown: Summary · Resolution · Evidence · Notes · Tree · Timeline · Similar · Audit metadata. Served as JSON + plain `.md` download |
+| Multi-operator | `assigned_to` + `collaborators_json` + `last_touched_by/at`. Handoff note logged on assignment change. `@handle` mentions in notes emit `mention` events |
+| Properties | Append-only history (notes never edited, events never deleted), explainable, replay-aware (`replay_anchor_ms` + window), scarcity-aware via upstream layers, NOT a trading engine |
+
 ### Layer 10 — Operator Layer (Phase 17)
 
 | | |
@@ -466,6 +482,23 @@ lifecycle (DB-backed):
 | `/research/crisis-genesis` | 7-probe composite | <200 ms | 7 ms | 120s | DISC banner | 🟡 |
 | `/admin/runtime-health` | Pool + cache + heartbeats + tables | <50 ms | <50 ms | none | (ops use) | 🟡 |
 
+### Phase 18 — Investigation & Casework
+
+| route | purpose | cold | warm | TTL |
+|---|---|---|---|---|
+| `POST /research/investigations` | Create case (manual or with initial evidence) | <50 ms | — | none |
+| `GET /research/investigations` | List with status/severity/tag/search filters | <50 ms | — | none |
+| `GET /research/investigations/{id}` | Full case detail (+ evidence + notes counts) | <50 ms | — | none |
+| `PATCH /research/investigations/{id}` | Update fields; status transitions logged | <50 ms | — | none |
+| `POST /research/investigations/{id}/notes` | Append-only note (with `@mention` parsing) | <50 ms | — | none |
+| `POST /research/investigations/{id}/evidence` | Link evidence (idempotent on triple) | <50 ms | — | none |
+| `DELETE /research/investigations/{id}/evidence/{eid}` | Unlink (audit-logged) | <50 ms | — | none |
+| `GET /research/investigations/{id}/timeline` | Hybrid timeline — case events + JOINed upstream | <100 ms | — | none |
+| `GET /research/investigations/{id}/causal-tree` | Typed graph with per-edge confidence + rationale | ~200 ms | — | none |
+| `GET /research/investigations/{id}/similar` | Deterministic similarity to prior cases | <100 ms | — | none |
+| `GET /research/investigations/{id}/export` | Stable 8-section markdown (JSON) | <200 ms | — | none |
+| `GET /research/investigations/{id}/export.md` | Same, as plain text/markdown download | <200 ms | — | none |
+
 ### Phase 15 causal layers
 
 | route | purpose | cold | warm | TTL |
@@ -538,6 +571,10 @@ Postgres 16, single instance, no replication. Sizes as of 2026-05-23.
 | `liquidity_anomaly_memory` | 64 kB | 16 | ~10 | 180d | anomaly recorder | `(occurred_at)`, `(kind)` |
 | `operator_priority_events` | 64 kB | 11 | varies | 90d | operator | `(key, ts)`, `(ts, type)` |
 | `operator_acknowledgements` | 64 kB | 3 | low | 180d | operator | `(key, active)`, `(created_at)` |
+| `investigations` | new | 0 | per case | unbounded (small) | operator/worker | `(status)`, `(severity)`, `(updated_at_ms)`, `(origin_fingerprint)`, `(primary_symbol)` |
+| `investigation_evidence` | new | 0 | per link | bound to case | operator | `(investigation_id)`, `(evidence_type, ref_key)`, unique triple |
+| `investigation_notes` | new | 0 | per note | append-only | operator | `(investigation_id, created_at_ms)` |
+| `investigation_events` | new | 0 | per event | append-only | operator | `(investigation_id, ts_ms)`, `(ts_ms, event_type)` |
 | `users`, `coins`, `system_status`, `liquidity_ws_status`, `liquidity_pins`, `liquidity_annotations`, `structure_overrides`, `user_tda_states`, `liquidity_crossex_history` | < 70 kB each | small | low | unbounded (small) | various | — |
 
 **Steady-state projection at 1y:** ~7 GB total. `liquidity_samples` (35d retention) dominates at ~6.6 GB; everything else bounded. Adopt aggregation tier (`docs/2026-05-23-p1-hardening-plan.md` §1) before scaling symbol count 2×.
@@ -666,6 +703,7 @@ These layers have been live with real data, audited under load, and the operator
 - **Sanity Audit** + **Runtime Health** — operational visibility
 - **Research aggregators**: synthesis, multi-horizon, risk_state, structural_breaks, regime_shift_warning, meta_confidence, meta_intelligence_health, strategic_state, signal_reliability, transition_forecast
 - **Operator Queue + Persistence** (Phase 17) — operator workflow now durable
+- **Investigation lifecycle / persistence / append-only history** (Phase 18 Pass A & B core) — DB schema, CRUD, evidence linking, notes, lifecycle audit, markdown export
 - **Retention loop** — protects against unbounded storage growth
 - **Adaptation modifiers** (Phase 16) — bounded, explainable, reversible
 
@@ -680,6 +718,8 @@ These layers are valuable but their absolute numbers should be read as "best cur
 - **Narrative Causality** — deterministic template-built; safe to read. The probabilistic phrasing is the feature.
 - **Memory Graph / Anomaly Lineage** — small now, will need rendering limits (P2 backlog) at scale.
 - **Pattern Discovery / Hidden Regimes / Crisis Archetypes** — data-driven mining, all guarded by `data_quality`.
+- **Investigation causal tree / similarity** (Phase 18 Pass B) — investigation-support graphs and deterministic case similarity. Tree edges come from already-stable upstream layers (anomaly genealogy, propagation, structural deps, transitions); similarity is rule-based (no ML). Useful diagnostically; reasons always exposed.
+- **Investigation auto-draft** — only fires on `crisis_genesis = PRE_CASCADE` with deduped fingerprint. Treat the absolute count of auto-drafts as exploratory until the genesis layer itself stabilizes.
 
 ### Frozen interfaces (do not break)
 

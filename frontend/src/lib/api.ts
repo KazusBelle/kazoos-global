@@ -2160,3 +2160,283 @@ export type SanityAudit = {
 export async function getSanityAudit() {
   return request<SanityAudit>("/liquidity/research/sanity-audit");
 }
+
+// ── Phase 18 — Investigation & Casework Layer ─────────────────────────
+
+export type InvestigationStatus = "OPEN" | "INVESTIGATING" | "MONITORING" | "RESOLVED" | "ARCHIVED";
+export type InvestigationSeverity = "info" | "warn" | "critical";
+export type InvestigationEvidenceType =
+  | "alert" | "anomaly" | "operator_priority" | "propagation_edge"
+  | "causal_chain" | "narrative_section" | "symbol" | "transition"
+  | "dependency_cluster" | "file";
+export type InvestigationNoteType =
+  | "note" | "hypothesis" | "conclusion" | "false_positive"
+  | "needs_monitoring" | "confirmed_structural" | "coincidence" | "comment";
+
+export type Investigation = {
+  id: number;
+  title: string;
+  description: string;
+  severity: InvestigationSeverity;
+  status: InvestigationStatus;
+  tags: string[];
+  created_by: number | null;
+  assigned_to: number | null;
+  origin_kind: string;
+  origin_fingerprint: string | null;
+  replay_anchor_ms: number | null;
+  replay_window_start_ms: number | null;
+  replay_window_end_ms: number | null;
+  primary_symbol: string | null;
+  related_symbols: string[];
+  collaborators: number[];
+  last_touched_by: number | null;
+  last_touched_at_ms: number | null;
+  resolution_summary: string | null;
+  resolved_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
+export type InvestigationEvidence = {
+  id: number;
+  evidence_type: InvestigationEvidenceType;
+  ref_id: number | null;
+  ref_key: string;
+  snapshot: Record<string, unknown> | null;
+  note: string | null;
+  linked_at_ms: number;
+  linked_by: number | null;
+};
+
+export type InvestigationNote = {
+  id: number;
+  note_type: InvestigationNoteType;
+  body: string;
+  author_id: number | null;
+  created_at_ms: number;
+};
+
+export type InvestigationDetail = Investigation & {
+  evidence: InvestigationEvidence[];
+  notes: InvestigationNote[];
+  evidence_count: number;
+  note_count: number;
+  event_count: number;
+};
+
+export type InvestigationTimelineEvent = {
+  ts_ms: number;
+  source: string;
+  event_type: string;
+  actor_id: number | null;
+  payload: Record<string, unknown> | null;
+  note: string | null;
+};
+
+export type InvestigationTimeline = {
+  found: boolean;
+  id: number;
+  title?: string;
+  status?: InvestigationStatus;
+  events: InvestigationTimelineEvent[];
+  event_count?: number;
+  limit?: number;
+};
+
+export type InvestigationList = {
+  total: number;
+  items: Investigation[];
+  offset: number;
+  limit: number;
+};
+
+export type InvestigationEvidenceInput = {
+  evidence_type: InvestigationEvidenceType;
+  ref_key: string;
+  ref_id?: number | null;
+  snapshot?: Record<string, unknown> | null;
+  note?: string | null;
+};
+
+export async function listInvestigations(opts: {
+  status?: string;
+  severity?: InvestigationSeverity;
+  tag?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+} = {}) {
+  const usp = new URLSearchParams();
+  if (opts.status) usp.set("status", opts.status);
+  if (opts.severity) usp.set("severity", opts.severity);
+  if (opts.tag) usp.set("tag", opts.tag);
+  if (opts.search) usp.set("search", opts.search);
+  if (opts.limit != null) usp.set("limit", String(opts.limit));
+  if (opts.offset != null) usp.set("offset", String(opts.offset));
+  const qs = usp.toString();
+  return request<InvestigationList>(`/liquidity/research/investigations${qs ? `?${qs}` : ""}`);
+}
+
+export async function createInvestigation(payload: {
+  title: string;
+  description?: string;
+  severity?: InvestigationSeverity;
+  tags?: string[];
+  assigned_to?: number | null;
+  replay_anchor_ms?: number | null;
+  replay_window_start_ms?: number | null;
+  replay_window_end_ms?: number | null;
+  primary_symbol?: string | null;
+  related_symbols?: string[];
+  collaborators?: number[];
+  initial_evidence?: InvestigationEvidenceInput[];
+}) {
+  return request<Investigation>("/liquidity/research/investigations", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getInvestigation(case_id: number) {
+  return request<InvestigationDetail>(`/liquidity/research/investigations/${case_id}`);
+}
+
+export async function updateInvestigation(case_id: number, payload: {
+  title?: string;
+  description?: string;
+  severity?: InvestigationSeverity;
+  status?: InvestigationStatus;
+  tags?: string[];
+  assigned_to?: number | null;
+  resolution_summary?: string;
+  primary_symbol?: string | null;
+  related_symbols?: string[];
+  collaborators?: number[];
+  replay_anchor_ms?: number | null;
+  replay_window_start_ms?: number | null;
+  replay_window_end_ms?: number | null;
+  handoff_note?: string;
+}) {
+  return request<Investigation>(`/liquidity/research/investigations/${case_id}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function addInvestigationNote(case_id: number, body: string, note_type: InvestigationNoteType = "note") {
+  return request<InvestigationNote>(`/liquidity/research/investigations/${case_id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ body, note_type }),
+  });
+}
+
+export async function linkInvestigationEvidence(case_id: number, payload: InvestigationEvidenceInput) {
+  return request<InvestigationEvidence & { investigation_id: number }>(
+    `/liquidity/research/investigations/${case_id}/evidence`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export async function unlinkInvestigationEvidence(case_id: number, evidence_id: number) {
+  return request<{ removed: boolean; evidence_id: number }>(
+    `/liquidity/research/investigations/${case_id}/evidence/${evidence_id}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getInvestigationTimeline(case_id: number, limit = 200) {
+  return request<InvestigationTimeline>(
+    `/liquidity/research/investigations/${case_id}/timeline?limit=${limit}`,
+  );
+}
+
+// ── Pass B: causal tree, similarity, export ──────────────────────────
+
+export type InvestigationTreeNode = {
+  id: string;
+  kind: string;
+  label: string;
+  status?: string | null;
+  severity?: string | null;
+  occurred_at_ms?: number | null;
+  verdict?: string | null;
+};
+
+export type InvestigationTreeEdge = {
+  edge_from: string;
+  edge_to: string;
+  kind: string;
+  confidence: number;
+  rationale: string;
+};
+
+export type InvestigationTree = {
+  found: boolean;
+  id: number;
+  case_status: string | null;
+  primary_symbol: string | null;
+  lookback_days: number | null;
+  nodes: InvestigationTreeNode[];
+  edges: InvestigationTreeEdge[];
+  node_count: number;
+  edge_count: number;
+  rationale_note: string | null;
+};
+
+export async function getInvestigationCausalTree(case_id: number, opts: { lookback_days?: number; max_nodes?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.lookback_days != null) usp.set("lookback_days", String(opts.lookback_days));
+  if (opts.max_nodes != null) usp.set("max_nodes", String(opts.max_nodes));
+  const qs = usp.toString();
+  return request<InvestigationTree>(
+    `/liquidity/research/investigations/${case_id}/causal-tree${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type InvestigationSimilarItem = {
+  id: number;
+  title: string;
+  status: InvestigationStatus;
+  severity: InvestigationSeverity;
+  origin_kind: string;
+  resolved_at_ms: number | null;
+  updated_at_ms: number;
+  similarity_score: number;
+  reasons: string[];
+};
+
+export type InvestigationSimilar = {
+  found: boolean;
+  id: number;
+  similar: InvestigationSimilarItem[];
+  candidates_compared: number;
+  min_score: number;
+};
+
+export async function getInvestigationSimilar(case_id: number, opts: { limit?: number; min_score?: number } = {}) {
+  const usp = new URLSearchParams();
+  if (opts.limit != null) usp.set("limit", String(opts.limit));
+  if (opts.min_score != null) usp.set("min_score", String(opts.min_score));
+  const qs = usp.toString();
+  return request<InvestigationSimilar>(
+    `/liquidity/research/investigations/${case_id}/similar${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type InvestigationExport = {
+  found: boolean;
+  id: number;
+  title: string;
+  generated_at_ms: number;
+  markdown: string;
+  char_count: number;
+};
+
+export async function getInvestigationExport(case_id: number) {
+  return request<InvestigationExport>(`/liquidity/research/investigations/${case_id}/export`);
+}
+
+export function investigationExportDownloadUrl(case_id: number): string {
+  return `/api/liquidity/research/investigations/${case_id}/export.md`;
+}

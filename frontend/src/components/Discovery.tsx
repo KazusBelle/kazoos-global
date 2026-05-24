@@ -24,6 +24,7 @@ import {
   getOperatorPriorities,
   getStructuralDependencies,
   postOperatorAck,
+  createInvestigation,
   getEvolutionaryBehavior,
   getHiddenRegimes,
   getIntelligenceForecast,
@@ -385,11 +386,13 @@ function OperatorPriorityItemRow({
   item,
   onAction,
   onHistory,
+  onInvestigate,
   busy,
 }: {
   item: OperatorPriorityItem;
   onAction: (key: string, action: OperatorAckAction) => void;
   onHistory: (key: string) => void;
+  onInvestigate: (item: OperatorPriorityItem) => void;
   busy: boolean;
 }) {
   const escColor = ESCALATION_COLOR[item.escalation_state];
@@ -481,6 +484,11 @@ function OperatorPriorityItemRow({
             className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200 hover:border-zinc-400"
             title="show escalation history"
           >hist</button>
+          <button
+            onClick={() => onInvestigate(item)}
+            className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-accent hover:border-accent/60"
+            title="open investigation case with this priority linked as evidence"
+          >inv</button>
         </div>
       </div>
       <div className="text-[12px] text-zinc-200 leading-snug">{item.headline}</div>
@@ -655,6 +663,44 @@ function OperatorPrioritiesPanel() {
     }
   };
 
+  const handleInvestigate = async (item: OperatorPriorityItem) => {
+    try {
+      const case_ = await createInvestigation({
+        title: `${item.kind}: ${item.headline}`.slice(0, 240),
+        description: [
+          `Investigation opened from operator priority ${item.key}.`,
+          `Score ${item.priority_score.toFixed(0)}/100 · ${item.escalation_state} · ${item.source_layer}.`,
+          item.detail || "",
+        ].filter(Boolean).join("\n"),
+        severity: item.escalation_state === "CRITICAL" ? "critical"
+                  : item.escalation_state === "IMPORTANT" ? "warn" : "info",
+        tags: ["from-queue", item.source_layer],
+        initial_evidence: [{
+          evidence_type: "operator_priority",
+          ref_key: item.key,
+          snapshot: {
+            headline: item.headline,
+            priority_score: item.priority_score,
+            escalation_state: item.escalation_state,
+            source_layer: item.source_layer,
+            kind: item.kind,
+            confidence: item.confidence,
+            severity_raw: item.severity_raw,
+          },
+          note: "auto-linked at case creation",
+        }],
+      });
+      // Cross-page navigation hook — Investigations panel listens for this.
+      window.dispatchEvent(new CustomEvent("kazus:open-investigation", {
+        detail: { case_id: case_.id },
+      }));
+      // Best-effort toast via alert (no toast lib in project).
+      alert(`Investigation #${case_.id} created. Open the INV tab to view.`);
+    } catch (e: any) {
+      alert(`Failed to create investigation: ${e?.message ?? e}`);
+    }
+  };
+
   const handleHistory = async (key: string) => {
     if (historyKey === key) {
       setHistoryKey(null);
@@ -751,6 +797,7 @@ function OperatorPrioritiesPanel() {
                 item={it}
                 onAction={handleAction}
                 onHistory={handleHistory}
+                onInvestigate={handleInvestigate}
                 busy={busyKey === it.key}
               />
             ))}

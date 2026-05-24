@@ -345,6 +345,7 @@ def _due_timeframes(boundary: datetime) -> Set[str]:
 
 _ANOMALY_INTERVAL_S = 300
 _INTEL_SNAPSHOT_INTERVAL_S = 300
+_INVESTIGATION_AUTODRAFT_INTERVAL_S = 300
 
 
 async def _anomaly_loop(stop_event: asyncio.Event) -> None:
@@ -404,6 +405,40 @@ async def _intel_snapshot_loop(stop_event: asyncio.Event) -> None:
             continue
 
 
+async def _investigation_autodraft_loop(stop_event: asyncio.Event) -> None:
+    """Phase-18 auto-draft loop. Polls crisis_genesis and opens a draft
+    investigation case whenever the verdict transitions to PRE_CASCADE
+    on a new probe-composition fingerprint. Idempotent — dedups against
+    any active case with the same fingerprint."""
+    from kazus_logic.liquidity.research import investigation_auto_draft_tick
+
+    # Stagger initial start so this doesn't fight the first poll cycle
+    # or the anomaly/intel snapshots.
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=120.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+    while not stop_event.is_set():
+        try:
+            with SessionLocal() as db:
+                drafted = investigation_auto_draft_tick(db)
+            if drafted:
+                logger.info(
+                    "investigation auto-drafted: id=%s title=%s",
+                    drafted.get("id"), drafted.get("title"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("investigation autodraft failed: %s", exc)
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=_INVESTIGATION_AUTODRAFT_INTERVAL_S,
+            )
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def main() -> None:
     settings = get_settings()
     logger.info(
@@ -450,6 +485,11 @@ async def main() -> None:
     intel_snapshot_task = asyncio.create_task(
         _intel_snapshot_loop(stop_event), name="liquidity-intel-snapshot"
     )
+    # Phase-18 investigation auto-draft loop — opens draft cases on
+    # PRE_CASCADE genesis verdicts so post-mortem has a starting point.
+    investigation_task = asyncio.create_task(
+        _investigation_autodraft_loop(stop_event), name="investigation-autodraft"
+    )
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -484,7 +524,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task):
+        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task):
             t.cancel()
             try:
                 await t

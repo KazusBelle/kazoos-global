@@ -242,6 +242,79 @@ _ADDITIVE_MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_operator_ack_key_active ON operator_acknowledgements (priority_key, active)",
     "CREATE INDEX IF NOT EXISTS ix_operator_ack_created ON operator_acknowledgements (created_at_ms)",
+    # Phase-18 investigation & casework layer.
+    """
+    CREATE TABLE IF NOT EXISTS investigations (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(240) NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        severity VARCHAR(16) NOT NULL DEFAULT 'warn',
+        status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
+        tags_json TEXT,
+        created_by INTEGER,
+        assigned_to INTEGER,
+        origin_kind VARCHAR(24) NOT NULL DEFAULT 'manual',
+        origin_fingerprint VARCHAR(96),
+        replay_anchor_ms BIGINT,
+        resolution_summary TEXT,
+        resolved_at_ms BIGINT,
+        created_at_ms BIGINT NOT NULL,
+        updated_at_ms BIGINT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_investigations_status ON investigations (status)",
+    "CREATE INDEX IF NOT EXISTS ix_investigations_severity ON investigations (severity)",
+    "CREATE INDEX IF NOT EXISTS ix_investigations_updated ON investigations (updated_at_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_investigations_origin_fingerprint ON investigations (origin_fingerprint)",
+    """
+    CREATE TABLE IF NOT EXISTS investigation_evidence (
+        id SERIAL PRIMARY KEY,
+        investigation_id INTEGER NOT NULL,
+        evidence_type VARCHAR(32) NOT NULL,
+        ref_id INTEGER,
+        ref_key VARCHAR(192) NOT NULL,
+        snapshot_json TEXT,
+        note TEXT,
+        linked_at_ms BIGINT NOT NULL,
+        linked_by INTEGER,
+        CONSTRAINT uq_investigation_evidence_triple UNIQUE (investigation_id, evidence_type, ref_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_investigation_evidence_case ON investigation_evidence (investigation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_investigation_evidence_type_key ON investigation_evidence (evidence_type, ref_key)",
+    """
+    CREATE TABLE IF NOT EXISTS investigation_notes (
+        id SERIAL PRIMARY KEY,
+        investigation_id INTEGER NOT NULL,
+        note_type VARCHAR(32) NOT NULL DEFAULT 'note',
+        body TEXT NOT NULL,
+        author_id INTEGER,
+        created_at_ms BIGINT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_investigation_notes_case_ts ON investigation_notes (investigation_id, created_at_ms)",
+    """
+    CREATE TABLE IF NOT EXISTS investigation_events (
+        id SERIAL PRIMARY KEY,
+        investigation_id INTEGER NOT NULL,
+        ts_ms BIGINT NOT NULL,
+        event_type VARCHAR(32) NOT NULL,
+        actor_id INTEGER,
+        payload_json TEXT,
+        note TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_investigation_events_case_ts ON investigation_events (investigation_id, ts_ms)",
+    "CREATE INDEX IF NOT EXISTS ix_investigation_events_ts_type ON investigation_events (ts_ms, event_type)",
+    # Phase-18 Pass B additions to investigations.
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS replay_window_start_ms BIGINT",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS replay_window_end_ms BIGINT",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS primary_symbol VARCHAR(32)",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS related_symbols_json TEXT",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS collaborators_json TEXT",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS last_touched_by INTEGER",
+    "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS last_touched_at_ms BIGINT",
+    "CREATE INDEX IF NOT EXISTS ix_investigations_primary_symbol ON investigations (primary_symbol)",
 ]
 
 

@@ -535,3 +535,156 @@ class OperatorAcknowledgement(Base):
     # Only one row per priority_key has active=True at a time. New ack
     # supersedes the previous (which gets active=False).
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+# ── Phase 18 — Investigation & Casework Layer ─────────────────────────
+
+
+class Investigation(Base):
+    """An operator-owned investigation case. Aggregates evidence, notes,
+    and lifecycle history around a finding worth tracking over time.
+
+    Cases are either operator-created or auto-drafted by the worker when
+    crisis_genesis transitions to PRE_CASCADE. Auto-drafts are marked by
+    created_by IS NULL and origin_kind='auto_pre_cascade'.
+    """
+
+    __tablename__ = "investigations"
+    __table_args__ = (
+        Index("ix_investigations_status", "status"),
+        Index("ix_investigations_severity", "severity"),
+        Index("ix_investigations_updated", "updated_at_ms"),
+        Index("ix_investigations_origin_fingerprint", "origin_fingerprint"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # info | warn | critical
+    severity: Mapped[str] = mapped_column(String(16), default="warn")
+    # OPEN | INVESTIGATING | MONITORING | RESOLVED | ARCHIVED
+    status: Mapped[str] = mapped_column(String(16), default="OPEN")
+    # JSON array of free-form tag strings
+    tags_json: Mapped[Optional[str]] = mapped_column(Text)
+    # NULL = auto-drafted by worker.
+    created_by: Mapped[Optional[int]] = mapped_column(Integer)
+    # Future-proof: forward owner. Single-user today.
+    assigned_to: Mapped[Optional[int]] = mapped_column(Integer)
+    # manual | auto_pre_cascade | reopen
+    origin_kind: Mapped[str] = mapped_column(String(24), default="manual")
+    # Fingerprint used by auto-draft dedup so we don't open N cases for
+    # the same PRE_CASCADE state.
+    origin_fingerprint: Mapped[Optional[str]] = mapped_column(String(96))
+    # Replay deep-link target: epoch-ms the operator should jump to when
+    # opening replay. Set on auto-draft (PRE_CASCADE transition time).
+    replay_anchor_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # Optional replay window around the anchor — operator's saved scope.
+    replay_window_start_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    replay_window_end_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # Primary symbol of the case (single string for quick chart-jump).
+    primary_symbol: Mapped[Optional[str]] = mapped_column(String(32))
+    # JSON array of related symbols — secondary chart context.
+    related_symbols_json: Mapped[Optional[str]] = mapped_column(Text)
+    # JSON array of collaborator user ids — multi-operator handoff state.
+    # Owner stays on `assigned_to`; collaborators get notified via mentions
+    # in notes but don't gain edit ownership.
+    collaborators_json: Mapped[Optional[str]] = mapped_column(Text)
+    # Who last performed any audit-logged action on this case. Derived
+    # field; updated on each event_log_event call.
+    last_touched_by: Mapped[Optional[int]] = mapped_column(Integer)
+    last_touched_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # Free-text summary required when status transitions to RESOLVED.
+    resolution_summary: Mapped[Optional[str]] = mapped_column(Text)
+    resolved_at_ms: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class InvestigationEvidence(Base):
+    """A typed link from an investigation to a piece of upstream evidence:
+    an alert, anomaly, operator-priority key, propagation edge, narrative
+    section, or arbitrary symbol/transition reference.
+
+    The ref_id and ref_key fields are kept loose on purpose — the upstream
+    tables are not formally foreign-keyed because evidence types span
+    independent schemas and may include synthetic refs (e.g. a
+    operator_priority_key string, or a "symbol::tf::ts" composite). A
+    snapshot of the evidence at link time is kept as JSON so the case
+    survives upstream pruning.
+    """
+
+    __tablename__ = "investigation_evidence"
+    __table_args__ = (
+        Index("ix_investigation_evidence_case", "investigation_id"),
+        Index("ix_investigation_evidence_type_key", "evidence_type", "ref_key"),
+        UniqueConstraint(
+            "investigation_id", "evidence_type", "ref_key",
+            name="uq_investigation_evidence_triple",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    investigation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # alert | anomaly | operator_priority | propagation_edge | causal_chain
+    # | narrative_section | symbol | transition | dependency_cluster | file
+    evidence_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # FK-style ref to the upstream id, when a single integer makes sense
+    # (alert.id, anomaly.id). NULL otherwise.
+    ref_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # Generic string key, used for string-identified references like
+    # operator_priority_key or "BTCUSDT::H1::1716700000000". Always set.
+    ref_key: Mapped[str] = mapped_column(String(192), nullable=False)
+    # Snapshot of the evidence payload at link time (JSON dict).
+    snapshot_json: Mapped[Optional[str]] = mapped_column(Text)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    linked_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    linked_by: Mapped[Optional[int]] = mapped_column(Integer)
+
+
+class InvestigationNote(Base):
+    """Append-only operator note attached to a case. Notes are never
+    edited or deleted — corrections are added as follow-up notes. This is
+    a strict audit-friendly property: an investigator can show the full
+    history of how their understanding evolved.
+    """
+
+    __tablename__ = "investigation_notes"
+    __table_args__ = (
+        Index("ix_investigation_notes_case_ts", "investigation_id", "created_at_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    investigation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # note | hypothesis | conclusion | false_positive | needs_monitoring
+    # | confirmed_structural | coincidence | comment
+    note_type: Mapped[str] = mapped_column(String(32), nullable=False, default="note")
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    author_id: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class InvestigationEvent(Base):
+    """Append-only lifecycle audit log for a case. Captures status
+    transitions, severity changes, evidence-link/unlink, note additions,
+    and assignment changes. Used by the case timeline (combined with
+    upstream timeline via on-read JOIN in research.py).
+    """
+
+    __tablename__ = "investigation_events"
+    __table_args__ = (
+        Index("ix_investigation_events_case_ts", "investigation_id", "ts_ms"),
+        Index("ix_investigation_events_ts_type", "ts_ms", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    investigation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # created | status_change | severity_change | tags_change | assigned
+    # | evidence_linked | evidence_unlinked | note_added | resolved
+    # | reopened | archived | auto_drafted
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # JSON payload — shape depends on event_type. E.g. status_change
+    # carries {"from": "OPEN", "to": "INVESTIGATING"}.
+    payload_json: Mapped[Optional[str]] = mapped_column(Text)
+    note: Mapped[Optional[str]] = mapped_column(Text)

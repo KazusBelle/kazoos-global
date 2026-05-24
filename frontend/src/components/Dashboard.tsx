@@ -27,6 +27,7 @@ import {
 } from "./CandleChart";
 import { Coordination } from "./Coordination";
 import { Discovery } from "./Discovery";
+import { Investigations } from "./Investigations";
 import { Liquidity } from "./Liquidity";
 import { MemoryPage } from "./Memory";
 import { Meta } from "./Meta";
@@ -62,7 +63,7 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "disc" | "server";
+type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "disc" | "inv" | "server";
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -99,6 +100,24 @@ function DiscoveryIcon({ size = 20 }: { size?: number }) {
       <circle cx="10" cy="10" r="6" stroke="currentColor" strokeWidth="1.4" />
       <path d="M10 4v2M10 14v2M4 10h2M14 10h2M5.8 5.8l1.4 1.4M12.8 12.8l1.4 1.4M5.8 14.2l1.4-1.4M12.8 7.2l1.4-1.4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
       <circle cx="10" cy="10" r="1.6" fill="currentColor" />
+    </svg>
+  );
+}
+
+function InvestigationIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <rect x="3" y="3" width="11" height="14" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M6 7h5M6 10h5M6 13h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+      <circle cx="15" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M17 16.5l1.5 1.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1223,6 +1242,24 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     localStorage.setItem(PAGE_KEY, page);
   }
 
+  // Cross-component navigation: the INV panel dispatches
+  // kazus:open-replay with {symbol, anchor_ms, window_*} when the user
+  // clicks the case-header "replay" button. Switch to the Liquidity
+  // page and stash the request in sessionStorage so the Liquidity page
+  // picks it up on mount.
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const detail = (ev as CustomEvent<any>).detail;
+      if (!detail) return;
+      try {
+        sessionStorage.setItem("kazus_replay_request", JSON.stringify(detail));
+      } catch { /* ignore */ }
+      setPage("liq");
+    };
+    window.addEventListener("kazus:open-replay", handler as EventListener);
+    return () => window.removeEventListener("kazus:open-replay", handler as EventListener);
+  }, []);
+
   function setChartSymbol(
     symbol: string | null,
     order?: string[],
@@ -1538,6 +1575,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("disc")}
             title="Discovery · Patterns · Archetypes · Hidden Regimes"
           />
+          <NavBtn
+            active={page === "inv"}
+            open={sidebarOpen}
+            icon={<InvestigationIcon size={20} />}
+            label="INV"
+            onClick={() => setPage("inv")}
+            title="Investigations · Casework · Evidence · Notes"
+          />
         </div>
 
         {/* Nav bottom */}
@@ -1752,6 +1797,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         {page === "mem" && <MemoryPage />}
 
         {page === "disc" && <Discovery />}
+        {page === "inv" && <Investigations />}
       </main>
 
       {/* ── Chart Modal ── */}
