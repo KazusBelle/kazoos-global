@@ -190,6 +190,19 @@ UX discipline: no cinematic effects, no glow, no auto-camera, no AI storytelling
 
 Performance: lazy-mounted (no fetches until the operator opens the `replay` tab); a single round-trip on mount (state + timeline + diff + propagation in parallel) plus debounced cursor-position fetches.
 
+### Attention & Trust Simplification Pass (2026-05-24, presentation-only)
+
+After the Integrity Repair Pass closed the four HIGH-severity findings from the operational review, a follow-up review (`docs/2026-05-24-stability-review.md`) identified six presentation-layer HIGH findings around operator fatigue, signal-vocabulary collisions, and trust semantics. Closed in a single presentation-layer pass — no new layer, no new endpoint, no formula change:
+
+* **Chronic vs new severity differentiation.** The sanity banner and operator-queue rows now classify each item into an attention bucket (`fresh / escalating / calming / stable / resolved`) derived from the existing `trend` and `lifecycle` fields. Persistent / chronic items render with muted color and lower visual energy; only fresh and escalating items get full saturation. The "persistent CRITICAL becomes wallpaper" failure mode is structurally addressed.
+* **Action-tier / diagnostic-tier separation on DISC.** The page splits into three visual blocks: action surfaces (Operator Queue · Sanity · Adaptation · Crisis Genesis · Narrative), an expandable "diagnostic context" accordion (Pattern Discovery · Propagation · Causal · Structural · Transitions), and an expandable "research drill-down" accordion (Archetypes · Hidden Regimes · Evolutionary · Memory · Forecast · Adaptation Recs). Nothing removed; defaults collapse the cold panels so they stop polling and stop competing for attention.
+* **Severity-vocabulary disambiguation.** Sanity findings are now prefixed with `integrity:` in the UI. Investigation severity is presented as "priority" (`investigationSeverityLabel`); alert severity keeps the canonical bare word. API contracts unchanged.
+* **Softer verdict / role wording.** `PRE_CASCADE` → "pre-cascade conditions present"; `DIRECTIONAL` → "directional pattern (lead-lag)"; `dominant_driver` → "candidate driver"; `AMPLIFIER` → "appears in chains"; `LEADER` → "appears as leader (candidate)". Every label remap lives in `frontend/src/lib/labels.ts`; raw enum values stay in the API.
+* **Replay propagation animation removed.** The per-symbol bars no longer animate (`transition` removed; renamed from "propagation playback" → "alert counts at cursor"). Animation implied causal transmission the data does not support; the operator now scrubs manually and reads a static per-bucket snapshot.
+* **Calmer chrome.** Action-tier panels keep saturation; persistent / chronic items render at ~60% opacity with neutral borders. Less simultaneous urgency; stronger contrast reserved for new/escalating signals.
+
+The strongest property of this pass is what it *did not* add: no new score, no new modifier, no new queue, no new intelligence layer.
+
 ### Layer 11 — Investigation & Casework (Phase 18)
 
 | | |

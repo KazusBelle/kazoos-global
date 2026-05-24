@@ -12,6 +12,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { investigationSeverityLabel } from "../lib/labels";
 import {
   addInvestigationNote,
   captureInvestigationReplay,
@@ -186,8 +187,8 @@ function InvestigationListPanel() {
             </button>
           ))}
         </div>
-        <div className="text-[9px] uppercase tracking-[0.14em] flex gap-1.5 items-baseline">
-          <span className="text-muted">sev:</span>
+        <div className="text-[9px] uppercase tracking-[0.14em] flex gap-1.5 items-baseline" title="Operator-chosen case priority (not engine severity)">
+          <span className="text-muted">priority:</span>
           {(["critical", "warn", "info"] as const).map((s) => (
             <button
               key={s}
@@ -198,7 +199,7 @@ function InvestigationListPanel() {
                   : "border-border/50 text-muted hover:text-zinc-200"
               }`}
             >
-              {s}
+              {investigationSeverityLabel(s)}
             </button>
           ))}
         </div>
@@ -284,8 +285,9 @@ function CaseRow({
             borderColor: sev.replace(/0\.95\)$|0\.9\)$|0\.85\)$/, "0.5)"),
             background: sev.replace(/0\.95\)$|0\.9\)$|0\.85\)$/, "0.10)"),
           }}
+          title="Operator-chosen case priority. Not the engine's alert severity."
         >
-          {c.severity}
+          {investigationSeverityLabel(c.severity)}
         </span>
         <span
           className="text-[9px] uppercase tracking-[0.14em] px-1 py-0.5 rounded-sm border"
@@ -360,18 +362,19 @@ function CreateCaseInline({
         className="w-full bg-bg/60 border border-border/40 text-[11px] px-2 py-1 rounded text-zinc-200"
       />
       <div className="flex items-baseline gap-2">
-        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">sev:</span>
+        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">priority:</span>
         {(["critical", "warn", "info"] as const).map((s) => (
           <button
             key={s}
             onClick={() => setSeverity(s)}
+            title={`Operator-chosen ${investigationSeverityLabel(s)}; not the engine's alert severity`}
             className={`text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border ${
               severity === s
                 ? "border-accent text-accent"
                 : "border-border/50 text-muted hover:text-zinc-200"
             }`}
           >
-            {s}
+            {investigationSeverityLabel(s)}
           </button>
         ))}
         <input
@@ -552,9 +555,11 @@ function CaseHeader({
         <select
           value={c.severity}
           onChange={(e) => onChange({ severity: e.target.value as InvestigationSeverity })}
+          title="Operator-chosen case priority (not engine severity)"
           className="bg-bg/60 border border-border/40 text-[10px] px-1 py-0.5 rounded text-zinc-200 uppercase tracking-[0.14em]"
         >
-          {(["critical", "warn", "info"] as const).map((s) => <option key={s} value={s}>{s}</option>)}
+          {(["critical", "warn", "info"] as const).map((s) =>
+            <option key={s} value={s}>{investigationSeverityLabel(s)}</option>)}
         </select>
         <select
           value={c.status}
@@ -1753,18 +1758,23 @@ function ReplayPropagationPlayback({
   propagation: ReplayPropagation | null;
   cursorMs: number | null;
 }) {
+  // Attention & Trust Pass §5: renamed from "propagation playback" to
+  // "alert counts at cursor". The bars are NOT animated — playback
+  // implied transmission causality the data does not support. Operator
+  // scrubs the cursor manually; each frame is a STATIC snapshot of
+  // alert-starts per symbol in that bucket.
   if (propagation == null) return null;
   if (!propagation.found || propagation.frames.length === 0) {
     return (
       <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
-        <div className="text-[11px] uppercase tracking-[0.22em] text-zinc-200 mb-1">● propagation playback</div>
-        <div className="text-[10px] text-muted">No alerts inside the case window — nothing to playback.</div>
+        <div className="text-[11px] uppercase tracking-[0.22em] text-zinc-200 mb-1">● alert counts at cursor</div>
+        <div className="text-[10px] text-muted">No alerts inside the case window — nothing to show.</div>
       </div>
     );
   }
 
-  // Find the active frame whose [ts, ts+bucket) contains cursor; if
-  // cursor is before window start show the first frame.
+  // Find the bucket whose [ts, ts+bucket) contains cursor; if cursor
+  // is before window start show the first frame.
   const bucket = propagation.bucket_ms ?? 1;
   const activeIdx = useMemo(() => {
     if (cursorMs == null) return 0;
@@ -1781,16 +1791,17 @@ function ReplayPropagationPlayback({
   return (
     <div className="rounded-lg border border-border/40 bg-bg/40 px-3 py-2.5">
       <div className="flex items-baseline gap-3 mb-2 flex-wrap">
-        <span className="text-[11px] uppercase tracking-[0.22em] text-zinc-200">● propagation playback</span>
+        <span className="text-[11px] uppercase tracking-[0.22em] text-zinc-200">● alert counts at cursor</span>
         <span className="text-[10px] text-muted">
-          frame {activeIdx + 1}/{propagation.frame_count} · bucket {Math.round(bucket / 60000)}m
+          bucket {activeIdx + 1}/{propagation.frame_count} · {Math.round(bucket / 60000)}m wide
         </span>
         <span className="text-[10px] text-muted ml-auto">
           {fmtTs(active.ts_ms)} → {fmtTs(active.ts_ms + bucket)}
         </span>
       </div>
 
-      {/* Active frame: per-symbol activation bars. */}
+      {/* Active bucket: per-symbol alert-start counts. Static. No
+          animation: animation implied causal transmission. */}
       <div className="space-y-1">
         {propagation.symbols.map((sym) => {
           const count = active.per_symbol_count[sym] ?? 0;
@@ -1805,7 +1816,7 @@ function ReplayPropagationPlayback({
                     width: `${pct}%`,
                     background: count > 0 ? "rgba(227,180,87,0.5)" : "transparent",
                     borderRight: count > 0 ? "1px solid rgba(227,180,87,0.9)" : "none",
-                    transition: "width 120ms linear",
+                    // No CSS transition. Bars are a snapshot at cursor.
                   }}
                 />
               </div>
@@ -1813,6 +1824,9 @@ function ReplayPropagationPlayback({
             </div>
           );
         })}
+      </div>
+      <div className="text-[9px] text-muted italic mt-1">
+        Counts are alert-starts per symbol in this bucket. The bars do NOT animate; advance the cursor to see other buckets.
       </div>
 
       {/* Static lead-lag edges from propagation_graph. */}

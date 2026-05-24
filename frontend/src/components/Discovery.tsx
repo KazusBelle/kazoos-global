@@ -62,39 +62,83 @@ import {
   type Propagation,
   type SanityAudit,
 } from "../lib/api";
+import {
+  causalRoleLabel,
+  causalVerdictLabel,
+  genesisVerdictLabel,
+  lifecycleAttention,
+  sanityTrendAttention,
+} from "../lib/labels";
 
 const REFRESH_MS = 60_000;
 
 export function Discovery() {
+  // Attention & Trust Pass §2: explicit action-tier / diagnostic-tier
+  // separation. The first block hosts surfaces that require operator
+  // attention. The second block (diagnostic context) is collapsed by
+  // default so it does not visually compete with the action surfaces.
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
+  const [showResearch, setShowResearch] = useState<boolean>(false);
   return (
     <div className="space-y-4">
       <div className="flex items-baseline gap-3">
         <div className="text-accent text-xl font-bold tracking-[0.3em]">DISC</div>
         <div className="text-[11px] uppercase tracking-[0.3em] text-muted">
-          autonomous discovery · archetypes · hidden regimes · propagation
+          operator surface · diagnostic + research below
         </div>
       </div>
 
+      {/* ── Action tier ──────────────────────────────────────────── */}
       <OperatorPrioritiesPanel />
       <SanityBanner />
       <AdaptationStatePanel />
       <CrisisGenesisPanel />
       <NarrativeCausalityPanel />
-      <PatternDiscoveryPanel />
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <CrisisArchetypesPanel />
-        <HiddenRegimesPanel />
+
+      {/* ── Tier separator ──────────────────────────────────────── */}
+      <div className="border-t border-border/30 pt-2 mt-2">
+        <button
+          onClick={() => setShowDiagnostics(!showDiagnostics)}
+          className="w-full text-left text-[10px] uppercase tracking-[0.22em] text-muted hover:text-zinc-200 py-1.5 flex items-baseline gap-2"
+        >
+          <span className="font-mono text-zinc-400">{showDiagnostics ? "▾" : "▸"}</span>
+          <span>diagnostic context — for investigating, not for acting on alone</span>
+        </button>
+        {showDiagnostics && (
+          <div className="space-y-4 mt-2">
+            <PatternDiscoveryPanel />
+            <PropagationPanel />
+            <CausalPropagationPanel />
+            <StructuralDependenciesPanel />
+            <MarketStateTransitionsPanel />
+          </div>
+        )}
       </div>
-      <PropagationPanel />
-      <CausalPropagationPanel />
-      <StructuralDependenciesPanel />
-      <MarketStateTransitionsPanel />
-      <EvolutionaryPanel />
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <MemoryAbstractionPanel />
-        <IntelligenceForecastPanel />
+
+      {/* ── Research tier ───────────────────────────────────────── */}
+      <div className="border-t border-border/20 pt-2">
+        <button
+          onClick={() => setShowResearch(!showResearch)}
+          className="w-full text-left text-[10px] uppercase tracking-[0.22em] text-muted hover:text-zinc-200 py-1.5 flex items-baseline gap-2"
+        >
+          <span className="font-mono text-zinc-400">{showResearch ? "▾" : "▸"}</span>
+          <span>research drill-down — analyst surfaces, low operational urgency</span>
+        </button>
+        {showResearch && (
+          <div className="space-y-4 mt-2">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <CrisisArchetypesPanel />
+              <HiddenRegimesPanel />
+            </div>
+            <EvolutionaryPanel />
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <MemoryAbstractionPanel />
+              <IntelligenceForecastPanel />
+            </div>
+            <AdaptationPanel />
+          </div>
+        )}
       </div>
-      <AdaptationPanel />
     </div>
   );
 }
@@ -271,35 +315,70 @@ function SanityBanner() {
     );
   }
 
+  // Attention & Trust Pass §1: chronic vs new differentiation.
+  // Count per-attention bucket — if everything tripping is chronic /
+  // recurring, the banner renders MUTED so it stops being wallpaper.
+  // Anything fresh or escalating restores full attention treatment.
+  const buckets = { fresh: 0, escalating: 0, calming: 0, stable: 0, resolved: 0 } as Record<string, number>;
+  for (const f of data.findings) {
+    buckets[sanityTrendAttention(f.trend)] = (buckets[sanityTrendAttention(f.trend)] || 0) + 1;
+  }
+  const hasActiveAttention = buckets.fresh > 0 || buckets.escalating > 0;
   const overallColor =
     data.overall_state === "CRITICAL" ? "rgba(214, 75, 75, 0.95)" :
     data.overall_state === "WARN" ? "rgba(227, 180, 87, 0.95)" :
     "rgba(140, 170, 235, 0.95)";
+  // Muted treatment when no new/escalating finding present:
+  // — lower border alpha, no left-saturation accent
+  // — dim header indicator (CHRONIC-marker)
+  const containerBorder = hasActiveAttention
+    ? overallColor.replace(/0\.95\)$/, "0.55)")
+    : "rgba(125, 125, 125, 0.35)";
+  const containerBg = hasActiveAttention ? "bg-panel/60" : "bg-panel/30";
+
+  // Sort: fresh & escalating first, chronic last — so the operator's
+  // eye lands on what's new even on a long scroll-list.
+  const sortedFindings = [...data.findings].sort((a, b) => {
+    const rank: Record<string, number> = { escalating: 0, fresh: 1, calming: 2, stable: 3, resolved: 4 };
+    return (rank[sanityTrendAttention(a.trend)] ?? 5) - (rank[sanityTrendAttention(b.trend)] ?? 5);
+  });
 
   return (
     <div
-      className="rounded-lg border bg-panel/60 px-3 py-2.5"
-      style={{ borderColor: overallColor.replace(/0\.95\)$/, "0.55)") }}
+      className={`rounded-lg border ${containerBg} px-3 py-2.5`}
+      style={{ borderColor: containerBorder }}
     >
-      <div className="flex items-baseline gap-3 mb-2.5">
-        <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: overallColor }}>
-          ● {data.overall_state}
+      <div className="flex items-baseline gap-3 mb-2.5 flex-wrap">
+        <span className="text-[11px] uppercase tracking-[0.22em]"
+              style={{ color: hasActiveAttention ? overallColor : "rgba(170, 170, 180, 0.7)" }}>
+          ● {hasActiveAttention ? data.overall_state : `${data.overall_state.toLowerCase()} · chronic`}
         </span>
-        <span className="text-[10px] uppercase tracking-[0.2em] text-muted">
-          {data.findings.length} of {data.check_count} checks tripped · worst severity {data.overall_score.toFixed(0)}/100
+        <span className="text-[10px] uppercase tracking-[0.18em] text-muted">
+          {buckets.fresh > 0 && <span className="text-zinc-100 mr-2">{buckets.fresh} new</span>}
+          {buckets.escalating > 0 && <span className="text-[#d68b8b] mr-2">{buckets.escalating} worsening</span>}
+          {buckets.calming > 0 && <span className="text-[#52b97a] mr-2">{buckets.calming} stabilizing</span>}
+          {buckets.stable > 0 && <span className="text-muted mr-2">{buckets.stable} chronic</span>}
+          {!hasActiveAttention && (
+            <span className="italic text-muted/70 ml-1">
+              long-known issues only — no new integrity drift
+            </span>
+          )}
         </span>
       </div>
       <ul className="space-y-2">
-        {data.findings.map((f, i) => {
+        {sortedFindings.map((f, i) => {
+          const att = sanityTrendAttention(f.trend);
           const sc = SANITY_SEVERITY_COLOR[f.severity];
           const trendColor =
             f.trend === "WORSENING" ? "text-[#d68b8b]"
               : f.trend === "STABILIZING" ? "text-[#52b97a]"
-                : f.trend === "CHRONIC" ? "text-[#e3b457]"
-                  : f.trend === "RECURRING" ? "text-[#8caaeb]"
+                : f.trend === "CHRONIC" ? "text-muted/70"
+                  : f.trend === "RECURRING" ? "text-muted/70"
                     : "text-muted";
           const human = FINDING_HUMAN[f.kind] ?? f.kind.replace(/_/g, " ");
           const trendLabel = FINDING_TREND_LABEL[f.trend] ?? f.trend.toLowerCase();
+          // Chronic / recurring findings: lower visual weight.
+          const rowDim = att === "stable" ? "opacity-60" : "";
           const tip = [
             `category    ${f.category}`,
             `kind        ${f.kind}`,
@@ -307,25 +386,35 @@ function SanityBanner() {
             `thresholds  info≥${f.info_threshold} warn≥${f.warn_threshold} crit≥${f.critical_threshold}`,
             `severity    ${f.severity_score.toFixed(0)}/100`,
             `trend       ${f.trend}`,
+            att === "stable"
+              ? `attention   chronic — visually muted; not new drift`
+              : att === "fresh" || att === "escalating"
+                ? `attention   active — needs review`
+                : `attention   ${att}`,
             ``,
             f.detail,
           ].join("\n");
           return (
-            <li key={i} title={tip}>
+            <li key={i} title={tip} className={rowDim}>
               <div className="flex items-baseline gap-2 text-[11px]">
                 <span
                   className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
                   style={{
                     color: sc,
-                    borderColor: sc.replace(/0\.95\)$/, "0.5)"),
-                    background: sc.replace(/0\.95\)$/, "0.10)"),
+                    borderColor: sc.replace(/0\.95\)$/, att === "stable" ? "0.3)" : "0.5)"),
+                    background: sc.replace(/0\.95\)$/, att === "stable" ? "0.05)" : "0.10)"),
                     minWidth: "3.4rem",
                     textAlign: "center",
                   }}
                 >
                   {f.severity_score.toFixed(0)}
                 </span>
-                <span className="text-zinc-200 flex-1">{human}</span>
+                <span className="text-zinc-200 flex-1">
+                  {/* Severity-domain disambiguation (§2.1): sanity findings */}
+                  {/* are engine-self-check, not market alerts. Soft prefix. */}
+                  <span className="text-[9px] uppercase tracking-[0.14em] text-muted/70 mr-1.5">integrity:</span>
+                  {human}
+                </span>
                 <span className={`text-[9px] uppercase tracking-[0.14em] ${trendColor} shrink-0`}>
                   {trendLabel}
                 </span>
@@ -398,6 +487,14 @@ function OperatorPriorityItemRow({
   const escColor = ESCALATION_COLOR[item.escalation_state];
   const lifeColor = LIFECYCLE_COLOR[item.lifecycle];
   const ack = item.ack ?? null;
+  // Attention & Trust Pass §1: persistent CRITICAL becomes wallpaper.
+  // Differentiate visual energy by lifecycle attention bucket.
+  // Persistent + unacked → muted (chronic-known); fresh / escalating →
+  // full saturation; calming → cool fading.
+  const att = lifecycleAttention(item.lifecycle);
+  const isChronic = att === "stable";
+  const isCalming = att === "calming";
+  const isActiveAttention = att === "fresh" || att === "escalating";
   const tip = [
     `priority      ${item.priority_score.toFixed(1)}/100  →  ${item.escalation_state}`,
     `decomposition severity ${item.severity_raw.toFixed(0)} × confidence ${(item.confidence * 100).toFixed(0)}% × recency ${(item.recency * 100).toFixed(0)}% × source_weight ${item.source_weight.toFixed(2)}`,
@@ -410,22 +507,38 @@ function OperatorPriorityItemRow({
     item.members.length > 0 ? `\nmembers: ${item.members.join(", ")}` : "",
   ].filter(Boolean).join("\n");
   const muted = ack && (ack.action === "ignore" || ack.action === "mute");
+  // Chronic (persistent + unacked) items render with low visual energy
+  // so they stop competing with new/worsening items for attention.
+  // The data is unchanged; this is presentation-layer only.
+  const chronicDim = isChronic && !ack ? "opacity-60" : "";
+  const calmingTint = isCalming ? "border-l-2 border-l-[#52b97a]/40" : "";
   return (
-    <li className={`rounded border border-border/40 bg-bg/40 px-3 py-2 ${muted ? "opacity-50" : ""}`} title={tip}>
+    <li
+      className={`rounded border bg-bg/40 px-3 py-2 ${muted ? "opacity-50" : chronicDim} ${calmingTint}`}
+      style={{
+        borderColor: isActiveAttention
+          ? escColor.replace(/0\.95\)$|0\.85\)$/, "0.55)")
+          : "rgba(255, 255, 255, 0.08)",  // chronic / stable / calming get neutral border
+      }}
+      title={tip}
+    >
       <div className="flex items-baseline gap-2 flex-wrap mb-1">
         <span
           className="inline-block rounded-sm border px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] shrink-0 tabular-nums"
           style={{
-            color: escColor,
-            borderColor: escColor.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
-            background: escColor.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+            color: isActiveAttention ? escColor : escColor.replace(/0\.95\)$|0\.85\)$/, "0.55)"),
+            borderColor: escColor.replace(/0\.95\)$|0\.85\)$/, isActiveAttention ? "0.5)" : "0.25)"),
+            background: escColor.replace(/0\.95\)$|0\.85\)$/, isActiveAttention ? "0.10)" : "0.04)"),
             minWidth: "3.4rem",
             textAlign: "center",
           }}
         >
           {item.priority_score.toFixed(0)}
         </span>
-        <span className="text-[9px] uppercase tracking-[0.14em]" style={{ color: escColor }}>
+        <span
+          className="text-[9px] uppercase tracking-[0.14em]"
+          style={{ color: isActiveAttention ? escColor : escColor.replace(/0\.95\)$|0\.85\)$/, "0.6)") }}
+        >
           {item.escalation_state}
         </span>
         <span className={`text-[9px] uppercase tracking-[0.14em]`} style={{ color: lifeColor }}>
@@ -968,13 +1081,9 @@ const GENESIS_VERDICT_COLOR: Record<CrisisGenesisVerdict, string> = {
   INSUFFICIENT:     "rgba(140, 140, 140, 0.85)",
 };
 
-const GENESIS_VERDICT_LABEL: Record<CrisisGenesisVerdict, string> = {
-  CALM:             "calm — no precursor signals materially elevated",
-  EARLY_DISTORTION: "early distortion — one or two precursor signals firing",
-  ELEVATED_RISK:    "elevated risk — multiple precursor signals firing",
-  PRE_CASCADE:      "pre-cascade — most precursor signals firing",
-  INSUFFICIENT:     "insufficient — not enough data to score",
-};
+// NOTE: Attention & Trust Pass §4 — verdict wording moved to
+// lib/labels.ts so it can be softened uniformly across the UI without
+// touching the API contract. Kept here only as a fall-through.
 
 const PROBE_STATUS_COLOR: Record<CrisisGenesisStatus, string> = {
   calm:         "rgba(82, 185, 122, 0.95)",
@@ -1002,7 +1111,11 @@ function CrisisGenesisPanel() {
   if (!data) return null;
 
   const verdictColor = GENESIS_VERDICT_COLOR[data.verdict];
-  const verdictLabel = GENESIS_VERDICT_LABEL[data.verdict];
+  // Attention & Trust Pass §4: softened wording. Headline is a phrase
+  // ("pre-cascade conditions present") not an assertive label.
+  const verdictHeadline = genesisVerdictLabel(data.verdict, "headline");
+  const verdictWording = genesisVerdictLabel(data.verdict, "wording");
+  const verdictNextAction = genesisVerdictLabel(data.verdict, "next_action");
 
   return (
     <div
@@ -1011,7 +1124,7 @@ function CrisisGenesisPanel() {
     >
       <div className="flex items-baseline gap-3 mb-2.5">
         <span className="text-[11px] uppercase tracking-[0.22em]" style={{ color: verdictColor }}>
-          ● crisis genesis · {data.verdict.toLowerCase().replace(/_/g, " ")}
+          ● crisis genesis · {verdictHeadline}
         </span>
         <span className="text-[10px] uppercase tracking-[0.18em] text-muted">
           score {data.genesis_score.toFixed(0)}/100 · confidence {(data.confidence * 100).toFixed(0)}% · {data.probe_count - data.insufficient_count}/{data.probe_count} probes contributing
@@ -1019,17 +1132,7 @@ function CrisisGenesisPanel() {
       </div>
 
       <div className="text-[11px] text-muted mb-3 leading-snug">
-        {verdictLabel}. {data.verdict === "PRE_CASCADE" ? (
-          <span className="text-[#d68b8b]">Take action before propagation widens further.</span>
-        ) : data.verdict === "ELEVATED_RISK" ? (
-          <span className="text-[#e3b457]">Watch for the next hot probe to confirm.</span>
-        ) : data.verdict === "EARLY_DISTORTION" ? (
-          <span>Treat as exploratory — could resolve or escalate.</span>
-        ) : data.verdict === "INSUFFICIENT" ? (
-          <span>The system is silent because data is missing, not because the market is calm.</span>
-        ) : (
-          <span>Precursor probes are quiet.</span>
-        )}
+        {verdictWording}. <span className="italic">{verdictNextAction}</span>
       </div>
 
       <ul className="space-y-1.5 font-mono text-[11px]">
@@ -1627,13 +1730,16 @@ const VERDICT_COLOR: Record<CausalVerdict, string> = {
   EXPLORATORY:     "rgba(120, 120, 120, 0.85)",
 };
 
+// Attention & Trust Pass §4: causal verdict labels softened via
+// lib/labels.ts so the operator-facing wording reads as observed
+// pattern rather than asserted causation.
 const VERDICT_LABEL: Record<CausalVerdict, string> = {
-  DIRECTIONAL:     "directional",
-  COMMON_DRIVEN:   "common-driven",
-  AMBIGUOUS:       "ambiguous",
-  UNDER_EVIDENCED: "under-evidenced",
-  COINCIDENCE:     "coincidence",
-  EXPLORATORY:     "exploratory",
+  DIRECTIONAL:     causalVerdictLabel("DIRECTIONAL"),
+  COMMON_DRIVEN:   causalVerdictLabel("COMMON_DRIVEN"),
+  AMBIGUOUS:       causalVerdictLabel("AMBIGUOUS"),
+  UNDER_EVIDENCED: causalVerdictLabel("UNDER_EVIDENCED"),
+  COINCIDENCE:     causalVerdictLabel("COINCIDENCE"),
+  EXPLORATORY:     causalVerdictLabel("EXPLORATORY"),
 };
 
 const ROLE_COLOR: Record<CausalRole, string> = {
@@ -1670,8 +1776,11 @@ function RoleChip({ r }: { r: CausalRole }) {
         borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
         background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
       }}
+      title={`Influence role candidate from causal-propagation. Raw label: ${r}`}
     >
-      {r.replace(/_/g, " ").toLowerCase()}
+      {/* Softened presentation: "appears as ..." reads as observation,
+          not as proven role assignment. */}
+      {causalRoleLabel(r)}
     </span>
   );
 }
@@ -1728,7 +1837,7 @@ function CausalPropagationPanel() {
           <div className="text-[10px] text-muted leading-snug">
             {data.data_quality === "INSUFFICIENT" || data.data_quality === "LOW" ? (
               <>
-                <span className="text-[#e3b457]">All pairs labeled EXPLORATORY</span> — too few alerts
+                <span className="text-[#e3b457]">All pairs flagged exploratory</span> — too few alerts
                 ({data.total_alerts}) for causal claims. The verdicts below reflect statistical signals
                 only and should not be treated as evidence of influence.
               </>
@@ -1858,7 +1967,7 @@ function StructuralDependenciesPanel() {
   return (
     <Panel
       title="Structural Dependencies"
-      subtitle={data ? data.summary : "influence chains · co-driver clusters · dominant drivers · synchronized groups"}
+      subtitle={data ? data.summary : "influence chains · co-driver clusters · candidate drivers · synchronized groups"}
       toolbar={data ? <DataQualityChip q={data.data_quality} /> : null}
     >
       {error && <div className="text-xs" style={{ color: "rgba(214, 139, 139, 0.9)" }}>{error}</div>}
@@ -1887,7 +1996,7 @@ function StructuralDependenciesPanel() {
             </div>
             {data.influence_chains.length === 0 ? (
               <div className="text-[11px] text-muted">
-                {data.exploratory ? "No multi-hop chains — no DIRECTIONAL edges available yet." : "No multi-hop chains detected."}
+                {data.exploratory ? "No multi-hop chains — no directional pattern available yet." : "No multi-hop chains observed."}
               </div>
             ) : (
               <ul className="space-y-1.5 font-mono text-[11px]">
@@ -1907,11 +2016,11 @@ function StructuralDependenciesPanel() {
 
           <div>
             <div className="text-[10px] uppercase tracking-[0.2em] text-muted mb-2">
-              dominant drivers ({data.dominant_drivers.length})
+              candidate drivers ({data.dominant_drivers.length})
             </div>
             {data.dominant_drivers.length === 0 ? (
               <div className="text-[11px] text-muted">
-                {data.exploratory ? "No dominant drivers — no DIRECTIONAL edges available yet." : "No driver dominance detected."}
+                {data.exploratory ? "No candidate drivers — no directional pattern available yet." : "No driver dominance observed."}
               </div>
             ) : (
               <table className="w-full text-[11px] font-mono">
