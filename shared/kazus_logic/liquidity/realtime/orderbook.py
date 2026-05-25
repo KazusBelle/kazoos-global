@@ -26,6 +26,12 @@ from typing import Deque, Dict, List, Optional, Tuple
 _TAPE_WINDOW_MS = 5 * 60 * 1000  # keep 5 min of trades / liquidations
 _DEPTH_HISTORY_WINDOW_MS = 5 * 60 * 1000  # 5-min rolling for depth/spread
 _RECOVERY_TIMEOUT_MS = 90_000             # give up tracking after this
+# Short ring of full top-N snapshots for the exec-impact layer. It needs
+# pre-burst and post-settle book states; 5s of 100ms-cadence frames is
+# enough to bracket any same-side burst we measure (BURST_GAP_MS=250,
+# SETTLE_MS=500). Bounded by count so a stalled stream can't grow it.
+_BOOK_HISTORY_MAX = 60
+_EXEC_EVENT_WINDOW_MS = 5 * 60 * 1000
 
 
 @dataclass
@@ -53,6 +59,22 @@ class DepthSample:
     ts: int
     depth_usd: Optional[float]   # credible depth at sample time
     spread_bps: Optional[float]  # spread in basis points
+
+
+@dataclass(frozen=True)
+class BookSnapshot:
+    """Frozen top-N book state captured each depth20 frame.
+
+    Held in a short ring (SymbolState.book_history) so the exec-impact
+    layer can locate pre-burst and post-settle book states by timestamp.
+    `bids` is sorted descending by price, `asks` ascending. `mid` is
+    derived from this same snapshot (not bookTicker) so book-walk and
+    mid are self-consistent.
+    """
+    ts: int
+    bids: Tuple[Tuple[float, float], ...]  # ((price, qty), ...) desc
+    asks: Tuple[Tuple[float, float], ...]  # ((price, qty), ...) asc
+    mid: float
 
 
 @dataclass
@@ -94,14 +116,44 @@ class SymbolState:
     events: Deque[RecoveryEvent] = field(default_factory=deque)
     # bookkeeping for event-detector debouncing
     last_event_ts: int = 0
+    # Short ring of full top-N snapshots — consumed by the exec-impact
+    # layer to locate pre-burst and post-settle book states. Pushed each
+    # depth20 frame; bounded by _BOOK_HISTORY_MAX.
+    book_history: Deque["BookSnapshot"] = field(default_factory=deque)
+    # Forward-only exec-impact events (ExecEvent from exec_impact.py).
+    # Pruned to last _EXEC_EVENT_WINDOW_MS.
+    exec_events: Deque[object] = field(default_factory=deque)
+    # Timestamp through which the burst-detector has already scanned the
+    # trade tape. Trades with ts <= cursor are never re-considered.
+    exec_cursor_ts: int = 0
 
     def apply_depth20(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], now_ms: int) -> None:
         """Replace the top-20 with the new snapshot. Levels whose qty
         is unchanged from the prior snapshot keep their first_seen_ts;
-        new or changed levels get first_seen_ts = now."""
+        new or changed levels get first_seen_ts = now.
+
+        Also pushes a frozen BookSnapshot into book_history so the
+        exec-impact layer can find pre/post states by timestamp without
+        racing the live mutable dicts.
+        """
         self.bids = _merge_levels(self.bids, bids, now_ms)
         self.asks = _merge_levels(self.asks, asks, now_ms)
         self.last_depth_ts = now_ms
+        if self.bids and self.asks:
+            bids_sorted = tuple(sorted(
+                ((p, q) for p, (q, _) in self.bids.items()),
+                key=lambda x: -x[0],
+            ))
+            asks_sorted = tuple(sorted(
+                ((p, q) for p, (q, _) in self.asks.items()),
+                key=lambda x: x[0],
+            ))
+            mid = (bids_sorted[0][0] + asks_sorted[0][0]) / 2
+            self.book_history.append(BookSnapshot(
+                ts=now_ms, bids=bids_sorted, asks=asks_sorted, mid=mid,
+            ))
+            while len(self.book_history) > _BOOK_HISTORY_MAX:
+                self.book_history.popleft()
 
     def apply_book_ticker(self, best_bid: float, best_ask: float, ts_ms: int) -> None:
         self.best_bid = best_bid

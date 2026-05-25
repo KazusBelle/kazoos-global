@@ -31,6 +31,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Set
 
+from .exec_impact import detect_and_measure_bursts, rolling_exec_metrics
 from .intelligence import (
     fragility_score,
     impact_score,
@@ -211,6 +212,15 @@ class RealtimeEngine:
             # state machine and records the depth sample for the rolling
             # history buffers.
             update_intelligence(state, now_ms, depth)
+            # Exec-impact layer: forward-only realized-vs-predicted
+            # measurement. Detects closed, settled bursts on the trade
+            # tape, measures them against pre-burst top-20, appends to
+            # state.exec_events. Rolling medians per (side, bucket) are
+            # published as sparse metric rows below — empty buckets are
+            # silently omitted, not zero-filled.
+            new_exec = detect_and_measure_bursts(state, now_ms)
+            if new_exec:
+                state.exec_events.extend(new_exec)
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
@@ -227,6 +237,18 @@ class RealtimeEngine:
                 ("fragility_score", fragility_score(state, now_ms)),
             )
             for metric_name, value in samples:
+                self._sample_buffer.append({
+                    "symbol": symbol,
+                    "metric": metric_name,
+                    "ts": now_ms,
+                    "value": value,
+                    "price": mid,
+                })
+            # Sparse exec-impact rows: only non-empty (side, bucket)
+            # combinations and the global exhaustion counter. We never
+            # write a zero-filled placeholder for a bucket that had no
+            # events in the window.
+            for metric_name, value in rolling_exec_metrics(state, now_ms):
                 self._sample_buffer.append({
                     "symbol": symbol,
                     "metric": metric_name,
