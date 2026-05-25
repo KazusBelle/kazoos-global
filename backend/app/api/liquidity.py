@@ -3333,6 +3333,8 @@ class OperatorPriorityItem(BaseModel):
     first_seen_at_ms: Optional[int] = None
     occurrence_count: Optional[int] = None
     ack: Optional[OperatorAck] = None
+    # Maintenance Pass §1 — queue ↔ investigation continuity.
+    linked_investigations: List[dict] = []
 
 
 class OperatorPrioritiesOut(BaseModel):
@@ -3885,6 +3887,12 @@ async def investigation_causal_tree_endpoint(
     )
 
 
+class InvestigationSimilarReason(BaseModel):
+    category: str           # origin | symbols | structure | tags | meta
+    contribution: float
+    text: str
+
+
 class InvestigationSimilarItem(BaseModel):
     id: int
     title: str
@@ -3895,6 +3903,7 @@ class InvestigationSimilarItem(BaseModel):
     updated_at_ms: int
     similarity_score: float
     reasons: List[str]
+    reason_breakdown: List[InvestigationSimilarReason] = []
 
 
 class InvestigationSimilarOut(BaseModel):
@@ -3928,6 +3937,13 @@ class InvestigationExportOut(BaseModel):
     generated_at_ms: int
     markdown: str
     char_count: int
+    # Maintenance Pass §3 — self-verifiable export.
+    content_hash: Optional[str] = None
+    frozen_snapshot_revision: Optional[int] = None
+    frozen_snapshot_captured_at_ms: Optional[int] = None
+    frozen_snapshot_total_revisions: int = 0
+    frozen_snapshot_sections_with_errors: List[str] = []
+    pruned_timeline_rows: int = 0
 
 
 @router.get("/research/investigations/{case_id}/export", response_model=InvestigationExportOut)

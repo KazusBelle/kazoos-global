@@ -2014,6 +2014,13 @@ export type OperatorPriorityItem = {
   first_seen_at_ms?: number | null;
   occurrence_count?: number | null;
   ack?: OperatorAck | null;
+  // Maintenance Pass §1 — queue ↔ investigation continuity.
+  linked_investigations?: Array<{
+    id: number;
+    status: InvestigationStatus;
+    severity: InvestigationSeverity;
+    title: string;
+  }>;
 };
 
 export type OperatorPriorities = {
@@ -2399,6 +2406,12 @@ export async function getInvestigationCausalTree(case_id: number, opts: { lookba
   );
 }
 
+export type InvestigationSimilarReason = {
+  category: "origin" | "symbols" | "structure" | "tags" | "meta";
+  contribution: number;
+  text: string;
+};
+
 export type InvestigationSimilarItem = {
   id: number;
   title: string;
@@ -2409,6 +2422,7 @@ export type InvestigationSimilarItem = {
   updated_at_ms: number;
   similarity_score: number;
   reasons: string[];
+  reason_breakdown?: InvestigationSimilarReason[];
 };
 
 export type InvestigationSimilar = {
@@ -2436,6 +2450,13 @@ export type InvestigationExport = {
   generated_at_ms: number;
   markdown: string;
   char_count: number;
+  // Maintenance Pass §3 — self-verifiable export.
+  content_hash?: string | null;
+  frozen_snapshot_revision?: number | null;
+  frozen_snapshot_captured_at_ms?: number | null;
+  frozen_snapshot_total_revisions?: number;
+  frozen_snapshot_sections_with_errors?: string[];
+  pruned_timeline_rows?: number;
 };
 
 export async function getInvestigationExport(case_id: number) {
@@ -2653,4 +2674,30 @@ export async function getInvestigationReplayPropagation(case_id: number, opts: {
   return request<ReplayPropagation>(
     `/liquidity/research/investigations/${case_id}/replay/propagation${qs ? `?${qs}` : ""}`,
   );
+}
+
+// ── Runtime health (Maintenance Pass §6) ─────────────────────────────
+//
+// Surface degraded-state visibility on operator surfaces. Polled at a
+// low cadence — the system is generally stable, and the only role of
+// this client is to put one chip on the top of DISC.
+
+export type WorkerHeartbeat = {
+  task: string;
+  last_tick_ms: number | null;
+  seconds_since: number | null;
+  expected_max_seconds: number;
+  state: "live" | "lagging" | "stale" | "dead";
+};
+
+export type RuntimeHealth = {
+  pool: Record<string, unknown>;
+  research_cache: Record<string, unknown>;
+  worker_heartbeats: WorkerHeartbeat[];
+  tables: Array<{ table: string; rows: number; size_bytes: number; bytes_per_row: number }>;
+  overall: "ok" | "degraded" | "down";
+};
+
+export async function getRuntimeHealth() {
+  return request<RuntimeHealth>("/liquidity/admin/runtime-health");
 }

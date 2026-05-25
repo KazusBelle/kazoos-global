@@ -1260,6 +1260,28 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     return () => window.removeEventListener("kazus:open-replay", handler as EventListener);
   }, []);
 
+  // Maintenance Pass §1 — queue ↔ investigation continuity.
+  // Discovery's operator-queue row dispatches `kazus:open-investigation`
+  // when the operator opens (or de-dups onto) a case. Switch to the INV
+  // page so the Investigations panel — which separately listens for the
+  // same event to select the case — actually becomes visible.
+  useEffect(() => {
+    const handler = () => setPage("inv");
+    window.addEventListener("kazus:open-investigation", handler);
+    return () => window.removeEventListener("kazus:open-investigation", handler);
+  }, []);
+
+  // Reverse direction: the Investigations EvidencePanel dispatches
+  // `kazus:open-priority` when the operator wants to jump from a linked
+  // operator_priority evidence row back to the queue. We just navigate
+  // to DISC — the priority key is included in the detail for future use
+  // (no auto-scroll today; the queue is short).
+  useEffect(() => {
+    const handler = () => setPage("disc");
+    window.addEventListener("kazus:open-priority", handler);
+    return () => window.removeEventListener("kazus:open-priority", handler);
+  }, []);
+
   function setChartSymbol(
     symbol: string | null,
     order?: string[],

@@ -7501,6 +7501,50 @@ def _operator_group_related(items: List[dict]) -> List[dict]:
     return grouped
 
 
+def _active_investigations_for_priority_keys(
+    db: Session,
+    priority_keys: List[str],
+) -> Dict[str, List[dict]]:
+    """Deterministic JOIN: which non-ARCHIVED investigation cases are
+    linked to each priority_key via `operator_priority` evidence?
+
+    Returns mapping `priority_key → [ {id, status, severity, title} ]`,
+    ordered by case.updated_at_ms desc. Empty mapping if no keys passed.
+
+    Note: no fuzzy matching, no learned linkage. The relationship is
+    rigid — a case appears for a key iff `investigation_evidence` rows
+    exist with `evidence_type='operator_priority'` and `ref_key=key`.
+    Cases with status='ARCHIVED' are excluded (historical, not active)."""
+    if not priority_keys:
+        return {}
+    from kazus_db.models import Investigation, InvestigationEvidence
+    rows = (
+        db.query(
+            InvestigationEvidence.ref_key,
+            Investigation.id,
+            Investigation.status,
+            Investigation.severity,
+            Investigation.title,
+            Investigation.updated_at_ms,
+        )
+        .join(Investigation, Investigation.id == InvestigationEvidence.investigation_id)
+        .filter(InvestigationEvidence.evidence_type == "operator_priority")
+        .filter(InvestigationEvidence.ref_key.in_(priority_keys))
+        .filter(Investigation.status != "ARCHIVED")
+        .order_by(Investigation.updated_at_ms.desc())
+        .all()
+    )
+    out: Dict[str, List[dict]] = {}
+    for ref_key, cid, status, severity, title, _ts in rows:
+        out.setdefault(ref_key, []).append({
+            "id": cid,
+            "status": status,
+            "severity": severity,
+            "title": title,
+        })
+    return out
+
+
 def operator_priorities(
     db: Session,
     lookback_days: int = 7,
@@ -7744,6 +7788,11 @@ def operator_priorities(
             .all()
         )
     ack_by_key: Dict[str, OperatorAcknowledgement] = {a.priority_key: a for a in ack_rows}
+    # Queue ↔ investigation continuity (Maintenance Pass §1): for each
+    # visible priority_key, surface any non-ARCHIVED investigation that
+    # was linked from this same key via operator_priority evidence. Pure
+    # deterministic JOIN — no fuzzy match, no learned linkage.
+    inv_by_key = _active_investigations_for_priority_keys(db, ack_keys) if ack_keys else {}
     for item in grouped:
         a = ack_by_key.get(item["key"])
         if a is None:
@@ -7759,6 +7808,7 @@ def operator_priorities(
                     "expires_at_ms": a.expires_at_ms,
                     "note": a.note,
                 }
+        item["linked_investigations"] = inv_by_key.get(item["key"], [])
     snapshot_fresh = True  # DB-backed, always fresh now (was a Pass-A in-memory artifact)
 
     # ── Attention budget ─────────────────────────────────────────────
@@ -9511,11 +9561,33 @@ def _inv_extract_case_refs(case, db: Session) -> List[Tuple[int, str]]:
     return out
 
 
-def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[str]]:
-    """Compare case `a` (already-summarised dict) to another row. Returns
-    (score in [0,100], list of reasons). Deterministic — no hidden ML."""
+def _inv_similarity_compare(
+    a: dict, b_row, db: Session,
+) -> Tuple[float, List[str], List[dict]]:
+    """Compare case `a` (already-summarised dict) to another row.
+
+    Returns ``(score in [0,100], reasons[str], breakdown[dict])``.
+    Deterministic — no hidden ML, no learned weights. `breakdown` exposes
+    the per-criterion `contribution` so the operator UI can show
+    *why* the score is what it is (Maintenance Pass §2). `reasons[str]`
+    is preserved for downstream consumers (markdown export, tests) that
+    rely on plain-string predicates."""
     reasons: List[str] = []
+    breakdown: List[dict] = []
     score = 0.0
+
+    def _add(category: str, contribution: float, text: str) -> None:
+        nonlocal score
+        # Saturation is computed on the total, not per row, but expose
+        # the contribution as the unclipped amount so the sum matches
+        # the visible reasons (sum of contributions == raw score).
+        score += contribution
+        reasons.append(text)
+        breakdown.append({
+            "category": category,         # "origin" | "symbols" | "structure" | "tags" | "meta"
+            "contribution": round(contribution, 1),
+            "text": text,
+        })
 
     b_tags = set(_inv_deserialize_tags(b_row.tags_json))
     b_related = set(_inv_deserialize_tags(b_row.related_symbols_json))
@@ -9527,10 +9599,10 @@ def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[st
 
     # 1) Exact origin_fingerprint match — strongest signal (recurring archetype).
     if a["origin_fingerprint"] and a["origin_fingerprint"] == b_row.origin_fingerprint:
-        score += 40
-        reasons.append(
+        _add(
+            "origin", 40.0,
             f"same origin fingerprint ({a['origin_fingerprint']}) — "
-            f"recurring genesis-probe composition"
+            f"recurring genesis-probe composition",
         )
 
     # 2) Symbol overlap (Jaccard × 25).
@@ -9539,11 +9611,10 @@ def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[st
         union = a["symbols"] | b_symbols
         if overlap:
             j = len(overlap) / len(union)
-            inc = round(25 * j, 1)
-            score += inc
-            reasons.append(
+            _add(
+                "symbols", round(25 * j, 1),
                 f"{len(overlap)}/{len(union)} symbol overlap "
-                f"({', '.join(sorted(overlap)[:4])}) — Jaccard {j:.2f}"
+                f"({', '.join(sorted(overlap)[:4])}) — Jaccard {j:.2f}",
             )
 
     # 3) Operator-priority key overlap × 15.
@@ -9551,11 +9622,10 @@ def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[st
         overlap = a["op_keys"] & b_summary["op_keys"]
         if overlap:
             j = len(overlap) / max(1, len(a["op_keys"] | b_summary["op_keys"]))
-            inc = round(15 * j, 1)
-            score += inc
-            reasons.append(
+            _add(
+                "structure", round(15 * j, 1),
                 f"{len(overlap)} shared operator-priority key(s) "
-                f"({sorted(overlap)[0][:40]}…)"
+                f"({sorted(overlap)[0][:40]}…)",
             )
 
     # 4) Tag overlap × 10.
@@ -9563,22 +9633,19 @@ def _inv_similarity_compare(a: dict, b_row, db: Session) -> Tuple[float, List[st
         overlap = a["tags"] & b_tags
         if overlap:
             inc = round(10 * (len(overlap) / max(1, len(a["tags"] | b_tags))), 1)
-            score += inc
-            reasons.append(f"shared tags: {', '.join(sorted(overlap))}")
+            _add("tags", inc, f"shared tags: {', '.join(sorted(overlap))}")
 
     # 5) Same severity × 5.
     if a["severity"] == b_row.severity:
-        score += 5
-        reasons.append(f"same severity ({b_row.severity})")
+        _add("meta", 5.0, f"same severity ({b_row.severity})")
 
     # 6) Same origin_kind × 5 (auto vs manual genesis).
     if a["origin_kind"] == b_row.origin_kind:
-        score += 5
-        reasons.append(f"same origin_kind ({b_row.origin_kind})")
+        _add("meta", 5.0, f"same origin_kind ({b_row.origin_kind})")
 
     # Saturate at 100.
     score = min(100.0, score)
-    return score, reasons
+    return score, reasons, breakdown
 
 
 def investigation_similar(
@@ -9624,7 +9691,7 @@ def investigation_similar(
     )
     scored: List[dict] = []
     for other in others:
-        s, reasons = _inv_similarity_compare(a, other, db)
+        s, reasons, breakdown = _inv_similarity_compare(a, other, db)
         if s < min_score or not reasons:
             continue
         scored.append({
@@ -9637,6 +9704,7 @@ def investigation_similar(
             "updated_at_ms": other.updated_at_ms,
             "similarity_score": round(s, 1),
             "reasons": reasons,
+            "reason_breakdown": breakdown,
         })
     scored.sort(key=lambda r: -r["similarity_score"])
     return {
@@ -9673,9 +9741,45 @@ def investigation_export_markdown(db: Session, case_id: int) -> dict:
         return _dt.fromtimestamp(ms / 1000, tz=_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines: List[str] = []
+    # Snapshot provenance (frozen revision metadata) — Maintenance Pass §3.
+    # The active snapshot row's revision + captured_at_ms are stamped here
+    # so an export carries a verifiable pointer to the FROZEN payload that
+    # was current at export time.
+    snap_revision: Optional[int] = None
+    snap_captured_at_ms: Optional[int] = None
+    snap_total_revisions: int = 0
+    snap_sections_with_errors: List[str] = []
+    try:
+        from kazus_db.models import InvestigationReplaySnapshot
+        active_snap = (
+            db.query(InvestigationReplaySnapshot)
+            .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+            .filter(InvestigationReplaySnapshot.is_active == True)  # noqa: E712
+            .first()
+        )
+        if active_snap is not None:
+            snap_revision = active_snap.revision
+            snap_captured_at_ms = active_snap.captured_at_ms
+            import json as _json
+            try:
+                snap_sections_with_errors = (
+                    _json.loads(active_snap.sections_with_errors_json)
+                    if active_snap.sections_with_errors_json else []
+                ) or []
+            except Exception:  # noqa: BLE001
+                snap_sections_with_errors = []
+        snap_total_revisions = (
+            db.query(InvestigationReplaySnapshot)
+            .filter(InvestigationReplaySnapshot.investigation_id == case_id)
+            .count()
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    export_generated_ms = _inv_now_ms()
     lines.append(f"# Investigation #{case.id}: {case.title}")
     lines.append("")
-    lines.append(f"_Exported at {_iso(_inv_now_ms())}_")
+    lines.append(f"_Exported at {_iso(export_generated_ms)}_")
     lines.append("")
 
     # ── 1. Summary ───────────────────────────────────────────────────
@@ -9774,21 +9878,31 @@ def investigation_export_markdown(db: Session, case_id: int) -> dict:
     lines.append("")
 
     # ── 6. Timeline ──────────────────────────────────────────────────
-    lines.append(f"## 6. Timeline ({len(timeline.get('events', []))})")
+    timeline_events = timeline.get("events", []) or []
+    pruned_count = sum(1 for e in timeline_events if e.get("is_pruned"))
+    pruned_suffix = (
+        f", {pruned_count} reconstructed from snapshots — upstream pruned"
+        if pruned_count else ""
+    )
+    lines.append(f"## 6. Timeline ({len(timeline_events)}{pruned_suffix})")
     lines.append("")
-    if not timeline.get("events"):
+    if not timeline_events:
         lines.append("_No timeline events._")
     else:
         lines.append("| When | Source | Event | Note |")
         lines.append("|---|---|---|---|")
         # Oldest-first for export readability.
-        for e in sorted(timeline["events"], key=lambda x: x["ts_ms"]):
+        for e in sorted(timeline_events, key=lambda x: x["ts_ms"]):
             note = (e.get("note") or "")
             if not note and e.get("payload"):
                 pairs = list((e.get("payload") or {}).items())[:3]
                 note = ", ".join(f"{k}={v}" for k, v in pairs)
             note = note.replace("\n", " ").replace("|", "\\|")[:200]
-            lines.append(f"| {_iso(e['ts_ms'])} | `{e['source']}` | `{e['event_type']}` | {note} |")
+            # Maintenance Pass §3 — explicit marker per pruned row.
+            mark = " ⚠ PRUNED" if e.get("is_pruned") else ""
+            lines.append(
+                f"| {_iso(e['ts_ms'])} | `{e['source']}`{mark} | `{e['event_type']}` | {note} |"
+            )
     lines.append("")
 
     # ── 7. Similar cases ─────────────────────────────────────────────
@@ -9803,25 +9917,66 @@ def investigation_export_markdown(db: Session, case_id: int) -> dict:
                 lines.append(f"  - {r}")
     lines.append("")
 
-    # ── 8. Audit footer ──────────────────────────────────────────────
+    # ── 8. Audit metadata ────────────────────────────────────────────
+    # Self-verifiable: an auditor opening this file months later can
+    # compare `content_hash` against a freshly recomputed SHA-256 of the
+    # body (everything above the hash line). The frozen-snapshot revision
+    # pointer lets the auditor request the exact payload that was current
+    # at export time via `investigation_replay_state(revision=N)`.
     lines.append("## 8. Audit metadata")
     lines.append("")
+    lines.append(f"- case_id: {case.id}")
+    lines.append(f"- exported_at: {_iso(export_generated_ms)}")
     lines.append(f"- last_touched_by: user_id={case.last_touched_by}")
     lines.append(f"- last_touched_at: {_iso(case.last_touched_at_ms)}")
     lines.append(f"- evidence_count: {detail['evidence_count']}")
     lines.append(f"- note_count: {detail['note_count']}")
     lines.append(f"- event_count: {detail['event_count']}")
+    if snap_revision is not None:
+        lines.append(
+            f"- frozen_snapshot_revision: {snap_revision}"
+            f" (captured {_iso(snap_captured_at_ms)};"
+            f" {snap_total_revisions} total revision(s) in history)"
+        )
+        if snap_sections_with_errors:
+            lines.append(
+                f"- frozen_snapshot_sections_with_errors: "
+                + ", ".join(f"`{s}`" for s in snap_sections_with_errors)
+            )
+    else:
+        lines.append(
+            "- frozen_snapshot_revision: _none — case has no frozen capture "
+            "(capture pending or failed)_"
+        )
+    if pruned_count:
+        lines.append(
+            f"- pruned_timeline_rows: {pruned_count} (reconstructed from "
+            f"`investigation_evidence.snapshot_json`)"
+        )
     lines.append("")
     lines.append("_End of export._")
+    lines.append("")
+
+    body_for_hash = "\n".join(lines)
+    import hashlib as _hashlib
+    content_hash = _hashlib.sha256(body_for_hash.encode("utf-8")).hexdigest()
+    lines.append(f"<!-- content_hash:sha256={content_hash} -->")
+    lines.append("")
 
     markdown = "\n".join(lines)
     return {
         "found": True,
         "id": case_id,
         "title": case.title,
-        "generated_at_ms": _inv_now_ms(),
+        "generated_at_ms": export_generated_ms,
         "markdown": markdown,
         "char_count": len(markdown),
+        "content_hash": content_hash,
+        "frozen_snapshot_revision": snap_revision,
+        "frozen_snapshot_captured_at_ms": snap_captured_at_ms,
+        "frozen_snapshot_total_revisions": snap_total_revisions,
+        "frozen_snapshot_sections_with_errors": snap_sections_with_errors,
+        "pruned_timeline_rows": pruned_count,
     }
 
 

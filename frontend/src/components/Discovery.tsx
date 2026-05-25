@@ -31,6 +31,7 @@ import {
   getMemoryAbstraction,
   getPatternDiscovery,
   getPropagation,
+  getRuntimeHealth,
   getSanityAudit,
   type AdaptationOut,
   type AdaptationState,
@@ -60,6 +61,7 @@ import {
   type MemoryAbstraction,
   type PatternDiscovery,
   type Propagation,
+  type RuntimeHealth,
   type SanityAudit,
 } from "../lib/api";
 import {
@@ -77,8 +79,23 @@ export function Discovery() {
   // separation. The first block hosts surfaces that require operator
   // attention. The second block (diagnostic context) is collapsed by
   // default so it does not visually compete with the action surfaces.
-  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
-  const [showResearch, setShowResearch] = useState<boolean>(false);
+  //
+  // Maintenance Pass §5: the diagnostic / research accordion state is
+  // persisted across sessions so an operator who explicitly opened
+  // them once doesn't have to re-open them on every page refresh.
+  // Default-collapsed for new operators is preserved (null → false).
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(
+    () => localStorage.getItem("kazus_disc_diag") === "1",
+  );
+  const [showResearch, setShowResearch] = useState<boolean>(
+    () => localStorage.getItem("kazus_disc_research") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("kazus_disc_diag", showDiagnostics ? "1" : "0");
+  }, [showDiagnostics]);
+  useEffect(() => {
+    localStorage.setItem("kazus_disc_research", showResearch ? "1" : "0");
+  }, [showResearch]);
   return (
     <div className="space-y-4">
       <div className="flex items-baseline gap-3">
@@ -86,6 +103,9 @@ export function Discovery() {
         <div className="text-[11px] uppercase tracking-[0.3em] text-muted">
           operator surface · diagnostic + research below
         </div>
+        {/* Maintenance Pass §6 — degraded-state visibility. One chip,
+            low cadence, no work unless something is actually wrong. */}
+        <WorkerHealthChip />
       </div>
 
       {/* ── Action tier ──────────────────────────────────────────── */}
@@ -142,6 +162,71 @@ export function Discovery() {
     </div>
   );
 }
+
+// Maintenance Pass §6 — degraded-state visibility.
+//
+// Polls /admin/runtime-health at a low cadence and condenses the
+// per-task heartbeats into a single chip:
+//   ● ok       — every background task wrote within its expected gap
+//   ▲ degraded — at least one task is lagging (within 3× its cadence)
+//   ✕ down     — at least one task is stale or dead
+// Operator can hover for the per-task gap. Failure modes deliberately
+// silent on the visual side (chip just hides) — we never paint a fake
+// green light.
+function WorkerHealthChip() {
+  const [data, setData] = useState<RuntimeHealth | null>(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getRuntimeHealth()
+        .then((d) => { if (!cancelled) { setData(d); setError(false); } })
+        .catch(() => { if (!cancelled) setError(true); });
+    load();
+    // 5 min cadence — runtime state changes on the minutes-scale; the
+    // chip's whole point is to give the operator a slow-changing trust
+    // anchor without burning network on a steady-state panel.
+    const id = window.setInterval(load, 300_000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  if (error || !data) return null;
+
+  const lagging = data.worker_heartbeats.filter((h) => h.state === "lagging");
+  const stale = data.worker_heartbeats.filter((h) => h.state === "stale" || h.state === "dead");
+  const label =
+    data.overall === "ok" ? "● workers ok"
+    : data.overall === "degraded" ? `▲ workers lagging (${lagging.length})`
+    : `✕ workers stale (${stale.length})`;
+  const color =
+    data.overall === "ok" ? "rgba(82, 185, 122, 0.85)"
+    : data.overall === "degraded" ? "rgba(227, 180, 87, 0.95)"
+    : "rgba(214, 105, 105, 0.95)";
+  const tip = [
+    `overall: ${data.overall}`,
+    ``,
+    ...data.worker_heartbeats.map((h) => {
+      const gap = h.seconds_since != null ? `${h.seconds_since.toFixed(0)}s ago` : "no data yet";
+      return `${h.state.padEnd(8)} ${h.task.padEnd(28)} ${gap} (≤ ${h.expected_max_seconds.toFixed(0)}s)`;
+    }),
+  ].join("\n");
+
+  return (
+    <span
+      className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.14em] ml-auto"
+      style={{
+        color,
+        borderColor: color.replace(/0\.95\)$|0\.85\)$/, "0.5)"),
+        background: color.replace(/0\.95\)$|0\.85\)$/, "0.10)"),
+      }}
+      title={tip}
+    >
+      {label}
+    </span>
+  );
+}
+
 
 function Panel({
   title, subtitle, toolbar, children,
@@ -225,6 +310,26 @@ function dataQualityClass(q: DataQuality | undefined): string {
   if (q === "LOW") return "opacity-80";
   return "";
 }
+
+// Maintenance Pass §4 — low-confidence visual discipline.
+//
+// Numeric surfaces lose their "solid" reading when the upstream
+// data_quality is exploratory or the per-row verdict is explicitly
+// non-causal. The number is still shown (the operator may still want
+// to see the raw value), but it renders muted, italic, and with no
+// solid color contrast against the panel background.
+function lowTrustNumericClass(low: boolean): string {
+  return low ? "text-muted/70 italic" : "";
+}
+
+// A negative-verdict row's confidence number is misleading at face
+// value — the verdict says "this is NOT causal", but the number
+// reads like a 30% causality claim. Dim it visually; the row already
+// has opacity-70 from the row-level class, but the cell itself needs
+// to lose its standard "text-zinc-300 tabular-nums" weight.
+const CAUSAL_NEGATIVE_VERDICTS = new Set([
+  "COINCIDENCE", "UNDER_EVIDENCED", "EXPLORATORY", "AMBIGUOUS",
+]);
 
 // Short human-readable copy keyed by finding.kind — lets the banner say
 // what the diagnostic actually means in one sentence, with all the
@@ -567,6 +672,18 @@ function OperatorPriorityItemRow({
         {item.occurrence_count != null && item.occurrence_count > 1 && (
           <span className="text-[9px] text-muted/70">×{item.occurrence_count}</span>
         )}
+        {item.linked_investigations && item.linked_investigations.length > 0 && (
+          <span
+            className="inline-block rounded-sm border border-[#8caaeb]/50 bg-[#8caaeb]/10 px-1 py-0.5 text-[9px] uppercase tracking-[0.12em] text-[#8caaeb]"
+            title={item.linked_investigations
+              .map((c) => `#${c.id} · ${c.status} · ${c.title}`)
+              .join("\n")}
+          >
+            {item.linked_investigations.length === 1
+              ? `inv #${item.linked_investigations[0].id}`
+              : `inv ×${item.linked_investigations.length}`}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-0.5">
           <button
             disabled={busy}
@@ -600,8 +717,12 @@ function OperatorPriorityItemRow({
           <button
             onClick={() => onInvestigate(item)}
             className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-accent hover:border-accent/60"
-            title="open investigation case with this priority linked as evidence"
-          >inv</button>
+            title={
+              item.linked_investigations && item.linked_investigations.length > 0
+                ? `jump to investigation #${item.linked_investigations[0].id} (already linked)`
+                : "open investigation case with this priority linked as evidence"
+            }
+          >{item.linked_investigations && item.linked_investigations.length > 0 ? "open" : "inv"}</button>
         </div>
       </div>
       <div className="text-[12px] text-zinc-200 leading-snug">{item.headline}</div>
@@ -777,6 +898,18 @@ function OperatorPrioritiesPanel() {
   };
 
   const handleInvestigate = async (item: OperatorPriorityItem) => {
+    // Maintenance Pass §1 — deterministic dedup. If this priority_key
+    // already has a non-ARCHIVED investigation linked to it, jump to
+    // the most recently updated one instead of creating a duplicate
+    // case for the same chronic issue. No fuzzy matching: the linkage
+    // is a strict JOIN on `investigation_evidence.ref_key`.
+    const existing = item.linked_investigations?.[0];
+    if (existing) {
+      window.dispatchEvent(new CustomEvent("kazus:open-investigation", {
+        detail: { case_id: existing.id },
+      }));
+      return;
+    }
     try {
       const case_ = await createInvestigation({
         title: `${item.kind}: ${item.headline}`.slice(0, 240),
@@ -803,12 +936,14 @@ function OperatorPrioritiesPanel() {
           note: "auto-linked at case creation",
         }],
       });
-      // Cross-page navigation hook — Investigations panel listens for this.
+      // Cross-page navigation hook — Investigations panel listens for
+      // this to select the case; Dashboard listens to switch to the
+      // INV page. Re-fetch the queue so the under-investigation chip
+      // appears immediately on the originating row.
       window.dispatchEvent(new CustomEvent("kazus:open-investigation", {
         detail: { case_id: case_.id },
       }));
-      // Best-effort toast via alert (no toast lib in project).
-      alert(`Investigation #${case_.id} created. Open the INV tab to view.`);
+      refresh().catch(() => {});
     } catch (e: any) {
       alert(`Failed to create investigation: ${e?.message ?? e}`);
     }
@@ -1321,12 +1456,23 @@ function PatternDiscoveryPanel() {
             <tbody>
               {data.patterns.map((p) => {
                 const eff = p.effective_lift;
-                const effColor =
-                  eff >= 1.5 ? "text-[#52b97a]"
+                // Maintenance Pass §4 — discovery is exploratory by
+                // nature; numbers on thin / fragile patterns should not
+                // read with the same authority as well-supported ones.
+                const isLowTrust = (
+                  data.data_quality === "INSUFFICIENT"
+                  || data.data_quality === "LOW"
+                  || p.robustness_flags.length > 0
+                );
+                const effColor = isLowTrust
+                  ? "text-muted/70 italic"
+                  : (eff >= 1.5 ? "text-[#52b97a]"
                     : eff >= 1.0 ? "text-[#e3b457]"
-                      : eff > 0 ? "text-[#d68b8b]" : "text-muted";
+                      : eff > 0 ? "text-[#d68b8b]" : "text-muted");
                 const stab = p.stability_score;
-                const stabColor = stab >= 0.6 ? "text-[#52b97a]" : stab >= 0.3 ? "text-[#e3b457]" : "text-[#d68b8b]";
+                const stabColor = isLowTrust
+                  ? "text-muted/70 italic"
+                  : (stab >= 0.6 ? "text-[#52b97a]" : stab >= 0.3 ? "text-[#e3b457]" : "text-[#d68b8b]");
                 const rowClass = p.suppressed_reason ? "opacity-40" : "";
                 const tip = [
                   `raw_lift     ${p.lift != null ? p.lift.toFixed(2) + "×" : "—"}`,
@@ -1523,6 +1669,14 @@ function HiddenRegimesPanel() {
           <tbody>
             {data.clusters.map((c) => {
               const emergentColor = c.is_emergent ? "rgba(227, 180, 87, 0.95)" : "rgba(140, 170, 235, 0.95)";
+              // Maintenance Pass §4 — small clusters / sparse data
+              // shouldn't read with the same authority as well-supported
+              // ones. Numeric cells mute when the surface is exploratory.
+              const lowTrust = (
+                data.data_quality === "INSUFFICIENT"
+                || data.data_quality === "LOW"
+                || c.size < 5
+              );
               return (
                 <tr key={c.cluster_id} className="border-t border-border/40">
                   <td className="py-1.5 text-muted">{c.cluster_id}</td>
@@ -1539,9 +1693,9 @@ function HiddenRegimesPanel() {
                     </span>
                   </td>
                   <td className="py-1.5 text-[10px] text-zinc-300">{c.dominant_coordinated_state?.replace(/_/g, " ") ?? "—"}</td>
-                  <td className="py-1.5 text-right text-zinc-200">{c.size}</td>
-                  <td className="py-1.5 text-right" style={{ color: emergentColor }}>{c.emergent_regime_score.toFixed(0)}</td>
-                  <td className="py-1.5 text-right text-muted">{c.regime_stability.toFixed(0)}</td>
+                  <td className={`py-1.5 text-right ${lowTrust ? "text-muted/70 italic" : "text-zinc-200"}`}>{c.size}</td>
+                  <td className={`py-1.5 text-right ${lowTrust ? "text-muted/70 italic" : ""}`} style={lowTrust ? undefined : { color: emergentColor }}>{c.emergent_regime_score.toFixed(0)}</td>
+                  <td className={`py-1.5 text-right ${lowTrust ? "text-muted/70 italic" : "text-muted"}`}>{c.regime_stability.toFixed(0)}</td>
                 </tr>
               );
             })}
@@ -1644,6 +1798,11 @@ function PropagationPanel() {
               </thead>
               <tbody>
                 {data.edges.slice(0, 12).map((e, i) => {
+                  // Maintenance Pass §4 — LOW-confidence propagation
+                  // edges are candidates, not findings. Dim their
+                  // numeric score so they don't compete visually with
+                  // validated ones.
+                  const lowTrust = e.confidence === "LOW";
                   const tip = [
                     `volume      ${(e.volume_strength * 100).toFixed(0)}`,
                     `lead clarity ${(e.lead_clarity * 100).toFixed(0)}`,
@@ -1655,7 +1814,7 @@ function PropagationPanel() {
                     `base → final ${(e.base_confidence * 100).toFixed(0)} → ${(e.confidence_score * 100).toFixed(0)}`,
                   ].join("\n");
                   return (
-                    <tr key={i} className="border-t border-border/40" title={tip}>
+                    <tr key={i} className={`border-t border-border/40 ${lowTrust ? "opacity-75" : ""}`} title={tip}>
                       <td className="py-1 text-[10px]">
                         <span className="text-zinc-200">{e.from_symbol}</span>
                         <span className="text-muted"> → </span>
@@ -1668,7 +1827,7 @@ function PropagationPanel() {
                       <td className="py-1 text-right text-muted">
                         {e.avg_lead_s.toFixed(0)}±{e.lead_std_s.toFixed(0)}s
                       </td>
-                      <td className="py-1 text-right text-zinc-300">{(e.confidence_score * 100).toFixed(0)}</td>
+                      <td className={`py-1 text-right tabular-nums ${lowTrust ? "text-muted/70 italic" : "text-zinc-300"}`}>{(e.confidence_score * 100).toFixed(0)}</td>
                       <td className="py-1 text-right"><EdgeConfidenceChip c={e.confidence} /></td>
                     </tr>
                   );
@@ -1905,7 +2064,18 @@ function CausalPropagationPanel() {
                           )}
                         </td>
                         <td className="py-1 text-right text-muted tabular-nums">{e.count}/{e.reverse_count}</td>
-                        <td className="py-1 text-right text-zinc-300 tabular-nums">{(e.causal_confidence * 100).toFixed(0)}</td>
+                        <td
+                          className={`py-1 text-right tabular-nums ${
+                            CAUSAL_NEGATIVE_VERDICTS.has(e.verdict) || data.data_quality === "INSUFFICIENT" || data.data_quality === "LOW"
+                              ? "text-muted/60 italic"
+                              : "text-zinc-300"
+                          }`}
+                          title={CAUSAL_NEGATIVE_VERDICTS.has(e.verdict)
+                            ? "Confidence shown for transparency only — verdict says this edge is NOT causal."
+                            : undefined}
+                        >
+                          {(e.causal_confidence * 100).toFixed(0)}
+                        </td>
                         <td className="py-1"><VerdictChip v={e.verdict} /></td>
                       </tr>
                     );

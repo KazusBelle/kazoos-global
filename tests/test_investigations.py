@@ -382,6 +382,75 @@ def test_export_404_for_missing(db):
     assert out["found"] is False
 
 
+def test_export_carries_content_hash_and_metadata(db):
+    """Maintenance Pass §3 — export is a self-verifiable artifact.
+
+    Header carries SHA-256 of the body; metadata block has snapshot
+    revision info (or an explicit "_none_" marker when no frozen
+    snapshot exists for the case)."""
+    case = research.investigation_create(db, title="hashable", created_by=1)
+    out = research.investigation_export_markdown(db, case["id"])
+    # Hash present and looks like sha256 hex.
+    assert out["content_hash"] is not None
+    assert len(out["content_hash"]) == 64
+    assert f"content_hash:sha256={out['content_hash']}" in out["markdown"]
+    # Stamped in audit metadata.
+    assert "frozen_snapshot_revision" in out["markdown"]
+    # No frozen snapshot yet — capture is async (PENDING).
+    assert out["frozen_snapshot_revision"] is None
+    assert out["frozen_snapshot_total_revisions"] == 0
+    assert out["pruned_timeline_rows"] == 0
+
+
+def test_similar_reason_breakdown_exposes_contributions(db):
+    """Maintenance Pass §2 — every similarity reason carries the
+    contribution it added to the score, plus a category bucket."""
+    a = research.investigation_create(
+        db, title="a", primary_symbol="BTCUSDT", related_symbols=["ETHUSDT"],
+        tags=["alpha"], severity="warn",
+    )
+    b = research.investigation_create(
+        db, title="b", primary_symbol="BTCUSDT", related_symbols=["ETHUSDT"],
+        tags=["alpha"], severity="warn",
+    )
+    sim = research.investigation_similar(db, b["id"], min_score=0)
+    match = next(s for s in sim["similar"] if s["id"] == a["id"])
+    breakdown = match["reason_breakdown"]
+    assert len(breakdown) == len(match["reasons"])
+    # Sum of contributions equals raw (pre-saturation) score.
+    total = sum(r["contribution"] for r in breakdown)
+    assert abs(total - match["similarity_score"]) < 0.5 or total >= 100
+    # Categories live in the documented vocabulary.
+    for r in breakdown:
+        assert r["category"] in ("origin", "symbols", "structure", "tags", "meta")
+        assert r["contribution"] >= 0
+
+
+def test_active_investigations_for_priority_keys_returns_open_cases(db):
+    """Maintenance Pass §1 — deterministic JOIN: each priority_key
+    maps to the non-ARCHIVED cases that link it as evidence."""
+    case = research.investigation_create(db, title="bridged", created_by=1)
+    research.investigation_link_evidence(
+        db, case["id"], evidence_type="operator_priority",
+        ref_key="sanity::propagation_loop", snapshot={"headline": "h"},
+    )
+    out = research._active_investigations_for_priority_keys(
+        db, ["sanity::propagation_loop", "unrelated::key"],
+    )
+    assert "sanity::propagation_loop" in out
+    assert out["sanity::propagation_loop"][0]["id"] == case["id"]
+    assert "unrelated::key" not in out
+    # ARCHIVED cases are excluded.
+    research.investigation_update(
+        db, case["id"], status="RESOLVED", resolution_summary="ok",
+    )
+    research.investigation_update(db, case["id"], status="ARCHIVED")
+    out2 = research._active_investigations_for_priority_keys(
+        db, ["sanity::propagation_loop"],
+    )
+    assert out2 == {}
+
+
 # ─── Pass A: Phase 19 Replay Intelligence ─────────────────────────────
 
 

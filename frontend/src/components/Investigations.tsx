@@ -40,6 +40,7 @@ import {
   type InvestigationNoteType,
   type InvestigationSeverity,
   type InvestigationSimilar,
+  type InvestigationSimilarItem,
   type InvestigationStatus,
   type InvestigationTimeline,
   type InvestigationTree,
@@ -703,6 +704,15 @@ function EvidencePanel({
             {e.ref_key}
           </span>
           {e.note && <span className="text-[10px] text-muted truncate max-w-[40%]" title={e.note}>{e.note}</span>}
+          {e.evidence_type === "operator_priority" && (
+            <button
+              onClick={() => window.dispatchEvent(new CustomEvent("kazus:open-priority", {
+                detail: { priority_key: e.ref_key },
+              }))}
+              className="text-[9px] uppercase tracking-[0.14em] px-1.5 py-0.5 rounded border border-border/50 text-muted hover:text-[#8caaeb] hover:border-[#8caaeb]/50"
+              title="jump back to the operator queue (DISC page)"
+            >queue ↗</button>
+          )}
           <span className="text-[10px] text-muted tabular-nums">{ago(e.linked_at_ms)}</span>
           <button
             onClick={async () => {
@@ -1027,33 +1037,123 @@ function SimilarPanel({
         Deterministic scoring — every reason is exposed.
       </div>
       <ul className="space-y-1.5">
-        {similar.similar.map((s) => (
-          <li key={s.id} className="rounded border border-border/40 bg-bg/40 px-2 py-1.5">
-            <div className="flex items-baseline gap-2">
-              <button
-                onClick={() => onOpen(s.id)}
-                className="text-[12px] text-accent hover:underline"
-              >#{s.id}</button>
-              <span className="text-[12px] text-zinc-200 truncate flex-1">{s.title}</span>
-              <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{s.status}</span>
-              <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{s.severity}</span>
-              <span className="text-[10px] tabular-nums text-accent">score {s.similarity_score}</span>
-            </div>
-            <ul className="mt-1 text-[10px] text-muted list-disc pl-4 space-y-0.5">
-              {s.reasons.map((r, i) => <li key={i}>{r}</li>)}
-            </ul>
-          </li>
-        ))}
+        {similar.similar.map((s) => <SimilarRow key={s.id} s={s} onOpen={onOpen} />)}
       </ul>
     </div>
   );
 }
 
+// Maintenance Pass §2 — similarity explainability.
+//
+// Surfaces are intentionally tabular: the reader should be able to tell
+// at a glance "why did this case match" (same symbols vs same structure
+// vs same origin), and "how much of the score does each reason carry".
+// No formula change — only presentation. The contributions sum to the
+// pre-saturation total; visible score is capped at 100.
+
+const SIMILARITY_CATEGORY_ORDER: Array<"origin" | "symbols" | "structure" | "tags" | "meta"> =
+  ["origin", "symbols", "structure", "tags", "meta"];
+
+const SIMILARITY_CATEGORY_LABEL: Record<string, string> = {
+  origin: "same origin",
+  symbols: "same symbols",
+  structure: "same structure",
+  tags: "same tags",
+  meta: "same metadata",
+};
+
+const SIMILARITY_CATEGORY_COLOR: Record<string, string> = {
+  origin: "rgba(227, 180, 87, 0.85)",     // amber — strongest signal
+  symbols: "rgba(140, 170, 235, 0.85)",   // blue
+  structure: "rgba(82, 185, 122, 0.85)",  // green
+  tags: "rgba(180, 180, 200, 0.65)",      // muted
+  meta: "rgba(180, 180, 200, 0.45)",      // dimmest
+};
+
+function SimilarRow({
+  s,
+  onOpen,
+}: {
+  s: InvestigationSimilarItem;
+  onOpen: (case_id: number) => void;
+}) {
+  const breakdown = s.reason_breakdown ?? [];
+  // Group by category in the canonical order so two cases score
+  // ordered the same way every time.
+  const byCategory: Record<string, typeof breakdown> = {};
+  for (const r of breakdown) {
+    (byCategory[r.category] ||= []).push(r);
+  }
+  return (
+    <li className="rounded border border-border/40 bg-bg/40 px-2 py-1.5">
+      <div className="flex items-baseline gap-2">
+        <button
+          onClick={() => onOpen(s.id)}
+          className="text-[12px] text-accent hover:underline"
+        >#{s.id}</button>
+        <span className="text-[12px] text-zinc-200 truncate flex-1">{s.title}</span>
+        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{s.status}</span>
+        <span className="text-[9px] uppercase tracking-[0.14em] text-muted">{s.severity}</span>
+        <span className="text-[10px] tabular-nums text-accent" title="match strength — sum of rule-based contributions (capped at 100)">
+          match {s.similarity_score}
+        </span>
+      </div>
+      {breakdown.length > 0 ? (
+        <div className="mt-1 space-y-0.5">
+          {SIMILARITY_CATEGORY_ORDER.filter((c) => byCategory[c]?.length).map((cat) => {
+            const rows = byCategory[cat];
+            const subtotal = rows.reduce((a, r) => a + r.contribution, 0);
+            return (
+              <div key={cat} className="text-[10px]">
+                <div className="flex items-baseline gap-2">
+                  <span
+                    className="uppercase tracking-[0.14em] text-[9px]"
+                    style={{ color: SIMILARITY_CATEGORY_COLOR[cat] }}
+                  >
+                    {SIMILARITY_CATEGORY_LABEL[cat]}
+                  </span>
+                  <span
+                    className="tabular-nums text-[9px]"
+                    style={{ color: SIMILARITY_CATEGORY_COLOR[cat] }}
+                  >
+                    +{subtotal.toFixed(1)}
+                  </span>
+                </div>
+                <ul className="pl-3 text-muted">
+                  {rows.map((r, i) => (
+                    <li key={i} className="flex items-baseline gap-2">
+                      <span
+                        className="tabular-nums text-[9px] shrink-0"
+                        style={{ color: SIMILARITY_CATEGORY_COLOR[cat], minWidth: "2.4rem" }}
+                      >+{r.contribution.toFixed(1)}</span>
+                      <span className="text-[10px] text-zinc-300/90">{r.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        // Backwards-compatible fallback: older API responses without
+        // `reason_breakdown` still render their flat reason list.
+        <ul className="mt-1 text-[10px] text-muted list-disc pl-4 space-y-0.5">
+          {s.reasons.map((r, i) => <li key={i}>{r}</li>)}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 function ExportPanel({ caseId, exp }: { caseId: number; exp: InvestigationExport | null }) {
   if (exp == null) return <div className="text-[11px] text-muted">rendering export…</div>;
+  const shortHash = exp.content_hash ? exp.content_hash.slice(0, 12) : null;
+  const hasFrozen = exp.frozen_snapshot_revision != null;
+  const hasPruned = (exp.pruned_timeline_rows ?? 0) > 0;
+  const hasSnapErrors = (exp.frozen_snapshot_sections_with_errors?.length ?? 0) > 0;
   return (
     <div className="space-y-1.5">
-      <div className="flex items-baseline gap-2">
+      <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-[10px] text-muted">
           generated {ago(exp.generated_at_ms)} · {exp.char_count.toLocaleString()} chars
         </span>
@@ -1068,6 +1168,49 @@ function ExportPanel({ caseId, exp }: { caseId: number; exp: InvestigationExport
           }}
           className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
         >copy</button>
+        {exp.content_hash && (
+          <button
+            onClick={() => navigator.clipboard?.writeText(exp.content_hash!).catch(() => {})}
+            className="text-[10px] uppercase tracking-[0.14em] px-2 py-0.5 rounded border border-border/50 text-muted hover:text-zinc-200"
+            title={`SHA-256 content hash — full: ${exp.content_hash}`}
+          >copy hash</button>
+        )}
+      </div>
+      {/* Maintenance Pass §3 — self-verifiability stamps. Auditors can
+          cross-check the content_hash against a fresh SHA-256 of the
+          export body, and use the frozen-snapshot revision to fetch the
+          exact payload that was current at export time. */}
+      <div className="flex items-baseline gap-2 flex-wrap text-[10px] font-mono text-muted">
+        {shortHash && (
+          <span title={`SHA-256: ${exp.content_hash}`}>
+            sha256 · <span className="text-zinc-300">{shortHash}…</span>
+          </span>
+        )}
+        {hasFrozen ? (
+          <span title={`frozen revision ${exp.frozen_snapshot_revision} · captured at ${fmtTs(exp.frozen_snapshot_captured_at_ms!)}`}>
+            frozen rev <span className="text-zinc-300">#{exp.frozen_snapshot_revision}</span>
+            {exp.frozen_snapshot_total_revisions && exp.frozen_snapshot_total_revisions > 1 && (
+              <span className="text-muted"> / {exp.frozen_snapshot_total_revisions}</span>
+            )}
+          </span>
+        ) : (
+          <span
+            className="text-[#e3b457]"
+            title="no frozen snapshot was active for this case — capture pending or failed"
+          >no frozen snapshot</span>
+        )}
+        {hasSnapErrors && (
+          <span
+            className="text-[#e3b457]"
+            title={`sections failed at capture: ${exp.frozen_snapshot_sections_with_errors!.join(", ")}`}
+          >snapshot errors: {exp.frozen_snapshot_sections_with_errors!.length}</span>
+        )}
+        {hasPruned && (
+          <span
+            className="text-[#e3b457]"
+            title="some upstream rows were already pruned; reconstructed from evidence snapshots"
+          >pruned rows: {exp.pruned_timeline_rows}</span>
+        )}
       </div>
       <pre className="rounded border border-border/40 bg-bg/40 p-2 text-[10px] text-zinc-200 font-mono max-h-[420px] overflow-auto whitespace-pre-wrap">
         {exp.markdown}
