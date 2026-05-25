@@ -322,8 +322,8 @@ def _get_known_metric_names(db: Session) -> tuple[str, ...]:
 # response shape are identical to the prior query.
 _SNAPSHOT_SQL_LIVE = """
 SELECT s.sym AS symbol, m.met AS metric, l.value, l.ts
-FROM unnest(:symbols::text[]) AS s(sym)
-CROSS JOIN unnest(:metrics::text[]) AS m(met)
+FROM unnest(CAST(:symbols AS text[])) AS s(sym)
+CROSS JOIN unnest(CAST(:metrics AS text[])) AS m(met)
 INNER JOIN LATERAL (
     SELECT value, ts FROM liquidity_samples
     WHERE symbol = s.sym AND metric = m.met
@@ -334,8 +334,8 @@ INNER JOIN LATERAL (
 
 _SNAPSHOT_SQL_REPLAY = """
 SELECT s.sym AS symbol, m.met AS metric, l.value, l.ts
-FROM unnest(:symbols::text[]) AS s(sym)
-CROSS JOIN unnest(:metrics::text[]) AS m(met)
+FROM unnest(CAST(:symbols AS text[])) AS s(sym)
+CROSS JOIN unnest(CAST(:metrics AS text[])) AS m(met)
 INNER JOIN LATERAL (
     SELECT value, ts FROM liquidity_samples
     WHERE symbol = s.sym AND metric = m.met AND ts <= :as_of
