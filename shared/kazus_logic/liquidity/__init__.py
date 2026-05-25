@@ -48,6 +48,14 @@ class _WsMetricDescriptor:
 
 OBI_RT = _WsMetricDescriptor(name="obi_rt", label="Realtime OBI")
 CREDIBLE_DEPTH = _WsMetricDescriptor(name="credible_depth", label="Credible Depth")
+# `liq_stress` is kept in the registry so downstream research.py +
+# liquidityIntelligence.ts consumers don't break, but the realtime
+# engine no longer writes samples for it (verified 2026-05-25:
+# `<s>@forceOrder` is unavailable on this network — Binance accepts
+# SUBSCRIBE silently, then delivers zero frames; `!forceOrder@arr` is
+# likewise empty). The chart renders "No data in this window yet"
+# instead of a fabricated constant 0.0. Re-enable sampling when the
+# forceOrder feed becomes available again.
 LIQ_STRESS = _WsMetricDescriptor(name="liq_stress", label="Liquidation Stress")
 # Phase-4 intelligence layer — WS-only. Resiliency tracks recovery from
 # microstructure events; Kyle Lambda measures price impact per signed

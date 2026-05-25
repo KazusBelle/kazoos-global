@@ -9,8 +9,18 @@ per-symbol SymbolState, and samples metrics into liquidity_samples at
 Streams subscribed per active symbol:
   <s>@depth20@100ms   — orderbook top-20 every 100ms (Credible Depth, OBI)
   <s>@bookTicker      — best bid/ask, sub-100ms (mid_price)
-  <s>@aggTrade        — trades tape (kept for future Kyle Lambda)
-  <s>@forceOrder      — liquidations (Liquidation Stress)
+  <s>@trade           — trades tape (Kyle Lambda / Impact / Fragility)
+
+Note on missing streams (operator-reality 2026-05-25):
+  Binance Futures `<s>@aggTrade` and `<s>@forceOrder` are silently
+  unavailable from this network perimeter — SUBSCRIBE returns success
+  but zero frames ever arrive (verified at the wire level; SPOT
+  aggTrade and FUTURES @trade work, only aggTrade/forceOrder on
+  futures do not). We therefore use the non-aggregated `<s>@trade`
+  stream which carries the same fields we read (p, q, m, T) and is
+  delivered normally. Liquidation Stress (`liq_stress`) is dropped
+  from the metric registry rather than written as silently-zero
+  rows — operator surfaces never paint a fabricated value.
 """
 
 from __future__ import annotations
@@ -19,7 +29,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, List, Set
 
 from .intelligence import (
     fragility_score,
@@ -30,13 +40,13 @@ from .intelligence import (
     resiliency_score,
     update_intelligence,
 )
-from .metrics import credible_depth_usd, liquidation_stress_usd, obi_rt
-from .orderbook import Liquidation, SymbolState, Trade
+from .metrics import credible_depth_usd, obi_rt
+from .orderbook import SymbolState, Trade
 from .ws_client import FuturesWsClient
 
 logger = logging.getLogger("kazus.liquidity.realtime")
 
-_STREAM_SUFFIXES = ("depth20@100ms", "bookTicker", "aggTrade", "forceOrder")
+_STREAM_SUFFIXES = ("depth20@100ms", "bookTicker", "trade")
 
 RECONCILE_INTERVAL_S = 5
 SAMPLE_INTERVAL_S = 1.0
@@ -172,22 +182,18 @@ class RealtimeEngine:
                 if best_bid > 0 and best_ask > 0:
                     ts = int(data.get("E") or data.get("T") or now_ms)
                     state.apply_book_ticker(best_bid, best_ask, ts)
-            elif suffix == "aggTrade":
+            elif suffix == "trade":
+                # `<s>@trade` (non-aggregated). Same field shape as
+                # aggTrade for the parts we read: T/E timestamps, p/q
+                # price/qty strings, m=is-buyer-maker. We don't read the
+                # aggregation-specific fields (a/f/l) so the swap from
+                # aggTrade is transparent to downstream metrics.
                 ts = int(data.get("E") or data.get("T") or now_ms)
                 price = float(data.get("p") or 0.0)
                 qty = float(data.get("q") or 0.0)
                 is_buyer_maker = bool(data.get("m", False))
                 if price > 0 and qty > 0:
                     state.push_trade(Trade(ts=ts, price=price, qty=qty, is_buyer_maker=is_buyer_maker))
-            elif suffix == "forceOrder":
-                # frame: {"o": {"s","S","p","q","T",...}}
-                o = data.get("o") or {}
-                ts = int(o.get("T") or now_ms)
-                side = str(o.get("S") or "").upper()
-                price = float(o.get("ap") or o.get("p") or 0.0)
-                qty = float(o.get("q") or 0.0)
-                if price > 0 and qty > 0 and side in ("BUY", "SELL"):
-                    state.push_liquidation(Liquidation(ts=ts, side=side, price=price, qty=qty))
         except (TypeError, ValueError, KeyError) as exc:
             logger.warning("frame parse failed for %s: %s", stream, exc)
 
@@ -208,7 +214,11 @@ class RealtimeEngine:
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
-                ("liq_stress", liquidation_stress_usd(state, now_ms)),
+                # `liq_stress` dropped: `<s>@forceOrder` is unavailable
+                # from this network perimeter (verified at the wire),
+                # so the metric had no input and was writing constant
+                # 0.0 — silently false. Surface is dropped at the
+                # registry level so the chart never claims emptiness.
                 ("resiliency_score", resiliency_score(state, now_ms)),
                 ("recovery_time_ms", recovery_time_ms(state)),
                 ("refill_velocity", refill_velocity_usd_per_s(state)),
