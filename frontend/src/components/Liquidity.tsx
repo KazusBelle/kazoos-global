@@ -703,8 +703,11 @@ export function Liquidity() {
 
     for (const [sym, intel] of Object.entries(intelByRow)) {
       // Skip LOW-confidence rows entirely — Phase 5 explicitly suppresses
-      // noise from disagreeing or stale signals.
-      if (intel.confidence.state === "LOW") continue;
+      // noise from disagreeing or stale signals. UNKNOWN is also skipped:
+      // proposeAlerts returns [] when metrics are absent, but the guard
+      // here makes the contract explicit (no alerts for rows where we
+      // haven't measured anything yet).
+      if (intel.confidence.state === "LOW" || intel.confidence.state === "UNKNOWN") continue;
       for (const p of intel.proposals) {
         // Bucket by 30s windows so a long-lived condition produces ONE
         // alert (and updates lastSeenAt), not a fresh id every tick.
@@ -1402,7 +1405,12 @@ function ScoreCell({ score, subtle }: { score: number | undefined; subtle?: bool
 function RegimeBadge({ regime }: { regime: Regime | undefined }) {
   if (!regime) return <span className="text-muted">—</span>;
   const color = REGIME_COLORS[regime];
-  const label = regime.replace(/_/g, " ");
+  const isUnknown = regime === "UNKNOWN";
+  // Render "—" for UNKNOWN so the first paint reads as "we have not
+  // measured yet" rather than confidently green "HEALTHY TREND". The
+  // outer badge structure stays identical to other regimes so the cell
+  // doesn't reshape when real data arrives.
+  const label = isUnknown ? "—" : regime.replace(/_/g, " ");
   return (
     <span
       className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.14em] whitespace-nowrap"
@@ -1411,7 +1419,7 @@ function RegimeBadge({ regime }: { regime: Regime | undefined }) {
         borderColor: color.replace(/0\.95\)$/, "0.45)"),
         background: color.replace(/0\.95\)$/, "0.10)"),
       }}
-      title={`Regime: ${label}`}
+      title={isUnknown ? "Awaiting metric samples" : `Regime: ${label}`}
     >
       {label}
     </span>
@@ -1423,14 +1431,22 @@ function RegimeBadge({ regime }: { regime: Regime | undefined }) {
 function ConfidenceCell({ confidence }: { confidence: Confidence | undefined }) {
   if (!confidence) return <span className="text-muted">—</span>;
   const colorByState: Record<typeof confidence.state, string> = {
+    UNKNOWN: "rgba(140, 140, 150, 0.95)",
     HIGH: "rgba(82, 185, 122, 0.95)",
     MEDIUM: "rgba(227, 180, 87, 0.95)",
     LOW: "rgba(214, 105, 105, 0.95)",
   };
   const color = colorByState[confidence.state];
-  const title = confidence.reasons.length > 0
-    ? `${confidence.score.toFixed(0)} · ${confidence.reasons.join(" · ")}`
-    : `Confidence ${confidence.score.toFixed(0)}`;
+  const isUnknown = confidence.state === "UNKNOWN";
+  // For UNKNOWN we show "— —" instead of "HIGH 92": the dot stays at
+  // the same x-position so the column doesn't shift width when the real
+  // confidence arrives, but neither the state label nor the score
+  // number imply that we have measured anything yet.
+  const title = isUnknown
+    ? confidence.reasons.join(" · ") || "Awaiting metric samples"
+    : confidence.reasons.length > 0
+      ? `${confidence.score.toFixed(0)} · ${confidence.reasons.join(" · ")}`
+      : `Confidence ${confidence.score.toFixed(0)}`;
   return (
     <span
       className="inline-flex items-center gap-1 text-[10px] uppercase tracking-[0.14em]"
@@ -1438,8 +1454,8 @@ function ConfidenceCell({ confidence }: { confidence: Confidence | undefined }) 
       style={{ color }}
     >
       <span className="inline-block h-1.5 w-1.5 rounded-full" style={{ background: color }} />
-      {confidence.state}
-      <span className="text-muted">{confidence.score.toFixed(0)}</span>
+      {isUnknown ? "—" : confidence.state}
+      <span className="text-muted">{isUnknown ? "—" : confidence.score.toFixed(0)}</span>
     </span>
   );
 }
@@ -1720,7 +1736,20 @@ function ValidationStatsBar({ timeline }: { timeline: AlertEvent[] }) {
     counts[a.kind] = c;
   }
   const totalAlerts = timeline.length;
-  if (totalAlerts === 0) return null;
+  // Previously this returned null when timeline was empty, which meant
+  // the bar appeared OUT OF NOWHERE the moment the first alert promoted
+  // and pushed the whole table down. Now we always reserve the row with
+  // a placeholder so first-paint and post-first-snapshot have the same
+  // page geometry.
+  if (totalAlerts === 0) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-panel/40 px-3 py-2">
+        <span className="text-[10px] uppercase tracking-[0.22em] text-muted">
+          validation · last 0
+        </span>
+      </div>
+    );
+  }
   const top = Object.entries(counts)
     .sort((a, b) => b[1].total - a[1].total)
     .slice(0, 6);

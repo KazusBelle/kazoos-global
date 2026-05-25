@@ -23,7 +23,14 @@
 export type MetricSample = { value: number | null; ts: number };
 export type MetricsMap = Record<string, MetricSample>;
 
+// "UNKNOWN" is the honest first-render state — used when we have not yet
+// received any metric samples for the symbol. It is NOT a synonym for
+// HEALTHY_TREND: HEALTHY_TREND means "we measured and nothing is wrong",
+// UNKNOWN means "we have not measured yet". Treating these as the same
+// produced an actively misleading initial paint where every row looked
+// confidently green for ~500ms before snapshot data arrived.
 export type Regime =
+  | "UNKNOWN"
   | "HEALTHY_TREND"
   | "THIN_LIQUIDITY"
   | "SPOOF_PRONE"
@@ -33,6 +40,7 @@ export type Regime =
   | "UNSTABLE_MARKET";
 
 export const REGIME_COLORS: Record<Regime, string> = {
+  UNKNOWN: "rgba(140, 140, 150, 0.95)",
   HEALTHY_TREND: "rgba(82, 185, 122, 0.95)",
   THIN_LIQUIDITY: "rgba(214, 139, 105, 0.95)",
   SPOOF_PRONE: "rgba(214, 105, 105, 0.95)",
@@ -44,7 +52,8 @@ export const REGIME_COLORS: Record<Regime, string> = {
 
 // Hierarchy: the higher the rank, the more dominant the regime. Used both
 // for picking the single winner among multiple candidates and for sorting
-// rows by "anomaly priority" (worst-first).
+// rows by "anomaly priority" (worst-first). UNKNOWN is intentionally
+// below HEALTHY_TREND so rows without data sort last by priority.
 export const REGIME_RANK: Record<Regime, number> = {
   LIQUIDATION_CASCADE: 100,
   UNSTABLE_MARKET: 80,
@@ -53,6 +62,7 @@ export const REGIME_RANK: Record<Regime, number> = {
   CROWDED_LONGS: 50,
   CROWDED_SHORTS: 50,
   HEALTHY_TREND: 0,
+  UNKNOWN: -1,
 };
 
 export type Flag = { label: string; color: string; title: string };
@@ -150,7 +160,12 @@ export type AdaptiveThresholds = {
   fragilitySpike: number;     // fragility_score that counts as spike
 };
 
-export type ConfidenceState = "LOW" | "MEDIUM" | "HIGH";
+// "UNKNOWN" mirrors the Regime UNKNOWN state — the symbol has no metric
+// samples yet, so we should not display a confident score derived from
+// "no penalties because no signals". Score is kept at 0 in this state
+// so existing numeric consumers don't crash; UI must check `state` and
+// render the absence rather than the zero.
+export type ConfidenceState = "UNKNOWN" | "LOW" | "MEDIUM" | "HIGH";
 export type Confidence = { score: number; state: ConfidenceState; reasons: string[] };
 
 export type IntelResult = {
@@ -453,7 +468,21 @@ export function explainRegime(
   };
 }
 
+// True iff at least one metric in the map carries a non-null value.
+// Used by detectRegime / computeConfidence to distinguish "no data yet"
+// from "data measured, nothing wrong". Without this distinction the
+// downstream logic returns HEALTHY_TREND / 92 for empty inputs, which
+// is the right answer to the wrong question.
+function _hasAnyMetricValue(metrics: MetricsMap): boolean {
+  for (const k in metrics) {
+    if (metrics[k] && metrics[k].value != null) return true;
+  }
+  return false;
+}
+
+
 export function detectRegime(metrics: MetricsMap, flags: Flag[]): Regime {
+  if (!_hasAnyMetricValue(metrics)) return "UNKNOWN";
   const labels = new Set(flags.map((f) => f.label));
   const liqStress = getMetric(metrics, "liq_stress") ?? 0;
   const fragility = getMetric(metrics, "fragility_score");
@@ -476,6 +505,15 @@ export function detectRegime(metrics: MetricsMap, flags: Flag[]): Regime {
 // ── Intelligence score with regime-aware weights ─────────────────────────
 
 const WEIGHTS_BY_REGIME: Record<Regime, Record<string, number>> = {
+  // UNKNOWN never reaches the score computation (intelligenceScore
+  // returns null when no metrics are present), but the Record<Regime, …>
+  // type requires every regime key. Copying HEALTHY_TREND weights here
+  // is harmless and avoids a separate special case.
+  UNKNOWN: {
+    spread: 1.0, credible_depth: 1.2, atr_liquidity: 0.8,
+    obi: 0.5, liq_stress: 0.6, funding_z: 0.7, oi_delta_1h: 0.7,
+    resiliency_score: 0.6, impact_inv: 0.4, fragility_inv: 0.4,
+  },
   HEALTHY_TREND: {
     spread: 1.0, credible_depth: 1.2, atr_liquidity: 0.8,
     obi: 0.5, liq_stress: 0.6, funding_z: 0.7, oi_delta_1h: 0.7,
@@ -682,6 +720,14 @@ export function computeConfidence(
     prevRegime?: Regime;
   },
 ): Confidence {
+  // First render gate: if we have no metric samples, every penalty
+  // below short-circuits to "no problem", yielding score≈92 HIGH —
+  // an actively misleading "all good" badge. UNKNOWN says that
+  // honestly. score stays 0 (not visible in the UI for UNKNOWN).
+  if (!_hasAnyMetricValue(metrics)) {
+    return { score: 0, state: "UNKNOWN", reasons: ["awaiting metrics"] };
+  }
+
   let score = 100;
   const reasons: string[] = [];
 
