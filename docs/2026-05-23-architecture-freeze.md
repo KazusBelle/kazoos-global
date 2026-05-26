@@ -59,6 +59,15 @@ Every layer answers three questions: *what is measured · how it is measured · 
 14. [Distributed Stress — quantitative state machine](#14-distributed-stress--quantitative-state-machine)
 15. [Phrase compression reference](#15-phrase-compression-reference)
 16. [Meta-language → runtime-equivalent reference](#16-meta-language--runtime-equivalent-reference)
+17. [Measurement contract reference](#17-measurement-contract-reference)
+
+**Companion docs** (Option-A decomposition, 2026-05-26):
+
+- [`docs/lip-metric-registry.md`](lip-metric-registry.md) — canonical per-metric contracts (Part A realtime tier · Part B research aggregators · Part C measurement contract table). Replaces §3 + §9 + §17.
+- [`docs/lip-epistemic-boundaries.md`](lip-epistemic-boundaries.md) — non-inference list + propagation/stress epistemic ceilings + structurally-unknowable conditions. Replaces §11 + epistemic parts of §13/§14.
+- [`docs/lip-validation-and-calibration.md`](lip-validation-and-calibration.md) — calibration backlog + pending measurements + calibration-version semantics. Replaces §12.
+
+This document remains the **snapshot at freeze time**. New hardening lands in companion docs; the sections above are preserved as collapsible legacy content for anchor stability.
 
 ---
 
@@ -343,6 +352,10 @@ Every downstream layer's confidence is **capped** by its upstream `data_quality`
 
 ## 3. Formula registry
 
+**Moved.** Aggregator-tier formulas (sanity audit · data quality · pattern discovery · propagation graph · causal propagation · influence hierarchy · market state transitions · Distributed Stress Detection · forecast hardening · adaptation modifiers · operator priorities) live in [`docs/lip-metric-registry.md`](lip-metric-registry.md) Part B. This section header is preserved as an anchor for older PR / commit references.
+
+<details><summary>Original §3 content (preserved for legacy anchor stability)</summary>
+
 All formulas below are **deterministic, multiplicative, and explainable**. No black-box scoring. Every score is bounded [0, 100] (or [0, 1]) and every factor is exposed somewhere in the API response for inspection.
 
 ### Sanity audit
@@ -561,6 +574,8 @@ lifecycle (DB-backed):
   PERSISTENT   within ±8
   RESOLVED     disappeared from current run
 ```
+
+</details>
 
 ---
 
@@ -871,6 +886,10 @@ Internal research aggregators (`_research.*`) are free to evolve provided the en
 
 ## 9. Quantitative metric registry — realtime tier
 
+**Moved.** Realtime-tier per-metric contracts (Credible Depth · Resiliency · Impact · Fragility · Realized vs Predicted Impact · Liquidation Stress · Cross-Venue Divergence · OBI · Recovery Time · Refill Velocity) live in [`docs/lip-metric-registry.md`](lip-metric-registry.md) Part A. This section header is preserved as an anchor for older PR / commit references.
+
+<details><summary>Original §9 content (preserved for legacy anchor stability)</summary>
+
 §3 catalogued the research-aggregator formulas. This section catalogues the **realtime-tier microstructure metrics** computed at 1 Hz against the WS-sourced orderbook + tape, written to `liquidity_samples` under the metric names below. Each entry follows the same 7-field structure: Purpose · Inputs · Formula · Threshold/output · Failure conditions · Replay behavior · Validation constraints.
 
 ### 9.1 Credible Depth (`credible_depth`)
@@ -964,7 +983,46 @@ Internal research aggregators (`_research.*`) are free to evolve provided the en
 | Replay behavior | Snapshots persisted to `liquidity_crossex_history` (90 d retention per `poller.py:199`) |
 | Validation constraints | "Sustained" is not currently formalized — there is no `divergence_persistence` threshold below which a one-tick divergence is suppressed. Adding that gate is in §12 |
 
-### 9.8 Already-formalized in §3 (pointers)
+### 9.8 OBI (`obi_rt`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/metrics.py:43`](shared/kazus_logic/liquidity/realtime/metrics.py#L43) `obi_rt()` |
+| Purpose | Top-20 order-book imbalance — instantaneous bid-vs-ask quantity skew |
+| Inputs | `state.bids` / `state.asks` (top-20 WS book) |
+| Formula | `(Σbid_qty − Σask_qty) / (Σbid_qty + Σask_qty)`. Range: [-1, +1]. No normalization, no smoothing |
+| Threshold | Raw value; no verdict. Sign is the load-bearing semantic |
+| Failure conditions | Empty book on either side → returns None. `total ≤ 0` → returns None |
+| Replay behavior | Persisted to `liquidity_samples` at 1 Hz; not reconstructible from history (depends on in-memory book state) |
+| Validation constraints | The 10s OBI-flip event detector in `intelligence.py:117-121` is a stub — OBI history is not retained in `DepthSample` for cost reasons; `obi_flip` events listed in §9.2 do not currently fire from the realtime path |
+
+### 9.9 Recovery time (`recovery_time_ms`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:180`](shared/kazus_logic/liquidity/realtime/intelligence.py#L180) `recovery_time_ms()` |
+| Purpose | Per-event time from stress trigger to depth-recovery threshold crossing |
+| Inputs | Last completed `RecoveryEvent` in `state.events` |
+| Formula | `recovered_ts − started_ts` (ms). Recovered defined as depth crossing `RECOVERY_FRACTION × pre_depth = 0.80 × pre`. Events past `RECOVERY_MAX_AGE_MS = 90_000` are stamped with `recovery_ms = 90_000` and `refill_velocity = 0` rather than left open |
+| Threshold | Raw ms; consumed by [`resiliency_score`](#92-resiliency-score-resiliency_score) as the `time_part` component |
+| Failure conditions | No completed event yet → returns None (column shows "—") |
+| Replay behavior | Persisted as a `liquidity_samples` metric; underlying `RecoveryEvent` ring is in-memory only |
+| Validation constraints | The 80% recovery floor and 30s exp-decay anchor in `resiliency_score` are interim constants; not calibrated against labelled regimes |
+
+### 9.10 Refill velocity (`refill_velocity`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:187`](shared/kazus_logic/liquidity/realtime/intelligence.py#L187) `refill_velocity_usd_per_s()` |
+| Purpose | Per-event rate at which depth refilled toward the pre-event baseline |
+| Inputs | Last completed `RecoveryEvent` |
+| Formula | `delta_depth / elapsed_s`, where `delta_depth = max(0, current_depth − pre_depth × (1 − DEPTH_COLLAPSE_DROP)) = max(0, current_depth − pre_depth × 0.60)`. `elapsed_s = max(0.5, recovery_ms / 1000)`. Units: USD per second |
+| Threshold | Raw value; consumed by [`resiliency_score`](#92-resiliency-score-resiliency_score) as the `velo_part` component (`50 × tanh(refill_velocity / 50_000) + 50`) |
+| Failure conditions | No completed event yet → None |
+| Replay behavior | Persisted to `liquidity_samples`; in-memory event ring not retained |
+| Validation constraints | The 50,000 USD/s scaling anchor (tanh saturation point) is an interim constant; per-symbol calibration pending |
+
+### 9.11 Already-formalized in §3 (pointers)
 
 The following are not duplicated here because their formulas already live in §3 [Formula registry](#3-formula-registry):
 
@@ -977,6 +1035,8 @@ The following are not duplicated here because their formulas already live in §3
 - **Operator priority score** → §3 Operator priorities
 - **Pattern-discovery stability + confidence** → §3 Pattern discovery
 - **Forecast confidence (with cap factor)** → §3 Forecast hardening
+
+</details>
 
 ---
 
@@ -1040,6 +1100,10 @@ These follow from what is and is not persisted; they are not bugs.
 
 ## 11. Non-inference boundaries
 
+**Moved.** Canonical source is [`docs/lip-epistemic-boundaries.md`](lip-epistemic-boundaries.md) §2. This section header is preserved for legacy anchor stability.
+
+<details><summary>Original §11 content (preserved for legacy anchor stability)</summary>
+
 Load-bearing. The runtime **measures · validates · suppresses · reconstructs**. The following inferences are out of scope; a new layer that emits any of them violates the invariants in §8:
 
 - **Market intent.** No layer attempts to characterize what a participant is trying to achieve. Observable: order placement, fill, cancellation. Not observable: motive.
@@ -1054,9 +1118,15 @@ Load-bearing. The runtime **measures · validates · suppresses · reconstructs*
 
 If a verdict, edge, or score appears without one of the upstream factors above being either present-and-measurable or explicitly flagged INSUFFICIENT / UNDER_EVIDENCED, treat it as a bug, not a feature.
 
+</details>
+
 ---
 
 ## 12. Validation framework — calibration backlog
+
+**Moved.** Canonical source is [`docs/lip-validation-and-calibration.md`](lip-validation-and-calibration.md). This section header is preserved for legacy anchor stability.
+
+<details><summary>Original §12 content (preserved for legacy anchor stability)</summary>
 
 **Status:** this section is a **calibration backlog**, not a results report. Every entry below is a measurement that **has not been run yet**. No numbers in this section are real — they are placeholders for future calibration passes. Do not cite figures from this section.
 
@@ -1107,6 +1177,8 @@ Without the measurements above, the layer's outputs are still inspectable on fiv
 5. **Bounded modifiers.** `ADAPTATION_BOUNDS` clips every coefficient; nothing compounds without limit.
 
 When the calibration backlog above is run, this section will move from "framework" to "framework + measured results" — see the entries marked **not yet measured** for what is missing.
+
+</details>
 
 ---
 
@@ -1487,3 +1559,41 @@ This table replaces what an earlier draft of this document called "operational t
 | the layer's job is to make X harder | the layer applies the following demotions: `<list>` |
 
 **Editorial invariant (load-bearing).** A sentence in this document should say what the runtime *does* — what enters, what transforms, what validates, what suppresses, what emits, what persists, what replays, what invalidates, what remains unknowable. A sentence that describes what the system *is* or *prefers* should be rewritten to a runtime mechanic or deleted.
+
+---
+
+## 17. Measurement contract reference
+
+**Moved.** Canonical source is [`docs/lip-metric-registry.md`](lip-metric-registry.md) Part C. This section header is preserved for legacy anchor stability.
+
+<details><summary>Original §17 content (preserved for legacy anchor stability)</summary>
+
+Consolidates the dimensions that the per-metric sections (§9, §3, §14) cover separately. One row per published metric / aggregator; one column per measurement-contract field. The point of this table is **comparability** — to make it possible to scan the runtime tier and the research tier on the same axes (units · cadence · normalization · aggregation · stale behavior · replay reconstructibility · calibration status) without bouncing between sections.
+
+Cross-references in the rows point at the existing detail in §3 / §9 / §10 / §12 / §14 — this table does not duplicate formulas; it tabulates the *contract* around them.
+
+| metric (link) | units | cadence | normalization | aggregation | stale behavior | replay | calibration |
+|---|---|---|---|---|---|---|---|
+| [Credible Depth](#91-credible-depth-credible_depth) | USD | 1 Hz | none (raw USD); per-symbol baselines read from `/metrics/{symbol}` | per-tick scalar | empty book → None | persisted value only; not recomputable from history | uncalibrated (±0.5% band, 400 ms floor — interim) |
+| [Resiliency Score](#92-resiliency-score-resiliency_score) | [0, 100] | 1 Hz | sigmoid + tanh + exp-decay; no per-symbol baseline | exp-weighted (5-min half-life) blend of completed events; weights 0.6 / 0.4 on `time_part` / `velo_part` | no completed events → None | persisted only | uncalibrated (30 s exp anchor, 50 k USD/s tanh anchor) |
+| [Impact Score (Kyle λ)](#93-impact-score-impact_score--kyle-λ-sigmoid) | [0, 100] | 1 Hz | sigmoid centred at λ = 1 | median over ≥ 8 buckets in 60 s | < 8 filled buckets → None | persisted only | uncalibrated (λ = 1 → 50 anchor stated, not measured) |
+| [Fragility Score](#94-fragility-score-fragility_score) | [0, 100] | 1 Hz | CV × 50, clipped | std / mean of bucket λs | < 8 buckets → None | persisted only | uncalibrated (CV ≥ 2 → 100 interim) |
+| [Realized vs Predicted Impact](#95-realized-vs-predicted-impact-exec_impact) | bps + USD + ratio | per-burst (event-driven) | none on `expected_bps` / `realized_bps`; ratio gated by `EXPECTED_FLOOR_BPS = 0.5` | per-event, no aggregation; 5-min rolling medians per (side, bucket) published separately | missing pre or post book → event dropped | forward-only; unavailable before activation (L2 book not persisted) | observation mode (per [project_exec_impact_layer](project_exec_impact_layer.md)); not calibrated downstream |
+| [Liquidation stress](#96-liquidation-stress-liq_stress) | USD | 1 Hz | none | sum over 60 s window | empty window → 0.0 (absence is a valid measurement) | persisted only | uncalibrated |
+| [Cross-venue divergence](#97-cross-venue-divergence-crossex) | dimensionless / % | on-demand (per-request) | pairwise `(this − reference) / reference` | per-venue scalar set, no consolidated aggregate | venue fetch fail → venue omitted silently | snapshots persisted to `liquidity_crossex_history` 90 d | "sustained" not formalized; no `divergence_persistence` gate |
+| [OBI (`obi_rt`)](#98-obi-obi_rt) | [-1, +1] | 1 Hz | none | per-tick scalar | empty side → None | persisted only; in-memory dependent | uncalibrated; OBI-flip event detector currently stubbed |
+| [Recovery time](#99-recovery-time-recovery_time_ms) | ms | event-driven (latest completed `RecoveryEvent`) | none | latest-event scalar | no completed event → None | persisted only | 80 % recovery floor + 30 s decay anchor uncalibrated |
+| [Refill velocity](#910-refill-velocity-refill_velocity) | USD/s | event-driven | none | latest-event scalar | no completed event → None | persisted only | 50 k USD/s tanh saturation uncalibrated |
+| [Propagation per-edge confidence](#propagation-graph) | [0, 1] + label HIGH/MEDIUM/LOW | per `causal_propagation` call (300 s TTL) | `confidence_score = base × (1 − sym_penalty) × leader_pull`; ratio-of-counts, no z-score | per-edge composite of 5 factors (volume / lead_clarity / lead_consistency / temporal / recurrence) with explicit weights 0.30 / 0.20 / 0.15 / 0.20 / 0.15 | pair drop if `lead < min_lead_ms = 5_000` ms (§13.3); `data_quality = INSUFFICIENT/LOW` → verdict floored at EXPLORATORY | recomputed on demand from `liquidity_alert_history` (90 d retained); deterministic | not measured (edge lifetime, lag stability, HIGH-confidence degradation → §12) |
+| [Causal verdict](#causal-propagation-phase-15-1) | enum {DIRECTIONAL · AMBIGUOUS · UNDER_EVIDENCED · COMMON_DRIVEN · COINCIDENCE · EXPLORATORY} | per `causal_propagation` call | n/a (enum) | refusal-first 6-step ladder (§13.4) | scarcity-gated to EXPLORATORY | recomputed on demand from `liquidity_alert_history` | DIRECTIONAL false-positive rate not measured |
+| [Distributed Stress verdict](#1410-not-yet-implemented--calibration-backlog) | enum {CALM · EARLY_DISTORTION · ELEVATED_RISK · PRE_CASCADE · INSUFFICIENT} + `genesis_score ∈ [0, 100]` | per `crisis_genesis` call (120 s TTL) | per-probe score is mapped to [0,100] via probe-specific transforms; composite is unweighted mean of contributing | refusal-first 6-step ladder (§14.5); scarcity cap floors at EARLY_DISTORTION when > 3 probes INSUFFICIENT | per-probe insufficient → contributes nothing; composite verdict still emits | recomputed on demand from history tables; stateless between calls (no persistence/hysteresis — §14.7) | uncalibrated; PRE_CASCADE false-positive rate not measured |
+| [Stress probe `dependency_concentration`](#144-the-seven-probes-component-decomposition) | [0, 100] | inherited from upstream `structural_dependencies` (300 s TTL) | top driver's out-degree share of network | `top_driver.out_degree / total_edges` (single ratio) | upstream INSUFFICIENT → probe insufficient | recomputed on demand | uncalibrated |
+| [Stress probe `transition_instability`](#144-the-seven-probes-component-decomposition) | [0, 100] | inherited from `market_state_transitions` (300 s TTL) | `flicker_ratio` + `oscillation_periods` blend | unweighted blend (interim) | upstream INSUFFICIENT → probe insufficient | recomputed on demand | thresholds interim; calibration pending |
+| [Confidence penalties (causal)](#causal-propagation-phase-15-1) | multiplicative factors | per `causal_propagation` call | `common_driver_factor = 0.35` if candidate found; `symmetry_factor = 1 − sym_penalty`; `scarcity_factor` from `SCARCITY[data_quality]` lookup | multiplicative chain: `volume × asymmetry × evidence × cd × sym × scarcity` | factors return 1.0 (no-op) or refusal verdict when input absent | deterministic from history | factor weights fixed; not calibrated |
+| [Data-quality gate (`_discovery_quality`)](#data-quality-scarcity) | enum {HIGH · MEDIUM · LOW · INSUFFICIENT} → `SCARCITY_FACTOR ∈ {0.15, 0.40, 0.75, 1.00}` | per-call (each layer that uses it) | per-layer (sample-count thresholds chosen per endpoint — e.g. pattern_discovery `low=20, medium=100, high=500`) | scalar lookup, applied multiplicatively at the consumer | INSUFFICIENT is a first-class verdict; never silently substituted | deterministic from sample counts | the per-layer thresholds are configurable but currently hard-coded; calibration pending |
+
+**What this table is not.** It is not a layer of formulas — those live in §3 and §9. It is not a list of blind spots — those live in §10. It is not a calibration plan — that lives in §12. The role of this table is the **comparability axis** so that "raw USD vs sigmoid [0,100] vs enum" or "1 Hz vs 300 s TTL vs event-driven" can be read off in one place.
+
+**Reading rule.** If a row says "uncalibrated" or "not measured" or "interim", the metric is still usable for diagnosis but its absolute level should not be cited as a market judgment. The verdict columns (Causal / Distributed Stress) carry their own refusal verdicts that make this constraint operational; the realtime-tier numeric columns rely on the operator reading them as relative-to-symbol-baseline rather than absolute.
+
+</details>
