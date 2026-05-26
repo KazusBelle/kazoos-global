@@ -8,16 +8,53 @@ This document is meant to be read **cold**, by someone who has never seen the co
 
 ---
 
+## Terminology
+
+Layer names in this document describe **what the layer measures**, not metaphors. The 2026-05-26 documentation passes renamed several layer labels to remove storytelling and AI-cognition flavor; engine code identifiers (function names, table names, endpoint paths, enum values, table column names) stay frozen for stability and are listed verbatim where they appear.
+
+| documentation label | engine code identifier (frozen) | what it measures |
+|---|---|---|
+| **Distributed Stress Detection** | `crisis_genesis(db, lookback_days)` · endpoint `/research/crisis-genesis` · operator-priority source key `genesis` | 7-probe composite; emits a discrete verdict ∈ {CALM, EARLY_DISTORTION, ELEVATED_RISK, PRE_CASCADE, INSUFFICIENT} from measurable conditions |
+| **Event Chain Reconstruction** | `narrative_causality(db, lookback_days)` · endpoint `/research/narrative-causality` · field `narrative_confidence_modifier` | deterministic 5-section template that composes outputs from causal/structural/transition/stress layers into a fixed-form summary with explicit per-section confidence and a mandatory "what we don't know" section. No model calls, no interpretation of intent |
+| **Causal Inference Layer** | Layer 8 functions `causal_propagation` · `structural_dependencies` · `market_state_transitions` · `crisis_genesis` · `narrative_causality` (formerly headed "Causal Intelligence") | verdict-emitting functions over already-measured propagation/transition data |
+| **Regime Transition Engine** | `market_state_transitions(db, lookback_days)` · DISC panel previously labeled "State Transition Intelligence" | per-transition verdict (PERSISTENT · ACCELERATING · FLICKER · REVERSED) with measurable persistence + acceleration + reversal flags |
+| **Replay Reconstruction Engine** | Layer 12 (formerly "Replay Intelligence") · `investigation_replay_*` in `research.py` · endpoints under `…/replay/*` | as-of reconstruction of layer outputs from history tables; per-surface `data_quality` ∈ HIGH/PARTIAL/INSUFFICIENT/PRUNED is mandatory |
+| **Anomaly Memory & Edge Graph** | tables `liquidity_anomaly_memory` + `liquidity_anomaly_edges` · readers `anomaly_lineage` · `crisis_evolution_tree` · `regime_ancestry` · `edge_lineage` · `narrative_chronicle` (legacy code names; surface labels prefer "edge trace" / "stress evolution" / "stress clusters" / "event-chain timeline") | persistent record of structural anomalies + typed edges with a measurable basis per edge |
+
+### What the platform does and does not do
+
+The platform **measures · validates · reconstructs · aggregates · compares · suppresses · emits · tracks · rejects · scores**. It does **not** understand the market, see structure, interpret intent, narrate causality, or assert hidden actors.
+
+### Epistemic boundaries (load-bearing)
+
+These phrases appear throughout the document with their literal meaning — they are not hedges, they are output states the engine actually emits:
+
+| phrase | meaning |
+|---|---|
+| **INSUFFICIENT** / **UNDER_EVIDENCED** | the layer refuses to commit a verdict; never silently substituted with a default |
+| **structurally unknowable** | the input data does not carry the property at all (e.g. `propagation_graph` aggregates over the window, so per-frame transmission order is not derivable from it) |
+| **no measurable basis** | a candidate edge / link / verdict was rejected because no probe could attach a number to it |
+| **replay unavailable before activation** | a layer that was deployed at time T cannot reconstruct itself at any time < T |
+| **causality not asserted** | a directional lead-lag pattern exists in the data, but the layer publishes it as a candidate verdict, not a causal claim |
+
+Every layer answers three questions: *what is measured · how it is measured · when the operator is allowed to see it*.
+
+---
+
 ## Contents
 
 1. [Architecture map — layer by layer](#1-architecture-map)
-2. [Data lineage](#2-data-lineage)
+2. [Data flow & dependency trace](#2-data-flow--dependency-trace)
 3. [Formula registry](#3-formula-registry)
 4. [Endpoint inventory](#4-endpoint-inventory)
 5. [Table inventory](#5-table-inventory)
 6. [Operator workflow guide](#6-operator-workflow-guide)
 7. [Known risks & backlog](#7-known-risks--backlog)
 8. [Architecture freeze — stable core vs experimental](#8-architecture-freeze)
+9. [Quantitative metric registry — realtime tier](#9-quantitative-metric-registry--realtime-tier)
+10. [Failure modes & observability limits](#10-failure-modes--observability-limits)
+11. [Non-inference boundaries](#11-non-inference-boundaries)
+12. [Validation framework — calibration backlog](#12-validation-framework--calibration-backlog)
 
 ---
 
@@ -99,7 +136,7 @@ The system is composed of **ten layers**, each with a clear role. Layers run ins
 
 ### Layer 5 — Operations / Strategy / Meta / Coordination
 
-These are intelligence aggregators that **synthesize** across the lower layers. All are in `research.py`.
+These are read-only aggregators that **compose** outputs from the lower layers into fixed-schema summaries. No new measurements; every value is derivable from inputs already published by Layers 1–4. All in `research.py`.
 
 | function | role | TTL |
 |---|---|---|
@@ -116,14 +153,14 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | `adaptation_recommendations(db)` | per-metric importance shift suggestions | — |
 | `memory_abstraction(db)` | compressed archetype view of anomaly memory | — |
 
-### Layer 6 — Memory & Anomaly Genealogy
+### Layer 6 — Anomaly Memory & Edge Graph
 
 | | |
 |---|---|
 | Tables | `liquidity_anomaly_memory` + `liquidity_anomaly_edges` |
-| Purpose | Persistent record of structural anomalies + typed edges between them (caused_by / evolved_into / historically_similar / preceded / destabilized / stabilized) |
+| Purpose | Persistent record of structural anomalies + typed edges between them. Edge kinds are an enum, not a free-text annotation: `caused_by` / `evolved_into` / `historically_similar` / `preceded` / `destabilized` / `stabilized`. Every edge carries a measurable basis (lag window, similarity score, or co-occurrence count) and is never written without one |
 | Writer | Worker `anomaly_recorder` task (300s cadence) |
-| Readers | `anomaly_lineage`, `memory_graph`, `crisis_evolution_tree`, `regime_ancestry`, `edge_lineage`, `crisis_clusters`, `narrative_chronicle` |
+| Readers | `anomaly_lineage`, `memory_graph`, `crisis_evolution_tree`, `regime_ancestry`, `edge_lineage`, `crisis_clusters`, `narrative_chronicle` (legacy code identifiers; surface labels prefer "stress evolution" / "stress clusters" / "event-chain timeline") |
 | Retention | 180d (Pass-A retention layer) |
 
 ### Layer 7 — Discovery (data-driven mining)
@@ -135,15 +172,15 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | `hidden_regimes(db, lookback_days, max_clusters)` | Clusters in engine-state space (intelligence_history) | 300s |
 | `propagation_graph(db, lookback_days, lead_window_ms, min_lead_ms)` | Symbol→symbol pair edges with `confidence_score` decomposition + `integrity_components`; returns `all_symmetric_pairs` for sanity loop check | 300s |
 
-### Layer 8 — Causal Intelligence (Phase 15)
+### Layer 8 — Causal Inference Layer (Phase 15)
 
 | function | does | TTL |
 |---|---|---|
 | `causal_propagation(db, lookback_days, n_windows)` | Per-pair verdict over 4 tests: asymmetry · multi-window persistence · common-driver elimination · scarcity gate. Verdicts: DIRECTIONAL · COMMON_DRIVEN · COINCIDENCE · UNDER_EVIDENCED · AMBIGUOUS · EXPLORATORY | 300s |
 | `structural_dependencies(db, lookback_days)` | Composes causal verdicts into 4 structural findings: influence chains · dominant drivers · co-driver clusters · synchronized stress groups | 300s |
 | `market_state_transitions(db, lookback_days)` | Per-transition verdict + lifecycle: PERSISTENT · ACCELERATING · FLICKER · REVERSED; aggregates: flicker_ratio, oscillation_periods, transition_rate | 300s |
-| `crisis_genesis(db, lookback_days)` | 7-probe composite: fragmentation_growth · resiliency_decay · propagation_widening · dependency_concentration · anomaly_synchronization · transition_instability · stress_acceleration → verdict CALM/EARLY_DISTORTION/ELEVATED_RISK/PRE_CASCADE/INSUFFICIENT | 120s |
-| `narrative_causality(db, lookback_days)` | Deterministic 5-section narrative; template-built (no model calls); explicit confidence per section + "what we don't know" | 120s |
+| `crisis_genesis(db, lookback_days)` — **Distributed Stress Detection** | 7-probe composite over a `lookback_days` window: fragmentation_growth · resiliency_decay · propagation_widening · dependency_concentration · anomaly_synchronization · transition_instability · stress_acceleration. Each probe emits an independent [0,100] score with its own scarcity gate; composite = mean over *contributing* probes. Verdict thresholds: PRE_CASCADE (score ≥ 75 AND hot_count ≥ 3) · ELEVATED_RISK (≥ 50) · EARLY_DISTORTION (≥ 25) · CALM (< 25) · INSUFFICIENT (no probes contributing). Scarcity cap: verdict floored at EARLY_DISTORTION when > 3 probes are INSUFFICIENT. No forecast claim — every output is "current measured state across the window". | 120s |
+| `narrative_causality(db, lookback_days)` — **Event Chain Reconstruction** | Deterministic 5-section template that composes already-validated outputs from causal/structural/transition/stress layers into a fixed-form summary. No model calls. Per-section confidence is taken from upstream layer confidence — never invented. Mandatory "what we don't know" section enumerates layers that returned INSUFFICIENT/UNDER_EVIDENCED. The template is the contract: if a section's inputs are absent, the section reports absence rather than filling silence. | 120s |
 
 ### Layer 9 — Feedback & Adaptation (Phase 16)
 
@@ -156,7 +193,7 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | TTL | 120s |
 | Reversibility | Pure read; turning the loop off = downstream stops reading the modifier |
 
-### Layer 12 — Replay Intelligence (Phase 19, Pass A backend)
+### Layer 12 — Replay Reconstruction Engine (Phase 19, Pass A backend)
 
 | | |
 |---|---|
@@ -166,7 +203,7 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 | Capture | Auto-fires on `investigation_create` (kind=`auto_create` or `auto_draft`). Operator can recapture via `force=true` |
 | State modes | `frozen` reads the opaque JSON snapshot; `live` reconstructs from `liquidity_intelligence_history` + `liquidity_alert_history` + `liquidity_anomaly_memory` + `operator_priority_*` tables. Same response schema, distinguished by `is_frozen` |
 | Replay safety | Each reconstructed surface publishes its own `data_quality` ∈ HIGH/PARTIAL/INSUFFICIENT/PRUNED. PRUNED triggers when a window is past retention; the engine refuses to invent a value |
-| Diff | Narrow semantic comparison at anchor: genesis verdict + score, sanity overall_state, adaptation modifier values (Δ ≥ 0.05), operator queue size + escalation counts, narrative headline. Every drift carries before/after/delta |
+| Diff | Narrow field-level comparison at anchor: stress-detection verdict + score, sanity overall_state, adaptation modifier values (Δ ≥ 0.05), operator queue size + escalation counts, event-chain top section header. Every drift carries before/after/delta. No interpretation — pure value comparison |
 | Timeline | Scrubber keyframes — material events (operator_priority_events + alerts + anomalies + case lifecycle) inside a `[anchor − pre, anchor + post]` window |
 | Propagation | Frame-bucketed alert-start counts per symbol over the case window + static propagation edges. Per-frame edge transmission is intentionally NOT inferred — propagation_graph doesn't carry timestamped pair data |
 
@@ -175,18 +212,18 @@ These are intelligence aggregators that **synthesize** across the lower layers. 
 * **Frozen snapshot is now APPEND-ONLY.** `investigation_replay_snapshots` has a `revision` (1..N per case) + `is_active` pointer; the old unique-on-investigation_id is gone in favor of unique-on-(investigation_id, revision). Recapture inserts a new revision and flips the prior to `is_active=False`; payloads are never destroyed. New surfaces: `GET .../replay/history`, `GET .../replay/state?revision=N`, `GET .../replay/diff/revisions?from=&to=`.
 * **Diff semantics made explicit.** The diff response now always carries `comparison_mode ∈ {frozen_vs_now, frozen_vs_frozen}`; the UI labels the banner accordingly and no longer says "FROZEN vs LIVE". The cursor snapshot remains a separate panel — no fake cursor-diff is computed.
 * **Retention-safe evidence linking.** `_investigation_link_evidence_inner` now auto-fetches the upstream row (per `evidence_type` dispatch: alert / anomaly / operator_priority) and stores it in `investigation_evidence.snapshot_json` at link time. `investigation_timeline` falls back to that snapshot when the upstream row has been pruned and tags the event with `is_pruned=True` so the operator sees the gap explicitly. Silent shrinkage of the case timeline is eliminated.
-* **Async capture decoupling.** `investigations.capture_status ∈ {PENDING, CAPTURED, FAILED}` queue field. `investigation_create` sets PENDING; a new worker loop `investigation-capture` (30s cadence) drains the queue via `investigation_capture_pending(db)`. Case creation no longer holds the request on the 8-layer intelligence cascade. Failures are recorded (`capture_error`) and the operator can re-queue via `POST .../replay/retry`.
+* **Async capture decoupling.** `investigations.capture_status ∈ {PENDING, CAPTURED, FAILED}` queue field. `investigation_create` sets PENDING; a new worker loop `investigation-capture` (30s cadence) drains the queue via `investigation_capture_pending(db)`. Case creation no longer holds the request on the 8-layer aggregation cascade. Failures are recorded (`capture_error`) and the operator can re-queue via `POST .../replay/retry`.
 
 Pass B (Phase 19) lands the operator-facing UI on top of the Pass A endpoints, inside the INV drawer as a new lazy-mounted `replay` tab:
 
-* **FROZEN vs LIVE diff banner** — prominent header that shows the count + per-field deltas (genesis verdict, sanity overall_state, adaptation modifier values, queue size + escalation counts, narrative headline). Color band escalates with drift count. Includes one explicit `recapture` button that is the only frontend write path mutating the frozen reference.
+* **FROZEN vs LIVE diff banner** — prominent header that shows the count + per-field deltas (stress-detection verdict, sanity overall_state, adaptation modifier values, queue size + escalation counts, event-chain top section). Color band escalates with drift count. Includes one explicit `recapture` button that is the only frontend write path mutating the frozen reference.
 * **Scrubber** — SVG strip with click-to-seek, play/pause loop (`requestAnimationFrame` × speed factor; 1s wall ≈ 1m case time at speed=1, capped at window_end), step ±keyframe, prev/next critical-keyframe, jump-to-anchor, speed selector (0.5×–16×).
 * **Overlay toggles** — operator_priority / alert / anomaly / case sources can each be hidden from the keyframe strip; severity-colored ticks (info/warn/critical).
 * **Cursor snapshot** — toggle between live-reconstruction at cursor (debounced 250 ms refetch on cursor settle) and the frozen blob; live view surfaces per-section `data_quality` (HIGH/PARTIAL/INSUFFICIENT/PRUNED) explicitly.
 * **State evolution mini-charts** — keyframe density + alert activity per bucket, derived from already-fetched timeline + propagation data. Vanilla SVG sparklines with a synchronized cursor line. No interpolation, no smoothing.
-* **Propagation playback** — frame-bucketed per-symbol activation bars (current frame indexed by cursor); historical lead-lag edges from `propagation_graph` rendered as a static list, NOT animated per frame (no fake transmission order).
+* **Alert counts at cursor** (initial name: "propagation playback" — renamed in the 2026-05-24 Attention Pass, see below) — frame-bucketed per-symbol activation bars (current frame indexed by cursor); historical lead-lag edges from `propagation_graph` rendered as a static list, NOT animated per frame. `propagation_graph` edges are aggregated over the full lookback window, not timestamped, so per-frame transmission order is structurally unknowable from the data.
 
-UX discipline: no cinematic effects, no glow, no auto-camera, no AI storytelling. The only moving element is the scrubber cursor. Every series and every overlay is sourced from already-fetched real data; missing surfaces stay missing (data_quality flagged) rather than being interpolated.
+UX discipline: no cinematic effects, no glow, no auto-camera, no inferred transmission order. The only moving element is the scrubber cursor. Every series and every overlay is sourced from already-fetched real data; missing surfaces stay missing (`data_quality` flagged HIGH/PARTIAL/INSUFFICIENT/PRUNED) rather than being interpolated.
 
 Performance: lazy-mounted (no fetches until the operator opens the `replay` tab); a single round-trip on mount (state + timeline + diff + propagation in parallel) plus debounced cursor-position fetches.
 
@@ -195,13 +232,13 @@ Performance: lazy-mounted (no fetches until the operator opens the `replay` tab)
 After the Integrity Repair Pass closed the four HIGH-severity findings from the operational review, a follow-up review (`docs/2026-05-24-stability-review.md`) identified six presentation-layer HIGH findings around operator fatigue, signal-vocabulary collisions, and trust semantics. Closed in a single presentation-layer pass — no new layer, no new endpoint, no formula change:
 
 * **Chronic vs new severity differentiation.** The sanity banner and operator-queue rows now classify each item into an attention bucket (`fresh / escalating / calming / stable / resolved`) derived from the existing `trend` and `lifecycle` fields. Persistent / chronic items render with muted color and lower visual energy; only fresh and escalating items get full saturation. The "persistent CRITICAL becomes wallpaper" failure mode is structurally addressed.
-* **Action-tier / diagnostic-tier separation on DISC.** The page splits into three visual blocks: action surfaces (Operator Queue · Sanity · Adaptation · Crisis Genesis · Narrative), an expandable "diagnostic context" accordion (Pattern Discovery · Propagation · Causal · Structural · Transitions), and an expandable "research drill-down" accordion (Archetypes · Hidden Regimes · Evolutionary · Memory · Forecast · Adaptation Recs). Nothing removed; defaults collapse the cold panels so they stop polling and stop competing for attention.
+* **Action-tier / diagnostic-tier separation on DISC.** The page splits into three visual blocks: action surfaces (Operator Queue · Sanity · Adaptation · Distributed Stress · Event Chain), an expandable "diagnostic context" accordion (Pattern Discovery · Propagation · Causal · Structural · Transitions), and an expandable "research drill-down" accordion (Archetypes · Hidden Regimes · Evolutionary · Memory · Forecast · Adaptation Recs). Nothing removed; defaults collapse the cold panels so they stop polling and stop competing for attention.
 * **Severity-vocabulary disambiguation.** Sanity findings are now prefixed with `integrity:` in the UI. Investigation severity is presented as "priority" (`investigationSeverityLabel`); alert severity keeps the canonical bare word. API contracts unchanged.
 * **Softer verdict / role wording.** `PRE_CASCADE` → "pre-cascade conditions present"; `DIRECTIONAL` → "directional pattern (lead-lag)"; `dominant_driver` → "candidate driver"; `AMPLIFIER` → "appears in chains"; `LEADER` → "appears as leader (candidate)". Every label remap lives in `frontend/src/lib/labels.ts`; raw enum values stay in the API.
-* **Replay propagation animation removed.** The per-symbol bars no longer animate (`transition` removed; renamed from "propagation playback" → "alert counts at cursor"). Animation implied causal transmission the data does not support; the operator now scrubs manually and reads a static per-bucket snapshot.
+* **Replay propagation animation removed.** The per-symbol bars no longer animate (`transition` removed; label changed from "propagation playback" → "alert counts at cursor"). Animation implied per-frame causal transmission that `propagation_graph` does not carry — pair edges are aggregated over the full lookback window, not timestamped. Operator scrubs manually and reads a static per-bucket count.
 * **Calmer chrome.** Action-tier panels keep saturation; persistent / chronic items render at ~60% opacity with neutral borders. Less simultaneous urgency; stronger contrast reserved for new/escalating signals.
 
-The strongest property of this pass is what it *did not* add: no new score, no new modifier, no new queue, no new intelligence layer.
+The strongest property of this pass is what it *did not* add: no new score, no new modifier, no new queue, no new measurement layer.
 
 ### Layer 11 — Investigation & Casework (Phase 18)
 
@@ -245,7 +282,7 @@ Plus an hourly prune cycle that calls `prune_old` (samples, 35d) and `prune_rese
 
 ---
 
-## 2. Data lineage
+## 2. Data flow & dependency trace
 
 ```
                                 Binance REST     Binance WS     CoinGecko    Bybit
@@ -262,7 +299,7 @@ Plus an hourly prune cycle that calls `prune_old` (samples, 35d) and `prune_rese
                                                     │
                             ┌───────────────────────┼─────────────────────────┐
                             ▼                       ▼                         ▼
-                       alert engine             metric aggregators       intelligence snapshot
+                       alert engine             metric aggregators       engine-state snapshot
                             │                       │                         │
                             ▼                       ▼                         ▼
                   alert_states / events     research.py functions    liquidity_intelligence_history
@@ -281,10 +318,10 @@ Plus an hourly prune cycle that calls `prune_old` (samples, 35d) and `prune_rese
                                           structural_dependencies   market_state_transitions
                                                               │
                                                               ▼
-                                                      crisis_genesis (7 probes)
+                                          Distributed Stress Detection (7 probes)
                                                               │
                                                               ▼
-                                                  narrative_causality (template)
+                                          Event Chain Reconstruction (5-section template)
                                                               │
                                                               ▼
                                                   adaptation_state (Phase 16 modifiers)
@@ -438,22 +475,31 @@ verdict:
   PERSISTENT          else
 ```
 
-### Crisis genesis (Phase 15 #4)
+### Distributed Stress Detection (Phase 15 #4)
+
+Engine code identifier: `crisis_genesis()` (retained for stability). Composite verdict over 7 independent probes:
 
 ```
-genesis_score      = mean(probe.score for contributing probes)        ∈ [0, 100]
-confidence         = contributing_probes / 7
+contributing_probes  = count of probes whose data_quality ≠ INSUFFICIENT
+hot_count            = count of probes whose individual score ≥ 75
+genesis_score        = mean(probe.score for contributing probes)        ∈ [0, 100]
+confidence           = contributing_probes / 7
 
-scarcity cap:      verdict capped at EARLY_DISTORTION if > 3 probes INSUFFICIENT
-verdict:
-  PRE_CASCADE      score ≥ 75 AND hot_count ≥ 3
-  ELEVATED_RISK    score ≥ 50
-  EARLY_DISTORTION score ≥ 25
-  CALM             score < 25
-  INSUFFICIENT     no probes contributing
+verdict (priority order, applied AFTER scarcity cap):
+  INSUFFICIENT       contributing_probes == 0
+  PRE_CASCADE        genesis_score ≥ 75  AND  hot_count ≥ 3
+  ELEVATED_RISK      genesis_score ≥ 50
+  EARLY_DISTORTION   genesis_score ≥ 25
+  CALM               genesis_score <  25
+
+scarcity cap:
+  if > 3 probes INSUFFICIENT → verdict floored at EARLY_DISTORTION
+  (the layer refuses PRE_CASCADE / ELEVATED_RISK while too many inputs are blind)
 ```
 
-7 probes: see [Layer 8 table](#layer-8--causal-intelligence-phase-15).
+7 probes (each emits an independent [0,100] score with its own scarcity gate): `fragmentation_growth` · `resiliency_decay` · `propagation_widening` · `dependency_concentration` · `anomaly_synchronization` · `transition_instability` · `stress_acceleration`. See [Layer 8 table](#layer-8--causal-inference-layer-phase-15).
+
+Operator-visible decomposition is mandatory: every published verdict carries the probe list, per-probe score, per-probe data_quality, and the contributing-probes count. The composite is never published without its parts.
 
 ### Forecast hardening
 
@@ -525,8 +571,8 @@ lifecycle (DB-backed):
 | `/research/operator-digest?window_hours=1|6|24` | What materially changed | <100 ms | — | none | DISC bottom | 🟢 |
 | `/research/sanity-audit` | Engine integrity checks | ~5 s | 7 ms | 30s | DISC banner | 🔴 if down, integrity blind |
 | `/research/adaptation-state` | 5 modifiers + audit trail | <200 ms | 7 ms | 120s | DISC top | 🟡 |
-| `/research/narrative-causality` | Deterministic narrative | <200 ms | 7 ms | 120s | DISC narrative | 🟢 |
-| `/research/crisis-genesis` | 7-probe composite | <200 ms | 7 ms | 120s | DISC banner | 🟡 |
+| `/research/narrative-causality` | Event Chain Reconstruction (5-section deterministic template) | <200 ms | 7 ms | 120s | DISC event-chain panel | 🟢 |
+| `/research/crisis-genesis` | Distributed Stress Detection (7-probe composite) | <200 ms | 7 ms | 120s | DISC stress banner | 🟡 |
 | `/admin/runtime-health` | Pool + cache + heartbeats + tables | <50 ms | <50 ms | none | (ops use) | 🟡 |
 
 ### Phase 18 — Investigation & Casework
@@ -546,7 +592,7 @@ lifecycle (DB-backed):
 | `GET /research/investigations/{id}/export` | Stable 8-section markdown (JSON) | <200 ms | — | none |
 | `GET /research/investigations/{id}/export.md` | Same, as plain text/markdown download | <200 ms | — | none |
 
-### Phase 19 — Replay Intelligence (Pass A)
+### Phase 19 — Replay Reconstruction (Pass A)
 
 | route | purpose | cold | warm | TTL |
 |---|---|---|---|---|
@@ -554,7 +600,7 @@ lifecycle (DB-backed):
 | `GET .../replay/state?mode=frozen` | Return the opaque snapshot payload | <50 ms | — | none |
 | `GET .../replay/state?mode=live&at_ms=…` | Reconstruct surface from history tables at `at_ms` | <150 ms | — | none |
 | `GET .../replay/timeline` | Scrubber keyframes around the case anchor | <150 ms | — | none |
-| `GET .../replay/diff` | FROZEN vs LIVE narrow semantic diff at anchor | <500 ms | — | none |
+| `GET .../replay/diff` | FROZEN vs LIVE narrow field-level diff at anchor | <500 ms | — | none |
 | `GET .../replay/propagation` | Frame-bucketed alert counts per symbol + static prop edges | <150 ms | — | none |
 
 ### Phase 15 causal layers
@@ -579,7 +625,7 @@ lifecycle (DB-backed):
 | `/research/adaptation-recommendations` | Per-metric importance shifts | <50 ms | 7 ms | 300s |
 | `/research/adapted-recommendations` | …with Phase-16 suppression applied | <100 ms | — | none |
 
-### Heavy / pre-Phase-14 intelligence
+### Heavy / pre-Phase-14 aggregators
 
 | route | purpose | cold | warm | TTL |
 |---|---|---|---|---|
@@ -588,15 +634,15 @@ lifecycle (DB-backed):
 | `/research/intelligence-history` | Recent snapshots | ~25 ms | — | — |
 | `/research/structural-breaks`, `/risk-state`, `/regime-shift-warning`, `/meta-confidence`, `/meta-intelligence-health`, `/strategic-state` | Individual layers of synthesis | ms-range | — | — |
 
-### Memory / lineage
+### Memory / dependency trace
 
 | route | purpose | risk |
 |---|---|---|
 | `/research/anomaly-memory` (GET/POST) | Memory rows + insert | 🟡 if abused |
 | `/research/anomaly-lineage/{id}` | BFS up to depth 3 | 🟢 (capped) |
 | `/research/memory-graph` | Full nodes+edges | 🟡 (scales with memory) |
-| `/research/crisis-evolution-tree`, `/regime-ancestry`, `/edge-lineage/{kind}` | Specific lineage queries | 🟢 |
-| `/research/narrative-chronicle` | Memory→narrative timeline | 🟢 |
+| `/research/crisis-evolution-tree`, `/regime-ancestry`, `/edge-lineage/{kind}` | Specific dependency-trace queries (legacy endpoint names; surface labels prefer "edge trace") | 🟢 |
+| `/research/narrative-chronicle` | Anomaly-memory rows projected as an event-chain timeline (legacy endpoint name) | 🟢 |
 
 ### Pre-existing operator surfaces (alerts, pins, replay)
 
@@ -648,12 +694,12 @@ Open the **DISC page**. From the top:
 
 1. **Operator queue banner** — durable across restarts. Per-row priority chip + escalation + lifecycle + source layer + action buttons.
 2. **Sanity banner** — engine integrity checks. CLEAN = subtle dim row; WARN/CRITICAL = colored banner.
-3. **Crisis genesis banner** — 7-probe composite for "pre-cascade structural distortion?". Probabilistic, never claims to predict.
-4. **Adaptation loop banner** — 5 modifier coefficients; explains which downstream behavior is being suppressed/strengthened and why.
-5. **Narrative causality panel** — deterministic 5-section paragraph composed from causal/structural/transition/genesis layers. Italic "what we don't know" section is always present.
-6. **Causal Propagation** panel + **Structural Dependencies** panel + **State Transition Intelligence** panel — deeper drill-down.
-7. **Pattern Discovery** + **Hidden Regimes** + **Crisis Archetypes** + **Memory Abstraction** — pre-Phase-15 mining layers.
-8. **Intelligence Forecast** + **Adaptation Recommendations** + **Evolutionary Behavior** — projection / recommendation surfaces.
+3. **Distributed Stress Detection banner** — 7-probe composite. Reports the discrete verdict (CALM / EARLY_DISTORTION / ELEVATED_RISK / PRE_CASCADE / INSUFFICIENT) with `contributing_probes / 7` confidence and per-probe decomposition on click. Not a forecast; reports only the current measured state across the lookback window.
+4. **Adaptation loop banner** — 5 modifier coefficients; lists which downstream behavior is suppressed/strengthened, the input that drove the change, and the [min, max] bounds the modifier is clipped to.
+5. **Event Chain Reconstruction panel** — deterministic 5-section template composed from causal / structural / transition / distributed-stress outputs. Per-section confidence is taken from the upstream layer, never invented. Mandatory "what we don't know" section enumerates layers currently INSUFFICIENT / UNDER_EVIDENCED.
+6. **Causal Propagation** panel + **Structural Dependencies** panel + **Regime Transition Engine** panel — deeper drill-down.
+7. **Pattern Discovery** + **Hidden Regimes** + **Stress Archetypes** + **Memory Abstraction** — pre-Phase-15 mining layers.
+8. **Engine-State Forecast** + **Adaptation Recommendations** + **Evolutionary Behavior** — projection / recommendation surfaces.
 
 ### Reading escalation levels
 
@@ -661,10 +707,10 @@ Open the **DISC page**. From the top:
 |---|---|---|
 | **NORMAL** | Score < 25. Below the floor. | Nothing required. Visible if filter is `all`. |
 | **WATCH** | 25 ≤ score < 50. Signal worth monitoring. | Note it. Don't act yet. |
-| **IMPORTANT** | 50 ≤ score < 75. Material concern. | Investigate. Cross-check with sanity + crisis genesis. |
-| **CRITICAL** | Score ≥ 75. System integrity / pre-cascade signal. | Diagnostic, NOT a trade signal. Read the rationale, then ack/resolve/escalate manually. |
+| **IMPORTANT** | 50 ≤ score < 75. Material concern. | Investigate. Cross-check with sanity + Distributed Stress Detection. |
+| **CRITICAL** | Score ≥ 75. ≥1 measured property has crossed its CRITICAL threshold. | Diagnostic, NOT a trade signal. Read the per-finding decomposition, then ack/resolve/escalate manually. |
 
-**CRITICAL never means "buy" or "sell". It means "the engine is telling you something is structurally off; do not ignore."**
+**CRITICAL is never a trade signal.** It states that one or more measured properties have crossed an operator-visible threshold. The action is investigate · cross-check · ack/resolve, not buy/sell.
 
 ### Operator actions on a priority row
 
@@ -708,7 +754,7 @@ A WARN sanity + HIGH confidence + INSUFFICIENT scarcity is a coherent state: "Sa
 
 ## 7. Known risks & backlog
 
-### P0 — fix before next intelligence phase
+### P0 — fix before next measurement phase
 
 *(All P0 from the 2026-05-23 production audit are landed.)*
 
@@ -747,7 +793,7 @@ The sanity layer is currently in CRITICAL because of one persistent issue:
 
 - `sanity:propagation_loop` — 84 symmetric pairs ≥70% mirror. Most are between low-volume symbols that fire alerts in lockstep during market events. They're correctly demoted by the propagation layer's `symmetry_penalty` (and thus excluded from causal DIRECTIONAL verdicts), but the count is high enough that sanity flags it.
 
-The downstream effect is `discovery_suppression_modifier = ×0.50` on adaptation recommendations. This is **the feedback loop working as designed** — sanity sees noise, adaptation halves its action confidence.
+The downstream effect is `discovery_suppression_modifier = ×0.50` on adaptation recommendations. This is **the feedback loop working as designed** — the sanity layer flagged a noise-driven pattern; the adaptation layer applied its CRITICAL-state suppression coefficient (0.50 per the table at [§3 Adaptation modifiers](#adaptation-modifiers-phase-16)) and halved the importance shift on every recommendation.
 
 ---
 
@@ -772,14 +818,14 @@ These layers are valuable but their absolute numbers should be read as "best cur
 
 - **Causal Propagation** (verdicts, common-driver detection) — works, but DIRECTIONAL count = 0 on current data. Output stabilizes only after weeks of accumulated history.
 - **Structural Dependencies** (chains, drivers, clusters, sync) — entirely scarcity-gated. Currently exploratory.
-- **Market State Transition Intelligence** — emits real findings now (data_quality=MEDIUM), but `flicker_ratio` interpretation needs calibration over longer horizons.
-- **Crisis Genesis Detection** — 7 probes, 4 currently contributing on live data. The composite verdict is honest about which probes are missing.
-- **Narrative Causality** — deterministic template-built; safe to read. The probabilistic phrasing is the feature.
-- **Memory Graph / Anomaly Lineage** — small now, will need rendering limits (P2 backlog) at scale.
-- **Pattern Discovery / Hidden Regimes / Crisis Archetypes** — data-driven mining, all guarded by `data_quality`.
-- **Investigation causal tree / similarity** (Phase 18 Pass B) — investigation-support graphs and deterministic case similarity. Tree edges come from already-stable upstream layers (anomaly genealogy, propagation, structural deps, transitions); similarity is rule-based (no ML). Useful diagnostically; reasons always exposed.
-- **Investigation auto-draft** — only fires on `crisis_genesis = PRE_CASCADE` with deduped fingerprint. Treat the absolute count of auto-drafts as exploratory until the genesis layer itself stabilizes.
-- **Replay reconstruction / FROZEN-vs-LIVE diff** (Phase 19 Pass A) — frozen snapshot store is stable, but per-surface live reconstruction inherits the experimental status of its inputs (causal/structural/genesis/narrative). Diff entries should be read as "engine interpretation changed" — not a market prediction signal.
+- **Regime Transition Engine** (engine code: `market_state_transitions`) — emits real findings now (data_quality=MEDIUM), but `flicker_ratio` thresholds need calibration over longer horizons.
+- **Distributed Stress Detection** (engine code: `crisis_genesis`) — 7 probes, 4 currently contributing on live data. The composite always publishes `contributing_probes / 7` and the per-probe scores; a missing probe is never hidden behind the aggregate.
+- **Event Chain Reconstruction** (engine code: `narrative_causality`) — deterministic template, no model calls. Output is safe to read because every section is sourced from a layer that publishes its own confidence; sections with no upstream input render as explicit gaps.
+- **Memory Graph / Anomaly Edge Trace** (engine code: `memory_graph`, `anomaly_lineage`) — small now, will need rendering limits (P2 backlog) at scale.
+- **Pattern Discovery / Hidden Regimes / Stress Archetypes** (engine code: `crisis_archetypes`) — data-driven mining, all guarded by `data_quality`.
+- **Investigation causal tree / similarity** (Phase 18 Pass B) — investigation-support graphs and deterministic case similarity. Tree edges come from already-stable upstream layers (anomaly memory edges, propagation, structural deps, transitions); similarity is rule-based (no ML). Useful diagnostically; reasons always exposed.
+- **Investigation auto-draft** — only fires on `crisis_genesis = PRE_CASCADE` (Distributed Stress Detection verdict) with deduped fingerprint. Treat the absolute count of auto-drafts as exploratory until the stress-detection layer itself stabilizes.
+- **Replay reconstruction / FROZEN-vs-LIVE diff** (Phase 19 Pass A) — frozen snapshot store is stable, but per-surface live reconstruction inherits the experimental status of its inputs (causal · structural · distributed-stress · event-chain). Diff entries report that a layer's *output* changed between FROZEN time and LIVE time — they are not market predictions.
 
 ### Frozen interfaces (do not break)
 
@@ -806,9 +852,9 @@ If the system goes down tomorrow and someone needs to rebuild it from scratch:
 If someone needs to extend it without losing the architectural intent:
 
 - **Honest uncertainty** is the core invariant. Every layer must gate its outputs by data_quality and must publish its decomposition. New layers that do "we have a model that says X" without exposing factors do not fit.
-- **Acyclic dependencies** between intelligence layers. `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back into upstream computations.
+- **Acyclic dependencies** between measurement layers. `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back into upstream computations.
 - **Bounded, reversible, explainable** is the rule for any modifier that affects downstream behavior. Phase 16's `ADAPTATION_BOUNDS` is the pattern to copy.
-- **No trading actions**. The system is operator intelligence, not execution. ACK/MUTE/RESOLVE are workflow markers, not trade triggers.
+- **No trading actions**. The platform is operator-facing observability, not execution. ACK/MUTE/RESOLVE are workflow markers, not trade triggers.
 
 ### Companion docs
 
@@ -817,3 +863,245 @@ If someone needs to extend it without losing the architectural intent:
 - This document — system-wide freeze (commit pending)
 
 Together these three give the full picture: where we are, what's been hardened, what's planned, and how the pieces fit.
+
+---
+
+## 9. Quantitative metric registry — realtime tier
+
+§3 catalogued the research-aggregator formulas. This section catalogues the **realtime-tier microstructure metrics** computed at 1 Hz against the WS-sourced orderbook + tape, written to `liquidity_samples` under the metric names below. Each entry follows the same 7-field structure: Purpose · Inputs · Formula · Threshold/output · Failure conditions · Replay behavior · Validation constraints.
+
+### 9.1 Credible Depth (`credible_depth`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/metrics.py:56`](shared/kazus_logic/liquidity/realtime/metrics.py#L56) `credible_depth_usd()` |
+| Purpose | USD value of resting orderbook liquidity around mid that has demonstrated **persistence** — defeats spoof flicker by ignoring quotes younger than a minimum age |
+| Inputs | `state.bids` / `state.asks` (top-20 WS book), each level keyed by price with `(qty, first_ts)` first-appearance timestamp; `state.mid_price()` |
+| Formula | `band = mid × (1 ± CREDIBLE_BAND_PCT)` with `CREDIBLE_BAND_PCT = 0.005` (±0.5%). For each side, sum `price × qty` over levels where `price ∈ band` **AND** `(now_ms − first_ts) ≥ CREDIBLE_MIN_AGE_MS = 400`. Quotes younger than 400 ms contribute **zero** |
+| Threshold | Reported as raw USD. Higher = more genuine resting liquidity at the touch |
+| Failure conditions | `mid_price()` returns None → metric returns None (no fabricated value). Empty book → None. Per-symbol thresholds for "low credible depth" are not centralized — read via the per-symbol percentile context the operator pulls from `/metrics/{symbol}` |
+| Replay behavior | **Not reconstructible from history**: the metric depends on per-level `first_ts` which is only held in memory in `SymbolState`. Historical samples carry the computed value, not the inputs. Replay tier uses the persisted `liquidity_samples` row as authoritative |
+| Validation constraints | The 400 ms persistence floor is the anti-spoof primitive. Lowering it weakens the metric's core property; raising it makes the metric blind to short-but-real liquidity. Any change must be paired with a recalibration against known spoof / non-spoof regimes — currently not measured (see §12) |
+
+### 9.2 Resiliency Score (`resiliency_score`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:194`](shared/kazus_logic/liquidity/realtime/intelligence.py#L194) `resiliency_score()` |
+| Purpose | 0..100 measure of how the book recovers after a stress event. Higher = faster + more complete refill |
+| Inputs | `state.events` list of `RecoveryEvent` records produced by `_detect_events`: kinds ∈ {`liq_spike`, `spread_explosion`, `depth_collapse`, `obi_flip`}, each with `pre_depth`, `started_ts`, `recovered_ts`, `recovery_ms`, `refill_velocity`. Event detection is debounced by `EVENT_DEBOUNCE_MS = 10_000` |
+| Formula | For each completed event (i.e. `recovery_ms is not None`): `time_part = 100 × exp(−recovery_ms / 30_000)`; `velo_part = 50 × tanh(refill_velocity / 50_000) + 50`; event-score = `0.6·time_part + 0.4·velo_part`. Aggregate: exp-weighted by event age with **5-min half-life** (`weight = exp(−age_s / 300)`). Output clipped to [0, 100] |
+| Threshold | Recovery defined as depth climbing back to `RECOVERY_FRACTION × pre_depth = 0.80 × pre`. Events past `RECOVERY_MAX_AGE_MS = 90_000` are marked "did not recover" (recovery_ms = 90s, refill_velocity = 0) — not silently dropped |
+| Failure conditions | No completed events → returns **None**, not a fabricated 100. Per-event `pre_depth ≤ 0` → event skipped from recovery advancement. Operator-visible column shows "—" when None |
+| Replay behavior | Reconstructible only from `liquidity_samples` (the persisted score); the in-memory `RecoveryEvent` ring is not on disk |
+| Validation constraints | Three event-detection thresholds are load-bearing: `DEPTH_COLLAPSE_DROP = 0.40` (40% drop in 10s), `SPREAD_EXPLOSION_BPS = 8.0`, `LIQ_SPIKE_USD = 50_000`. All three are absolute (not per-symbol percentiles) and are interim values that should be recalibrated per-symbol — currently not measured (see §12) |
+
+### 9.3 Impact Score (`impact_score`) — Kyle λ sigmoid
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:270`](shared/kazus_logic/liquidity/realtime/intelligence.py#L270) `impact_score()` |
+| Purpose | 0..100 measure of price sensitivity to signed flow — the **Kyle Lambda** classical microstructure quantity, sigmoid-normalized for display |
+| Inputs | `state.trades` over the last `KYLE_WINDOW_MS = 60_000` ms |
+| Formula | Bucket trades into `KYLE_BUCKET_MS = 1_000` ms windows. For each bucket: `signed_usd = signed_qty × first_price`; skip if `|signed_usd| < KYLE_MIN_VOLUME_USD = 100`; `ret = (last_p − first_p) / first_p`; `λ = |ret| / |signed_usd| × 1e9`. Take **median** over buckets for robustness. Output: `100 / (1 + exp(−(λ − 1)))` — sigmoid centred at λ = 1 |
+| Threshold | λ = 1 ⇒ score ≈ 50 ("typical mid-cap perp under normal flow") per code comment. No hard verdict thresholds — the metric is published raw |
+| Failure conditions | `< KYLE_MIN_BUCKETS = 8` filled buckets → returns **None**. Zero or negative prices → bucket skipped. Negligible flow → bucket skipped |
+| Replay behavior | Persisted to `liquidity_samples`; the underlying tape is not retained at 1-second granularity past the 60s window |
+| Validation constraints | The "λ = 1 → 50" anchor is a documentation claim, not a calibration result — it has not been measured against a labelled corpus of "normal" vs "stressed" flow. Re-anchoring requires a per-symbol baseline (see §12) |
+
+### 9.4 Fragility Score (`fragility_score`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:279`](shared/kazus_logic/liquidity/realtime/intelligence.py#L279) `fragility_score()` |
+| Purpose | 0..100 measure of **price-impact instability** — high variance of bucket λs means the relationship between flow and price is unstable, regardless of its central level |
+| Inputs | Same bucket λs as Impact Score |
+| Formula | `mean = Σλ / N`; `var = Σ(λ − mean)² / N`; `std = √var`; `cv = std / mean if mean > 1e-12 else 0`; output = `clip(cv × 50, 0, 100)`. CV ≥ 2 ⇒ score = 100 ("very fragile") |
+| Threshold | No hard verdict — published raw. CV in [0, 2] maps linearly to [0, 100] |
+| Failure conditions | `< KYLE_MIN_BUCKETS = 8` filled buckets → **None**. Mean λ near zero → CV forced to 0 (rather than div-by-zero) |
+| Replay behavior | Persisted to `liquidity_samples` |
+| Validation constraints | The `cv × 50` scaling and the "CV ≥ 2 = fragile" anchor are interim. Calibration requires labelling regimes of known fragility, not yet collected |
+
+### 9.5 Realized vs Predicted Impact (`exec_impact`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/exec_impact.py`](shared/kazus_logic/liquidity/realtime/exec_impact.py) |
+| Purpose | **Forward-only observation** of how trade bursts actually move the market vs. how the visible top-of-book said they should. The honest measurement of executable liquidity. Per memory [project_exec_impact_layer](project_exec_impact_layer.md): pure observation mode, downstream not calibrated |
+| Inputs | Consecutive same-side taker prints with gap ≤ `BURST_GAP_MS = 250` (one burst); pre-burst book snapshot from `state.book_history` ring; post-settle mid `SETTLE_MS = 500` ms after the burst's last print |
+| Formula | Per burst: `expected_bps` = book-walk impact computed over pre-burst top-20 in the taker's direction; `realized_bps` = signed mid move (pre → post-settle); `divergence_bps = realized_bps − expected_bps`; `ratio = realized_bps / expected_bps` published **only when `|expected_bps| ≥ EXPECTED_FLOOR_BPS = 0.5`**, otherwise None. Bursts bucketed by notional: S < `BUCKET_M_USD = 50_000` ≤ M < `BUCKET_L_USD = 500_000` ≤ L |
+| Threshold | No verdict — four numbers per ExecEvent + a `book_exhausted` honesty flag. When `book_exhausted = True` (burst notional exceeded visible top-20), `expected_bps / divergence / ratio` are **None**, but the burst still counts under `exec_book_exhausted` |
+| Failure conditions | Burst < `NOTIONAL_FLOOR_USD = 5_000` → skipped. Missing pre or post book snapshot → event **dropped honestly** (not approximated). `expected_bps` below noise floor → ratio = None |
+| Replay behavior | **Strictly forward-only**. L2 book state is not persisted to disk, so historical bursts before the layer activated are structurally unmeasurable. Published per-(side, bucket) rolling medians over `EVENT_WINDOW_MS = 5 × 60 × 1000` ms |
+| Validation constraints | This layer is the only direct empirical test of [Credible Depth](#91-credible-depth-credible_depth)'s anti-spoof claim — if `realized_bps ≫ expected_bps` while `book_exhausted = False`, the book promised liquidity that did not materialize. Aggregating that relationship over time is the calibration backlog item in §12 |
+
+### 9.6 Liquidation stress (`liq_stress`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/metrics.py:80`](shared/kazus_logic/liquidity/realtime/metrics.py#L80) `liquidation_stress_usd()` |
+| Purpose | Rolling USD value of forced liquidations — cascade indicator |
+| Inputs | `state.liquidations` (WS `@forceOrder` feed — note: switched from dead `forceOrder` stream in commit 5c4acbc) |
+| Formula | Sum of `price × qty` over liquidations within `LIQ_WINDOW_MS = 60_000` ms |
+| Threshold | Raw USD, no verdict |
+| Failure conditions | No liquidations in window → 0.0 (not None — absence of stress is a valid measurement) |
+| Replay behavior | Persisted to `liquidity_samples` |
+| Validation constraints | Threshold for "cascade conditions" is symbol-dependent; not centrally calibrated |
+
+### 9.7 Cross-venue divergence (`crossex`)
+
+| | |
+|---|---|
+| Code | [`backend/app/api/liquidity.py:465`](backend/app/api/liquidity.py#L465) `CrossExDivergence` |
+| Purpose | Pairwise divergence vs the reference exchange (Binance) — the anti-manipulation primitive. Sustained price separation across major venues is rare and usually means something is wrong on one side |
+| Inputs | Per-exchange snapshot from `exchanges.REGISTRY` (currently Binance + Bybit): `funding_rate`, `open_interest_usd`, `spread_fraction`, `mid_price` |
+| Formula | For each non-reference exchange: `funding_diff = this.funding − reference.funding` (absolute); `oi_diff_pct = (this.oi − reference.oi) / reference.oi`; `spread_diff_pct = same shape`; `mid_price_diff_pct = same shape` |
+| Threshold | No hard verdict — published raw with the reference labelled. Mid-price divergence is the canonical signal (per code comment) |
+| Failure conditions | Exchange fetch raises / returns None → snapshot dropped silently. Per `liquidity.py:498-508` errors are caught individually; the response carries only successful venues |
+| Replay behavior | Snapshots persisted to `liquidity_crossex_history` (90 d retention per `poller.py:199`) |
+| Validation constraints | "Sustained" is not currently formalized — there is no `divergence_persistence` threshold below which a one-tick divergence is suppressed. Adding that gate is in §12 |
+
+### 9.8 Already-formalized in §3 (pointers)
+
+The following are not duplicated here because their formulas already live in §3 [Formula registry](#3-formula-registry):
+
+- **Distributed Stress Detection** (`crisis_genesis`) — 7-probe composite → §3 [Distributed Stress Detection](#distributed-stress-detection-phase-15-4)
+- **Causal confidence** per pair → §3 Causal propagation
+- **Propagation per-edge confidence** → §3 Propagation graph
+- **Regime transition verdict** → §3 Market state transitions
+- **Adaptation modifiers** (5 bounded coefficients) → §3 Adaptation modifiers
+- **Sanity audit severity** → §3 Sanity audit
+- **Operator priority score** → §3 Operator priorities
+- **Pattern-discovery stability + confidence** → §3 Pattern discovery
+- **Forecast confidence (with cap factor)** → §3 Forecast hardening
+
+---
+
+## 10. Failure modes & observability limits
+
+This section enumerates failure modes the code **actually handles**, failure modes it **does not handle** (known blind spots), and failure modes that are **structurally unrecoverable** from the data the layer holds. Every entry is grounded in code — no aspirational coverage.
+
+### 10.1 Exchange / transport failures (handled)
+
+| failure | how the system handles it | code |
+|---|---|---|
+| WS connection drop | Exp-backoff 1 s → 30 s + jitter; on reconnect, `conn_id` bumps and consumers re-issue SUBSCRIBE | [`realtime/ws_client.py`](shared/kazus_logic/liquidity/realtime/ws_client.py), Layer 2 row in §1 |
+| WS silent stall | ping/pong 30 s send / 10 s read — if no traffic, the connection is recycled rather than left hanging | Layer 2 row in §1 |
+| Sub-second message reorder | Sampler reads `state` at `SAMPLE_INTERVAL_S = 1.0`; sub-second jitter is absorbed in the next tick | [`realtime/engine.py`](shared/kazus_logic/liquidity/realtime/engine.py) |
+| REST 429 / rate-limit | Poller cadence `POLL_INTERVAL_S = 60`; per-exchange clients catch `httpx.HTTPStatusError` and skip the round | [`liquidity/poller.py`](shared/kazus_logic/liquidity/poller.py) |
+| Cross-exchange fetch failure | `asyncio.gather(..., return_exceptions=True)` — failed venues drop out of the response; reference may be missing | [`api/liquidity.py:498`](backend/app/api/liquidity.py#L498) |
+| Long missed tick (> 7 min) | Alert engine re-issues a full re-check at startup AND when a missed tick is detected | Layer 3 row in §1 |
+
+### 10.2 Exchange / transport failures (NOT handled — known blind spots)
+
+| failure | consequence | mitigation status |
+|---|---|---|
+| Partial-book WS desync (server-side `lastUpdateId` skip) | `SymbolState.bids/asks` drift from venue truth until reconnection. There is no diff-vs-rest reconciliation loop | none — relies on periodic reconnects; partial drift is silent for that window |
+| Timestamp drift (local clock vs venue clock) | All `_first_ts` ages are measured against `time.time()` locally. A drifting host clock biases [Credible Depth](#91-credible-depth-credible_depth)'s 400 ms persistence floor | none — no NTP enforcement at the app layer |
+| Venue outage > 30 s | WS reconnect keeps trying; if Bybit is down, `crossex` simply omits it without flagging which venues are missing in the divergence response | minimal — venues are listed in `snapshots[]` but operator must visually compare |
+| Stale REST snapshot (cached at CDN) | Poller cannot distinguish "no change" from "served from cache". Identical samples in `liquidity_samples` could mean either | none |
+
+### 10.3 Market-structure failures (NOT handled — out of scope)
+
+These are properties of the market that the current measurement set cannot disambiguate. They are not bugs — they are stated to set operator expectation.
+
+- **Hidden liquidity dominance.** [Credible Depth](#91-credible-depth-credible_depth) sees only displayed top-20 levels. A market dominated by iceberg / hidden orders will report low Credible Depth that does not reflect true executable size. The [Realized vs Predicted Impact](#95-realized-vs-predicted-impact-exec_impact) layer is the only honest counterweight — when `realized_bps ≪ expected_bps` with `book_exhausted = False`, hidden liquidity is the most likely explanation, but the platform does not attribute it as such.
+- **Liquidation-driven false signals.** A liq cascade fires every alert kind (`liq_spike`, `spread_explosion`, `depth_collapse`) simultaneously, and propagation_graph picks up synchronized cross-symbol activity. The `common_driver` test in `causal_propagation` rejects pairs whose co-movement can be explained by a shared shock — but the test is per-pair, not per-market-wide-event. Distributed Stress Detection's `anomaly_synchronization` probe is the closest signal that "this is a cascade, not many independent stresses."
+- **Spoof saturation regimes.** When > 50% of displayed depth is sub-400-ms quote flicker, [Credible Depth](#91-credible-depth-credible_depth) does its job correctly (reports near-zero) but the **operator-visible field is the same as a genuinely-empty book**. The two states are distinguishable only by cross-referencing the raw book — no automated flag is emitted.
+- **Quote-stuffing.** Burst rates of WS messages above what the sampler reads at 1 Hz cause **information loss inside the tick**. The current 1 Hz sample rate does not surface this — the metric just sees the last state of the tick.
+- **Perp-only distortions** (funding squeezes, OI imbalances) are surfaced via [§9.7 Cross-Venue Divergence](#97-cross-venue-divergence-crossex) only at the per-snapshot level. There is no time-series divergence-persistence metric — see §12.
+
+### 10.4 Measurement failures (handled by `data_quality` gating)
+
+Every research-tier layer publishes its own `_discovery_quality(samples, low, medium, high)` ∈ {INSUFFICIENT, LOW, MEDIUM, HIGH}; downstream confidence is multiplied by `SCARCITY_FACTOR = {INSUFFICIENT: 0.15, LOW: 0.40, MEDIUM: 0.75, HIGH: 1.00}`. Concrete handling:
+
+| measurement failure | gate |
+|---|---|
+| Low sample count | `data_quality = INSUFFICIENT` → causal verdict forced to EXPLORATORY (`causal_propagation`); pattern_discovery refuses to publish |
+| Sparse book (few top-20 levels populated) | [Credible Depth](#91-credible-depth-credible_depth) returns None when `state.bids/asks` empty rather than a synthetic 0 |
+| Volatility spike overwhelming Kyle bucket count | `< KYLE_MIN_BUCKETS = 8` → [Impact Score](#93-impact-score-impact_score--kyle-λ-sigmoid) / [Fragility Score](#94-fragility-score-fragility_score) return None |
+| Propagation false positives from synchronized cross-symbol shock | `common_driver_factor = 0.35` multiplicative penalty in `causal_confidence` + `symmetry_penalty²` on mirror pairs |
+| Distributed Stress Detection input blindness | Scarcity cap — verdict floored at EARLY_DISTORTION when > 3 probes INSUFFICIENT |
+| Forecast extrapolation past data span | `horizon_decay = data_span_days / (data_span_days + horizon_days)` decays confidence; `cap_factor = 0.5` when either slope or extrapolation was clipped |
+
+### 10.5 Replay limitations (structural)
+
+These follow from what is and is not persisted; they are not bugs.
+
+- **Replay unavailable before layer activation.** A layer deployed at time T cannot reconstruct itself at any t < T. Affects: Phase 15 (causal/structural/transition/stress), Phase 16 (adaptation), Phase 17 (operator priorities), Phase 18 (investigations), Phase 19 (replay), Exec-Impact (2026-05-25). The replay endpoint returns `data_quality = INSUFFICIENT` for windows before activation rather than fabricating a value.
+- **Realtime tier inputs not persisted at level granularity.** `state.bids`, `state.asks`, per-level `first_ts`, `state.trades`, `state.liquidations`, `state.book_history` ring — all in-memory. Persisted: only the metric values written to `liquidity_samples` at 1 Hz. Consequence: [Credible Depth](#91-credible-depth-credible_depth) and [Resiliency Score](#92-resiliency-score-resiliency_score) cannot be **recomputed** from history, only **read back** as the values that were computed live.
+- **Calibration-version dependency.** Thresholds like `CREDIBLE_BAND_PCT = 0.005`, `CREDIBLE_MIN_AGE_MS = 400`, `RECOVERY_FRACTION = 0.80`, `EXPECTED_FLOOR_BPS = 0.5`, `DEPTH_COLLAPSE_DROP = 0.40` are version-bound. Historical samples written under one set of constants are not directly comparable to samples written under a different set. The system **does not currently version-stamp** which constants were live when a sample was written.
+- **Anomaly Memory edges retention bound.** `liquidity_anomaly_memory` 180 d; `liquidity_anomaly_edges` cleaned up when their endpoints are pruned. Replay of an investigation past 180 d carries `data_quality = PRUNED` rather than a reconstructed graph. The frozen replay snapshot stores the graph **at capture time** instead.
+
+---
+
+## 11. Non-inference boundaries
+
+This section is load-bearing. The platform **measures, validates, suppresses, and reconstructs**. It does not infer the following — and any future layer that does will violate the architectural intent stated in §8.
+
+The platform does **not** infer:
+
+- **Market intent.** No layer attempts to characterize what a participant is trying to achieve. Observable: order placement, fill, cancellation. Not observable: motive.
+- **Manipulation attribution.** [Credible Depth](#91-credible-depth-credible_depth) flags persistence below 400 ms as non-credible. It does not label that flicker "spoofing" — it labels it "did not meet the persistence threshold." The semantic gap matters: a 200 ms quote could be a market-maker re-quoting on a refresh tick, not a spoof.
+- **Coordinated hidden actors.** Synchronized cross-symbol liquidity deterioration triggers [Distributed Stress Detection](#distributed-stress-detection-phase-15-4)'s `anomaly_synchronization` probe and increases the propagation graph's `symmetry_penalty`. None of this attributes causation to "a coordinated group" — synchronized stress and shared shock look identical to the layer, and the layer says so by demoting the verdict rather than committing it.
+- **Future price direction.** Every forecast endpoint (`/research/intelligence-forecast`, regime transition forecast, multi-horizon) is OLS extrapolation with explicit `slope_capped` / `extrapolation_capped` / `horizon_decay` / `cap_factor` discounts. No layer publishes a directional trade signal.
+- **Causality without measurable lag.** `causal_propagation` requires (a) `asymmetry ≥ 0.40`, (b) `evidence_factor` ≥ 2/n_windows, (c) `common_driver_factor` survival, (d) `symmetry_penalty ≤ 0.70` — failure on any of these forces the verdict to UNDER_EVIDENCED / AMBIGUOUS / COMMON_DRIVEN / COINCIDENCE / EXPLORATORY. A DIRECTIONAL verdict is structurally rare on current data and that is correct.
+- **Actor identity.** No layer reads exchange-side maker/taker account information or attempts to fingerprint flow to known actors. The data sources used (public REST + public WS) do not carry this information.
+- **Strategic objectives of participants.** No semantic interpretation of a flow as "accumulation," "distribution," "shakeout," etc. These labels are absent from the codebase by design.
+- **Free-form narrative.** [Event Chain Reconstruction](#layer-8--causal-inference-layer-phase-15) (`narrative_causality`) is a deterministic template composed from already-published layer outputs. No model calls, no language generation, no inference of a market story.
+
+If a verdict, edge, or score appears without one of the upstream factors above being either present-and-measurable or explicitly flagged INSUFFICIENT / UNDER_EVIDENCED, treat it as a bug, not a feature.
+
+---
+
+## 12. Validation framework — calibration backlog
+
+**Status:** this section is a **calibration backlog**, not a results report. Every entry below is a measurement that **would strengthen institutional credibility but has not been run yet**. No numbers in this section are real — they are placeholders for future calibration passes. Do not cite figures from this section.
+
+### 12.1 What "validation" means here
+
+For an observability platform with no trading actions, validation is the measurement of:
+
+- **Replay reproducibility** — does a FROZEN snapshot match a fresh LIVE reconstruction at the same anchor, field-by-field?
+- **Verdict survival** — when a layer commits a verdict at time T, does it still hold at T + Δ on the same window?
+- **Confidence calibration** — does a HIGH-confidence output empirically outperform LOW-confidence on the same downstream metric?
+- **Threshold stability** — do interim constants (`CREDIBLE_BAND_PCT`, `DEPTH_COLLAPSE_DROP`, `KYLE_MIN_BUCKETS`, `RECOVERY_FRACTION`, etc.) hold across regimes?
+
+### 12.2 Pending calibration measurements
+
+| measurement | target metric | how it would be measured | status |
+|---|---|---|---|
+| Replay reproducibility rate | % of FROZEN-vs-LIVE diff entries where Δ = 0 across the published-diff field set, over N investigations | Re-run `replay_state(mode=live)` at the case anchor for every closed investigation; compare to the frozen payload field-by-field | **not yet measured** |
+| Candidate rejection rate | fraction of propagation edges promoted to causal DIRECTIONAL out of all `propagation_graph` candidates | Count over a `lookback_days` window from current data | **not yet measured** |
+| Sanity-audit suppression rate | fraction of pattern_discovery candidates suppressed by `discovery_suppression_modifier` over a rolling window | Compare `adaptation_recommendations` to `adapted_recommendations` count and importance-shift distribution | **not yet measured** |
+| HIGH-confidence degradation frequency | rate at which an edge published with `confidence = HIGH` falls to MEDIUM/LOW on a subsequent window | Sliding-window tracking of per-edge confidence across causal_propagation runs | **not yet measured** |
+| Propagation edge lifetime distribution | median / P90 / P99 days an edge persists in DIRECTIONAL after first publication | Persist edge-confidence snapshots; aggregate survival curves | requires snapshot table not yet created |
+| Lag stability distribution | distribution of per-edge `lead_consistency` and `temporal_consistency` over rolling windows | Aggregate directly from `propagation_graph` rolling output | **not yet measured** |
+| Stress-probe contribution rate | per-probe fraction of windows where the probe was `contributing` (data_quality ≠ INSUFFICIENT) | Aggregate from `crisis_genesis` history | **not yet measured** |
+| Adaptation modifier oscillation rate | rate at which an adaptation modifier swings between bounds on consecutive runs | `adaptation_state` already returns `osc` flag; aggregate over time | partial — `osc` flag exists, no aggregated metric |
+| Realized-vs-predicted divergence distribution | per-bucket median + IQR of `divergence_bps` across `exec_impact` events; cross-tabbed by `book_exhausted` | Aggregate from already-emitted ExecEvent stream | **not yet measured** — see [project_exec_impact_layer](project_exec_impact_layer.md): platform still in pure observation mode |
+| Credible-depth anti-spoof empirical test | correlation between (Credible Depth at t) and (realized executable depth implied by `exec_impact.realized_bps` at t+ε) | Requires the realized-vs-predicted aggregation above | **not yet measured** — depends on previous item |
+| Threshold stability under regime change | how often a threshold-crossing flips on sub-minute volatility | Sliding-window count of state transitions on the same input within `FLICKER_WINDOW` | exists for `flicker_ratio` in `market_state_transitions`; not generalized across layers |
+
+### 12.3 Suppression and demotion rules already in code (operational falsification)
+
+While calibration measurements above are pending, the codebase already encodes explicit demotion paths. These are listed so a reader knows the platform falsifies *something* before they go looking for the calibration sheet:
+
+- `causal_propagation` verdict downgrade chain: DIRECTIONAL → AMBIGUOUS (asymmetry < 0.40) → UNDER_EVIDENCED (evidence_count ≤ 1) → COMMON_DRIVEN → EXPLORATORY (data_quality ∈ {INSUFFICIENT, LOW}) → COINCIDENCE (sym_penalty ≥ 0.70).
+- `market_state_transitions` lifecycle: PERSISTENT → ACCELERATING / FLICKER / REVERSED; REVERSED applies a `reversal_factor = 0.25` multiplicative penalty.
+- `crisis_genesis` scarcity cap: > 3 probes INSUFFICIENT → verdict floored at EARLY_DISTORTION.
+- Pattern discovery: 6 robustness flags (SINGLE_WINDOW, LOW_RECURRENCE, HIGH_LIFT_LOW_SUPPORT, REGIME_FRAGILE, BUCKET_SENSITIVE, LOW_SUPPORT) each apply a fixed multiplicative penalty to `stability_score`.
+- Forecast: `cap_factor = 0.5` whenever slope or extrapolation was clipped.
+- Sanity audit `propagation_loop` finding feeds `discovery_suppression_modifier = 0.50` when sanity is CRITICAL — the adaptation loop currently halves recommendation importance.
+
+### 12.4 Operational trustworthiness summary
+
+In the absence of yet-uncollected calibration numbers, operator trust currently rests on:
+
+1. **Decomposition discipline.** Every verdict publishes its inputs and per-factor values. A reader who disagrees with a verdict can find the exact factor that drove it.
+2. **Explicit absence.** INSUFFICIENT / UNDER_EVIDENCED / PRUNED / `book_exhausted = True` / `None`-return are first-class states, not suppressed errors.
+3. **Falsification paths.** §12.3 above — demotions are encoded in code, not in policy.
+4. **Acyclic dependencies.** §8 — `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back.
+5. **Bounded modifiers.** `ADAPTATION_BOUNDS` clips every coefficient; nothing compounds without limit.
+
+When the calibration backlog above is run, this section will move from "framework" to "framework + measured results" — see the entries marked **not yet measured** for what is missing.
