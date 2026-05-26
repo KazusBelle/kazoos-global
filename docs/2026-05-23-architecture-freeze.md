@@ -2,9 +2,9 @@
 
 **Snapshot date:** 2026-05-23
 **Status:** stable-core / experimental split documented below
-**Scope:** complete system audit for handoff, ops recovery, and continued development without losing architectural intent
+**Scope:** complete system audit for handoff, ops recovery, and continued development.
 
-This document is meant to be read **cold**, by someone who has never seen the codebase, and to be sufficient for them to (a) operate the system, (b) extend it without breaking it, or (c) recover it from scratch.
+Readable **cold** — without prior exposure to the codebase. Sufficient to (a) operate the running system, (b) add a new layer without breaking the data flow, or (c) rebuild the runtime from `docker compose up -d` against an empty Postgres instance.
 
 ---
 
@@ -58,6 +58,7 @@ Every layer answers three questions: *what is measured · how it is measured · 
 13. [Propagation & causality limits](#13-propagation--causality-limits)
 14. [Distributed Stress — quantitative state machine](#14-distributed-stress--quantitative-state-machine)
 15. [Phrase compression reference](#15-phrase-compression-reference)
+16. [Meta-language → runtime-equivalent reference](#16-meta-language--runtime-equivalent-reference)
 
 ---
 
@@ -241,7 +242,7 @@ After the Integrity Repair Pass closed the four HIGH-severity findings from the 
 * **Replay propagation animation removed.** The per-symbol bars no longer animate (`transition` removed; label changed from "propagation playback" → "alert counts at cursor"). Animation implied per-frame causal transmission that `propagation_graph` does not carry — pair edges are aggregated over the full lookback window, not timestamped. Operator scrubs manually and reads a static per-bucket count.
 * **Calmer chrome.** Action-tier panels keep saturation; persistent / chronic items render at ~60% opacity with neutral borders. Less simultaneous urgency; stronger contrast reserved for new/escalating signals.
 
-The strongest property of this pass is what it *did not* add: no new score, no new modifier, no new queue, no new measurement layer.
+Scope boundary: no new score, no new modifier, no new queue, no new measurement layer. Presentation-only changes against existing API contracts.
 
 ### Layer 11 — Investigation & Casework (Phase 18)
 
@@ -845,30 +846,26 @@ If the following change shape, downstream consumers (UI panels, future automatio
 
 Internal research aggregators (`_research.*`) are free to evolve provided the endpoint shape stays stable.
 
-### What this document promises
+### Recovery procedure (rebuild from empty)
 
-If the system goes down tomorrow and someone needs to rebuild it from scratch:
+1. `docker compose up -d db && docker compose run --rm backend python -m app.db.init_db` creates all 22 tables (DDL: [`backend/app/db/init_db.py`](backend/app/db/init_db.py)).
+2. Worker auto-starts four background tasks; `liquidity_samples` rows begin flowing within 60 s.
+3. ~6 h of accumulated samples → `data_quality` on most layers crosses MEDIUM.
+4. ~24 h → MEDIUM/HIGH gates open; causal / structural / transition layers begin emitting non-EXPLORATORY verdicts.
+5. Operator queue populates on day 1 from `sanity_audit` findings.
 
-1. `docker compose up -d db && docker compose run --rm backend python -m app.db.init_db` creates all 22 tables (DDL is in [`backend/app/db/init_db.py`](backend/app/db/init_db.py))
-2. Worker auto-starts the four background tasks; samples begin flowing within 60 s
-3. After ~6 hours of accumulated data, `data_quality` on most layers crosses MEDIUM
-4. After ~24 hours, MEDIUM/HIGH gates open and causal/structural/transition layers begin emitting committed verdicts
-5. Operator queue starts populating immediately (sanity findings on day 1)
+### Invariants new layers must satisfy
 
-If someone needs to extend it without losing the architectural intent:
-
-- **Data-quality gating + published decomposition** is the core invariant. Every layer gates its outputs by `data_quality` and publishes its per-factor decomposition. New layers that do "we have a model that says X" without exposing factors do not fit.
-- **Acyclic dependencies** between measurement layers. `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back into upstream computations.
-- **Bounded, reversible, explainable** is the rule for any modifier that affects downstream behavior. Phase 16's `ADAPTATION_BOUNDS` is the pattern to copy.
-- **No trading actions**. The platform is operator-facing observability, not execution. ACK/MUTE/RESOLVE are workflow markers, not trade triggers.
+- **Data-quality gating + published decomposition.** Every layer gates outputs by `data_quality` and publishes per-factor decomposition. A layer that returns "we have a model that says X" without exposing factors will not pass review.
+- **Acyclic dependencies between measurement layers.** `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back into upstream computations.
+- **Bounded, reversible, explainable** modifiers. `ADAPTATION_BOUNDS` (Phase 16) is the pattern: every coefficient clipped to [min, max], turning the loop off = downstream stops reading.
+- **No trading actions.** ACK / MUTE / RESOLVE are workflow markers, not trade triggers. No code path on this branch issues exchange orders.
 
 ### Companion docs
 
 - `docs/2026-05-23-production-hardening-audit.md` — P0 audit + applied fixes (commit 6b64a76)
 - `docs/2026-05-23-p1-hardening-plan.md` — P1 design + scaling estimates (commit c8246f4)
-- This document — system-wide freeze (commit pending)
-
-Together these three give the full picture: where we are, what's been hardened, what's planned, and how the pieces fit.
+- This document — system-wide freeze.
 
 ---
 
@@ -1043,9 +1040,7 @@ These follow from what is and is not persisted; they are not bugs.
 
 ## 11. Non-inference boundaries
 
-This section is load-bearing. The platform **measures, validates, suppresses, and reconstructs**. It does not infer the following — and any future layer that does will violate the architectural intent stated in §8.
-
-The platform does **not** infer:
+Load-bearing. The runtime **measures · validates · suppresses · reconstructs**. The following inferences are out of scope; a new layer that emits any of them violates the invariants in §8:
 
 - **Market intent.** No layer attempts to characterize what a participant is trying to achieve. Observable: order placement, fill, cancellation. Not observable: motive.
 - **Manipulation attribution.** [Credible Depth](#91-credible-depth-credible_depth) flags persistence below 400 ms as non-credible. It does not label that flicker "spoofing" — it labels it "did not meet the persistence threshold." The semantic gap matters: a 200 ms quote could be a market-maker re-quoting on a refresh tick, not a spoof.
@@ -1092,7 +1087,7 @@ For an observability platform with no trading actions, validation is the measure
 
 ### 12.3 Suppression and demotion rules already in code (operational falsification)
 
-While calibration measurements above are pending, the codebase already encodes explicit demotion paths. These are listed so a reader knows the platform falsifies *something* before they go looking for the calibration sheet:
+Demotion paths already encoded in code (independent of the pending calibration numbers above):
 
 - `causal_propagation` verdict downgrade chain: DIRECTIONAL → AMBIGUOUS (asymmetry < 0.40) → UNDER_EVIDENCED (evidence_count ≤ 1) → COMMON_DRIVEN → EXPLORATORY (data_quality ∈ {INSUFFICIENT, LOW}) → COINCIDENCE (sym_penalty ≥ 0.70).
 - `market_state_transitions` lifecycle: PERSISTENT → ACCELERATING / FLICKER / REVERSED; REVERSED applies a `reversal_factor = 0.25` multiplicative penalty.
@@ -1117,7 +1112,7 @@ When the calibration backlog above is run, this section will move from "framewor
 
 ## 13. Propagation & causality limits
 
-This section enumerates the epistemic ceiling of the propagation / causal layer. It is **complementary** to [§11 Non-inference boundaries](#11-non-inference-boundaries) (which lists what the platform refuses to infer at all) by stating *how far the propagation layer is allowed to go on the data it actually has*. Every constraint below maps to existing code — no new behavior, only an explicit reading of what `propagation_graph` and `causal_propagation` are licensed to claim.
+Enumerates the epistemic ceiling of `propagation_graph` and `causal_propagation`. Complements [§11](#11-non-inference-boundaries) (out-of-scope inferences) by stating how far these two functions are licensed to go on their actual inputs. Every constraint maps to existing code; no new behavior.
 
 ### 13.1 The load-bearing invariant
 
@@ -1127,7 +1122,7 @@ When the layer publishes an edge A → B with `confidence = HIGH`, the literal m
 
 ### 13.2 Epistemic tiers (a reading of existing verdicts)
 
-The TZ-requested tier framework maps onto the existing verdict enum without changing it. The tiers are an interpretation layer for documentation and operator UI; the engine keeps emitting the same code-level verdicts.
+Tier framework as a documentation overlay on the existing verdict enum. The engine emits the same code-level verdicts; the tiers only group them for operator-facing copy:
 
 | tier | claim shape | maps to existing verdicts |
 |---|---|---|
@@ -1219,7 +1214,7 @@ The propagation layer **measures**: pair counts of A→B alert sequences, lag di
 
 The propagation layer **does not measure** and **does not infer**: true economic causality, participant intent, hidden coordination, transmission certainty, directional influence under unresolved simultaneity, hidden actor identity, macro-driven co-stress without an observable common-driver symbol in the dataset, off-exchange flow that drives both endpoints.
 
-If an operator is reading a propagation surface as evidence of causation in the strong sense, they are reading past the layer's published epistemic ceiling. The layer's job is to make that reading harder; the operator's discipline closes the rest of the gap.
+An operator reading a propagation surface as evidence of strong-sense causation is reading past the layer's published ceiling. The downgrades in §13.4–13.5 reduce that reading surface; they do not eliminate it.
 
 ---
 
@@ -1245,7 +1240,7 @@ The verdict is **point-in-time**, recomputed on each call (300 s cache TTL via `
 
 ### 14.2 State-name mapping (documentation overlay)
 
-The TZ asks for a NORMAL → ELEVATED → STRESSED → DISTRESSED state machine. The engine emits an existing 5-state enum that maps to those names without renaming code:
+Five code-level verdicts map onto the documentation-layer state names without renaming any enum:
 
 | documentation state | code verdict | code condition |
 |---|---|---|
@@ -1419,7 +1414,7 @@ The layer **measures**: 7 independent probe scores from already-published upstre
 
 The layer **does not measure** and **does not infer**: future market direction, the originating asset of a stress episode, the strategic objectives of any participant, cross-venue confirmed stress (§14.8), event-level lifecycle timing (§14.10), or causal transmission between probes — the probes are independent measurements over the same time window, not a causal chain.
 
-If a downstream consumer (operator UI, alert routing, investigation auto-draft) reads the PRE_CASCADE verdict as a market forecast rather than as the multi-probe residue described in §14.5, the consumer is reading past the layer's epistemic ceiling. The auto-draft path explicitly says so: investigations created from PRE_CASCADE are labelled `kind = auto_draft` and inherit the experimental status of their inputs.
+A downstream consumer (operator UI, alert routing, investigation auto-draft) that reads PRE_CASCADE as a market forecast is reading past the layer's published ceiling. The auto-draft path labels its output `kind = auto_draft` and inherits the experimental status of its inputs, so the UI surface for these cases already carries the qualifier.
 
 ---
 
@@ -1464,3 +1459,31 @@ This table replaces what an earlier draft of this document called "operational t
 | operator-facing observability | operator queue + replay + investigations (Phases 17 / 18 / 19) |
 
 **The test, when in doubt:** would removing the phrase make any sentence in this document *false*? If not, the phrase was decoration. Remove it or replace it with the column on the right.
+
+---
+
+## 16. Meta-language → runtime-equivalent reference
+
+§15 covers wording that sounds strong but carries no operational contract. This table is narrower: it targets **self-descriptive (meta) sentences** — wording that says what the system *is* or *prefers* rather than what the runtime *does*. Left column is the meta form; right column states the same fact as a runtime mechanic that a reader can locate in code or in this document.
+
+| meta phrasing (about the system) | runtime equivalent (what actually happens) |
+|---|---|
+| the architecture enforces conservative behavior | layers emit no output when `data_quality ∈ {INSUFFICIENT, LOW}` (§3, §14.5) |
+| the platform preserves replay consistency | `liquidity_samples` rows are append-only; FROZEN snapshots are revision-versioned and append-only (§1 Layer 12) |
+| the platform prefers silence over hallucination | INSUFFICIENT / UNDER_EVIDENCED / PRUNED / `None` are first-class verdicts (§14.5, §13.5) |
+| the platform respects operator attention | chronic-finding bucketing renders at ~60% opacity; only fresh + escalating items keep full saturation (§1 Attention Pass) |
+| the system is conservative | refusal verdicts evaluate first in `crisis_genesis` and `causal_propagation` (§13.4, §14.5) |
+| the system understands / sees / knows X | the layer reads `<source>` and emits `<field>` ∈ `<enum>` |
+| the layer exists to identify X | the layer emits `<verdict>` when thresholds `<list>` hold |
+| the system is grounded in microstructure | inputs: Binance WS depth20@100ms + @trade + `@forceOrder`; outputs: §9 metric set |
+| the platform works with the operator | operator queue + ACK/MUTE/IGN/RES actions persisted in `operator_acknowledgements` (Phase 17) |
+| the architecture is built around immutability | `liquidity_samples` / `liquidity_alert_history` / `investigation_*` / `investigation_replay_snapshots` are all append-only (§5, §1 Integrity Repair Pass) |
+| the system is mature | (delete — no runtime referent) |
+| the design philosophy is decomposition | every verdict response carries its per-factor inputs; see `probes[]`, `confidence_score` decomposition, `causal_confidence` factor breakdown |
+| the framework is built to falsify | demotion chains encoded in code: §12.3 |
+| the platform is honest about uncertainty | data_quality gating + published decomposition (§8 invariant) |
+| the system describes itself accurately | (delete — meta-meta) |
+| the operator's discipline closes the gap | (delete — operator behavior is outside the system contract) |
+| the layer's job is to make X harder | the layer applies the following demotions: `<list>` |
+
+**Editorial invariant (load-bearing).** A sentence in this document should say what the runtime *does* — what enters, what transforms, what validates, what suppresses, what emits, what persists, what replays, what invalidates, what remains unknowable. A sentence that describes what the system *is* or *prefers* should be rewritten to a runtime mechanic or deleted.
