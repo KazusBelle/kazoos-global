@@ -55,6 +55,7 @@ Every layer answers three questions: *what is measured · how it is measured · 
 10. [Failure modes & observability limits](#10-failure-modes--observability-limits)
 11. [Non-inference boundaries](#11-non-inference-boundaries)
 12. [Validation framework — calibration backlog](#12-validation-framework--calibration-backlog)
+13. [Propagation & causality limits](#13-propagation--causality-limits)
 
 ---
 
@@ -385,7 +386,9 @@ Output range: `pattern_confidence` ∈ [0, 100]. Sort key is `effective_lift` (n
 
 ### Propagation graph
 
-Per-edge:
+**Sampling-resolution guard.** Pairs whose `lead` is below `min_lead_ms = 5_000` ms (default) are **dropped at ingestion** before any score is computed — not penalized, not flagged, *dropped*. Alerts arriving within ~5 s of each other carry no derivable transmission order from the available timestamps; treating them as a propagation edge would inflate causality from what is effectively co-occurrence. The `lead_window_ms = 30 × 60_000` (30 min) upper bound similarly drops pairs separated by so much time that recurrence cannot be distinguished from background co-incidence.
+
+Per-edge (computed only on pairs that survived the simultaneity + window guards):
 
 ```
 volume_strength       = 1 − exp(−count / 15)
@@ -427,8 +430,9 @@ scarcity_factor        = SCARCITY[data_quality]
 
 causal_confidence      = volume × asymmetry × evidence × cd × sym × scarcity   ∈ [0, 1]
 
-verdict (priority order):
-  COINCIDENCE         sym_penalty ≥ 0.70
+verdict (priority order — refusal verdicts come FIRST so a clean DIRECTIONAL
+is only emitted when every refusal path was rejected):
+  COINCIDENCE         sym_penalty ≥ 0.70          (effectively bidirectional)
   EXPLORATORY         data_quality ∈ {INSUFFICIENT, LOW}
   COMMON_DRIVEN       common-driver candidate found
   UNDER_EVIDENCED     evidence_count ≤ 1
@@ -1045,7 +1049,8 @@ The platform does **not** infer:
 - **Manipulation attribution.** [Credible Depth](#91-credible-depth-credible_depth) flags persistence below 400 ms as non-credible. It does not label that flicker "spoofing" — it labels it "did not meet the persistence threshold." The semantic gap matters: a 200 ms quote could be a market-maker re-quoting on a refresh tick, not a spoof.
 - **Coordinated hidden actors.** Synchronized cross-symbol liquidity deterioration triggers [Distributed Stress Detection](#distributed-stress-detection-phase-15-4)'s `anomaly_synchronization` probe and increases the propagation graph's `symmetry_penalty`. None of this attributes causation to "a coordinated group" — synchronized stress and shared shock look identical to the layer, and the layer says so by demoting the verdict rather than committing it.
 - **Future price direction.** Every forecast endpoint (`/research/intelligence-forecast`, regime transition forecast, multi-horizon) is OLS extrapolation with explicit `slope_capped` / `extrapolation_capped` / `horizon_decay` / `cap_factor` discounts. No layer publishes a directional trade signal.
-- **Causality without measurable lag.** `causal_propagation` requires (a) `asymmetry ≥ 0.40`, (b) `evidence_factor` ≥ 2/n_windows, (c) `common_driver_factor` survival, (d) `symmetry_penalty ≤ 0.70` — failure on any of these forces the verdict to UNDER_EVIDENCED / AMBIGUOUS / COMMON_DRIVEN / COINCIDENCE / EXPLORATORY. A DIRECTIONAL verdict is structurally rare on current data and that is correct.
+- **Causality without measurable lag.** `causal_propagation` requires (a) `asymmetry ≥ 0.40`, (b) `evidence_factor` ≥ 2/n_windows, (c) `common_driver_factor` survival, (d) `symmetry_penalty ≤ 0.70`, AND (e) the underlying `propagation_graph` already dropped any pair with `lead < min_lead_ms = 5_000` ms — failure on any of these forces the verdict to UNDER_EVIDENCED / AMBIGUOUS / COMMON_DRIVEN / COINCIDENCE / EXPLORATORY. A DIRECTIONAL verdict is structurally rare on current data and that is correct.
+- **Propagation ≠ causation.** A DIRECTIONAL verdict means "B repeatedly followed A with a stable measurable lag, on independent windows, and not in lockstep, and not jointly driven by a third symbol we could find." It does **not** establish economic causality, transmission certainty, or directional influence in the sense a research paper would use those terms. The full epistemic boundary is documented in [§13 Propagation & causality limits](#13-propagation--causality-limits).
 - **Actor identity.** No layer reads exchange-side maker/taker account information or attempts to fingerprint flow to known actors. The data sources used (public REST + public WS) do not carry this information.
 - **Strategic objectives of participants.** No semantic interpretation of a flow as "accumulation," "distribution," "shakeout," etc. These labels are absent from the codebase by design.
 - **Free-form narrative.** [Event Chain Reconstruction](#layer-8--causal-inference-layer-phase-15) (`narrative_causality`) is a deterministic template composed from already-published layer outputs. No model calls, no language generation, no inference of a market story.
@@ -1105,3 +1110,111 @@ In the absence of yet-uncollected calibration numbers, operator trust currently 
 5. **Bounded modifiers.** `ADAPTATION_BOUNDS` clips every coefficient; nothing compounds without limit.
 
 When the calibration backlog above is run, this section will move from "framework" to "framework + measured results" — see the entries marked **not yet measured** for what is missing.
+
+---
+
+## 13. Propagation & causality limits
+
+This section enumerates the epistemic ceiling of the propagation / causal layer. It is **complementary** to [§11 Non-inference boundaries](#11-non-inference-boundaries) (which lists what the platform refuses to infer at all) by stating *how far the propagation layer is allowed to go on the data it actually has*. Every constraint below maps to existing code — no new behavior, only an explicit reading of what `propagation_graph` and `causal_propagation` are licensed to claim.
+
+### 13.1 The load-bearing invariant
+
+> **Propagation edges represent repeated lagged association under observed conditions. They do not establish causal certainty.**
+
+When the layer publishes an edge A → B with `confidence = HIGH`, the literal meaning is: across the lookback window, B's alerts repeatedly started ≥ 5 s and ≤ 30 min after A's, with stable lag, on independent sub-windows, with no common-driver candidate found among observed symbols, and not as a bidirectional mirror. That is what the formula measures. It is not a claim that A *caused* B in any market-microstructure sense — only that the timestamps line up that way, repeatedly, under the conditions the data exposes.
+
+### 13.2 Epistemic tiers (a reading of existing verdicts)
+
+The TZ-requested tier framework maps onto the existing verdict enum without changing it. The tiers are an interpretation layer for documentation and operator UI; the engine keeps emitting the same code-level verdicts.
+
+| tier | claim shape | maps to existing verdicts |
+|---|---|---|
+| **T0 — Temporal adjacency** | "events occurred near each other in time" | dropped pairs (lead < `min_lead_ms`); also any unfiltered `propagation_graph` candidate before scoring |
+| **T1 — Stable lag association** | "B followed A with measurable lag across the window" | `propagation_graph` edge with `lead_clarity > 0` and `lead_consistency > 0` |
+| **T2 — Conditional propagation candidate** | "T1 + repeated across sub-windows + common-shock screen survived + not mirror" | `propagation_graph` edge with `confidence_score ≥ 0.45` (MEDIUM/HIGH label) — but **before** the causal layer's verdict |
+| **T3 — Observational propagation** | "B consistently followed A under observed conditions" (the strongest claim the layer is licensed to make) | `causal_propagation` verdict = DIRECTIONAL |
+
+The tier ladder never reaches "A caused B." T3 is the ceiling, and T3 is still observational, conditional, and refutable — every input that drove a T3 verdict is published with the verdict and can be re-checked or re-disputed.
+
+### 13.3 Simultaneity hardening (already in code)
+
+`propagation_graph` uses `min_lead_ms = 5_000` ms as a hard pre-scoring drop, not as a penalty. The reasoning, made explicit:
+
+- Alerts are timestamped at coarse granularity relative to actual transmission. Within ~5 s, the timestamps do not carry enough resolution to identify a first mover.
+- "First-mover" assignment on sub-`min_lead_ms` pairs is therefore **structurally unknowable** — not low-confidence, not uncertain, but unknowable from the data we have.
+- Dropping rather than penalizing is the right move: a penalized score is still a score, and a score still appears in the graph. A dropped pair leaves no edge, which is the honest representation.
+
+Generalized rule, for any future propagation layer added to this codebase: `if observed_lag ≤ effective_sampling_resolution: propagation_claim = invalid`. The current resolution proxy is the WS sampler cadence (1 Hz) plus the alert-engine M5-boundary alignment — `min_lead_ms = 5_000` is the conservative envelope around both.
+
+### 13.4 Common-shock aggression (already in code, made explicit)
+
+The codebase already aggressively suppresses propagation claims when a shared driver is plausible. Documented here so the suppression is auditable:
+
+| trigger | code-level effect |
+|---|---|
+| `symmetry_penalty = (min/max reverse_count)² ≥ 0.70` | verdict forced to **COINCIDENCE** before any other check |
+| common-driver candidate found (a symbol whose alerts preceded both A and B on the same windows) | `common_driver_factor = 0.35` multiplicative penalty on `causal_confidence` AND verdict forced to **COMMON_DRIVEN** |
+| `data_quality ∈ {INSUFFICIENT, LOW}` (sparse evidence) | verdict forced to **EXPLORATORY** regardless of how clean the headline numbers look |
+| `evidence_count ≤ 1` (the pair survived in only one sub-window) | verdict forced to **UNDER_EVIDENCED** |
+| `asymmetry < 0.40` | verdict forced to **AMBIGUOUS** |
+
+The verdict-priority order in §3 [Causal propagation](#causal-propagation-phase-15-1) is structured so that **refusal verdicts evaluate first**. A clean DIRECTIONAL is the residue after every refusal path was rejected, not the default.
+
+### 13.5 Causal refusal conditions
+
+The layer **refuses to publish a directional propagation verdict** when any of the following hold. Each maps to a specific code path:
+
+- **Sub-resolution lag.** `observed_lag < min_lead_ms` → pair dropped before scoring (§13.3).
+- **Insufficient episodes.** `evidence_count ≤ 1` → UNDER_EVIDENCED.
+- **Lag instability.** `lead_consistency < threshold` → `causal_confidence` decays multiplicatively; if data_quality is borderline, the verdict drops to EXPLORATORY.
+- **Common-shock contamination unresolved.** `find_common_driver()` returned a candidate → COMMON_DRIVEN.
+- **Bidirectional mirror.** `symmetry_penalty ≥ 0.70` → COINCIDENCE.
+- **Data scarcity.** `data_quality ∈ {INSUFFICIENT, LOW}` → EXPLORATORY (the layer refuses to commit on thin evidence even if everything else looks clean).
+- **Replay unavailable.** Pre-activation windows → `data_quality = PRUNED/INSUFFICIENT`; reconstruction does not invent edges.
+- **Timestamp drift detected** *(not currently auto-detected — see [§10.2](#102-exchange--transport-failures-not-handled--known-blind-spots))*. If a future detector flags drift, propagation output must be marked structurally suspect for the affected window.
+- **Synchronized global move overlap** *(blind spot per [§10.3](#103-market-structure-failures-not-handled--out-of-scope))*. Liquidation-cascade windows are not currently detected as such; in their presence, the `anomaly_synchronization` probe of Distributed Stress Detection is the closest counterweight, but propagation edges from those windows should be read with extra skepticism. Documented as a known blind spot rather than handled.
+
+### 13.6 Structurally unknowable conditions
+
+The following are **not** uncertainties to be reduced by more data — they are properties the data structurally cannot resolve. They are flagged with their own status rather than degraded confidence:
+
+| condition | flag / state |
+|---|---|
+| Per-frame transmission order on a `propagation_graph` edge | `structurally unknowable` (already in §1 Layer 12 description) — edges aggregate over the window, no timestamped pair data is carried |
+| First mover within `min_lead_ms = 5 s` window | not represented as an edge at all (drop, not flag) |
+| Whether a common-shock candidate is real macro or coincident burst | the layer flags COMMON_DRIVEN; it does not attempt to classify the driver |
+| Simultaneity vs sub-resolution lag | indistinguishable below `min_lead_ms`; the layer does not try |
+| Causal vs anti-causal direction when `symmetry_penalty ≈ 1` | indistinguishable; COINCIDENCE applies |
+| Pre-activation replay windows | `data_quality = INSUFFICIENT/PRUNED`; no reconstruction |
+
+### 13.7 UI / language discipline for the propagation layer
+
+The 2026-05-24 Attention Pass (see §1 Attention & Trust Simplification) already softened the highest-risk labels. Documented here so future UI work doesn't regress:
+
+| previously | now (in `frontend/src/lib/labels.ts`) |
+|---|---|
+| `DIRECTIONAL` | "directional pattern (lead-lag)" |
+| `dominant_driver` | "candidate driver" |
+| `AMPLIFIER` | "appears in chains" |
+| `LEADER` | "appears as leader (candidate)" |
+| `PRE_CASCADE` | "pre-cascade conditions present" |
+
+Vocabulary that should **not** appear in any future UI or copy for the propagation / causal surfaces:
+
+| avoid | preferred |
+|---|---|
+| "source asset" | "candidate leader" / "observed lead in pair" |
+| "origin node" | "highest out-degree node" / "lead-side node" |
+| "stress transmission" | "co-stressed cluster" / "synchronized deterioration" |
+| "cascade origin" | "earliest observed event in cluster" |
+| "trigger asset" | "candidate driver" |
+| "the market transmitted X" | "B followed A under observed conditions" |
+| "A caused B" | "B lagged A with stable measurable interval" |
+
+### 13.8 What the propagation layer does and does not do
+
+The propagation layer **measures**: pair counts of A→B alert sequences, lag distributions, sub-window survival, mirror-pair ratios, common-driver candidates among observed symbols.
+
+The propagation layer **does not measure** and **does not infer**: true economic causality, participant intent, hidden coordination, transmission certainty, directional influence under unresolved simultaneity, hidden actor identity, macro-driven co-stress without an observable common-driver symbol in the dataset, off-exchange flow that drives both endpoints.
+
+If an operator is reading a propagation surface as evidence of causation in the strong sense, they are reading past the layer's published epistemic ceiling. The layer's job is to make that reading harder; the operator's discipline closes the rest of the gap.
