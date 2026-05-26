@@ -57,6 +57,7 @@ Every layer answers three questions: *what is measured · how it is measured · 
 12. [Validation framework — calibration backlog](#12-validation-framework--calibration-backlog)
 13. [Propagation & causality limits](#13-propagation--causality-limits)
 14. [Distributed Stress — quantitative state machine](#14-distributed-stress--quantitative-state-machine)
+15. [Phrase compression reference](#15-phrase-compression-reference)
 
 ---
 
@@ -200,7 +201,7 @@ These are read-only aggregators that **compose** outputs from the lower layers i
 | | |
 |---|---|
 | Code | `investigation_replay_*` in `research.py` |
-| Purpose | Forensic FROZEN-vs-LIVE replay of an investigation case |
+| Purpose | Deterministic as-of FROZEN-vs-LIVE reconstruction of an investigation case |
 | Tables | `investigation_replay_snapshots` (one row per case, UPSERT) |
 | Capture | Auto-fires on `investigation_create` (kind=`auto_create` or `auto_draft`). Operator can recapture via `force=true` |
 | State modes | `frozen` reads the opaque JSON snapshot; `live` reconstructs from `liquidity_intelligence_history` + `liquidity_alert_history` + `liquidity_anomaly_memory` + `operator_priority_*` tables. Same response schema, distinguished by `is_frozen` |
@@ -247,7 +248,7 @@ The strongest property of this pass is what it *did not* add: no new score, no n
 | | |
 |---|---|
 | Code | `investigation_*` functions in `research.py` |
-| Purpose | Operator-owned forensic casework. Aggregates evidence + append-only notes + lifecycle history; renders causal trees, surfaces similar prior cases, exports audit-friendly markdown |
+| Purpose | Operator-owned case container. Aggregates evidence + append-only notes + lifecycle history; renders typed-edge graphs from upstream layers, surfaces deterministically-scored similar prior cases, exports markdown |
 | Tables | `investigations`, `investigation_evidence`, `investigation_notes`, `investigation_events` |
 | Lifecycle | OPEN · INVESTIGATING · MONITORING · RESOLVED · ARCHIVED (RESOLVED requires `resolution_summary`; ARCHIVED is one-way) |
 | Auto-draft | Worker opens a draft on `crisis_genesis` verdict=`PRE_CASCADE`, deduped by sorted-contributing-probes fingerprint. Worker loop cadence 300s |
@@ -804,7 +805,7 @@ The downstream effect is `discovery_suppression_modifier = ×0.50` on adaptation
 
 ## 8. Architecture freeze
 
-### Stable core (production-grade, deeply tested, low-churn)
+### Stable core (depended-on, low-churn)
 
 These layers have been live with real data, audited under load, and the operator workflow above the stable core is depended-on for daily operation. **Treat changes here as high-risk; require commit-by-commit review.**
 
@@ -817,9 +818,9 @@ These layers have been live with real data, audited under load, and the operator
 - **Retention loop** — protects against unbounded storage growth
 - **Adaptation modifiers** (Phase 16) — bounded, explainable, reversible
 
-### Experimental (working, exposed to operator, but treat outputs as research-grade)
+### Experimental (working, exposed to operator, outputs are best-current-estimate)
 
-These layers are valuable but their absolute numbers should be read as "best current estimate" not "truth". They are still useful for diagnosis and they degrade gracefully (every one of them has explicit scarcity gates). **Iterate freely here; just keep the safety properties.**
+These layers are useful for diagnosis but their absolute numbers should be read as the layer's best current estimate, not as ground truth. Every one of them has explicit scarcity gates and degrades gracefully when inputs are thin. **Iterate freely here; preserve the safety properties (scarcity gating, decomposition, refusal verdicts).**
 
 - **Causal Propagation** (verdicts, common-driver detection) — works, but DIRECTIONAL count = 0 on current data. Output stabilizes only after weeks of accumulated history.
 - **Structural Dependencies** (chains, drivers, clusters, sync) — entirely scarcity-gated. Currently exploratory.
@@ -856,7 +857,7 @@ If the system goes down tomorrow and someone needs to rebuild it from scratch:
 
 If someone needs to extend it without losing the architectural intent:
 
-- **Honest uncertainty** is the core invariant. Every layer must gate its outputs by data_quality and must publish its decomposition. New layers that do "we have a model that says X" without exposing factors do not fit.
+- **Data-quality gating + published decomposition** is the core invariant. Every layer gates its outputs by `data_quality` and publishes its per-factor decomposition. New layers that do "we have a model that says X" without exposing factors do not fit.
 - **Acyclic dependencies** between measurement layers. `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back into upstream computations.
 - **Bounded, reversible, explainable** is the rule for any modifier that affects downstream behavior. Phase 16's `ADAPTATION_BOUNDS` is the pattern to copy.
 - **No trading actions**. The platform is operator-facing observability, not execution. ACK/MUTE/RESOLVE are workflow markers, not trade triggers.
@@ -932,11 +933,11 @@ Together these three give the full picture: where we are, what's been hardened, 
 | | |
 |---|---|
 | Code | [`shared/kazus_logic/liquidity/realtime/exec_impact.py`](shared/kazus_logic/liquidity/realtime/exec_impact.py) |
-| Purpose | **Forward-only observation** of how trade bursts actually move the market vs. how the visible top-of-book said they should. The honest measurement of executable liquidity. Per memory [project_exec_impact_layer](project_exec_impact_layer.md): pure observation mode, downstream not calibrated |
+| Purpose | **Forward-only measurement** of how trade bursts actually move the market vs. what book-walk on the visible top-20 predicted. Per memory [project_exec_impact_layer](project_exec_impact_layer.md): pure observation mode, downstream not calibrated |
 | Inputs | Consecutive same-side taker prints with gap ≤ `BURST_GAP_MS = 250` (one burst); pre-burst book snapshot from `state.book_history` ring; post-settle mid `SETTLE_MS = 500` ms after the burst's last print |
 | Formula | Per burst: `expected_bps` = book-walk impact computed over pre-burst top-20 in the taker's direction; `realized_bps` = signed mid move (pre → post-settle); `divergence_bps = realized_bps − expected_bps`; `ratio = realized_bps / expected_bps` published **only when `|expected_bps| ≥ EXPECTED_FLOOR_BPS = 0.5`**, otherwise None. Bursts bucketed by notional: S < `BUCKET_M_USD = 50_000` ≤ M < `BUCKET_L_USD = 500_000` ≤ L |
-| Threshold | No verdict — four numbers per ExecEvent + a `book_exhausted` honesty flag. When `book_exhausted = True` (burst notional exceeded visible top-20), `expected_bps / divergence / ratio` are **None**, but the burst still counts under `exec_book_exhausted` |
-| Failure conditions | Burst < `NOTIONAL_FLOOR_USD = 5_000` → skipped. Missing pre or post book snapshot → event **dropped honestly** (not approximated). `expected_bps` below noise floor → ratio = None |
+| Threshold | No verdict — four numbers per ExecEvent + a `book_exhausted` flag. When `book_exhausted = True` (burst notional exceeded visible top-20), `expected_bps / divergence / ratio` are **None**, but the burst still counts under `exec_book_exhausted` |
+| Failure conditions | Burst < `NOTIONAL_FLOOR_USD = 5_000` → skipped. Missing pre or post book snapshot → event **dropped** (not approximated). `expected_bps` below noise floor → ratio = None |
 | Replay behavior | **Strictly forward-only**. L2 book state is not persisted to disk, so historical bursts before the layer activated are structurally unmeasurable. Published per-(side, bucket) rolling medians over `EVENT_WINDOW_MS = 5 × 60 × 1000` ms |
 | Validation constraints | This layer is the only direct empirical test of [Credible Depth](#91-credible-depth-credible_depth)'s anti-spoof claim — if `realized_bps ≫ expected_bps` while `book_exhausted = False`, the book promised liquidity that did not materialize. Aggregating that relationship over time is the calibration backlog item in §12 |
 
@@ -1010,7 +1011,7 @@ This section enumerates failure modes the code **actually handles**, failure mod
 
 These are properties of the market that the current measurement set cannot disambiguate. They are not bugs — they are stated to set operator expectation.
 
-- **Hidden liquidity dominance.** [Credible Depth](#91-credible-depth-credible_depth) sees only displayed top-20 levels. A market dominated by iceberg / hidden orders will report low Credible Depth that does not reflect true executable size. The [Realized vs Predicted Impact](#95-realized-vs-predicted-impact-exec_impact) layer is the only honest counterweight — when `realized_bps ≪ expected_bps` with `book_exhausted = False`, hidden liquidity is the most likely explanation, but the platform does not attribute it as such.
+- **Hidden liquidity dominance.** [Credible Depth](#91-credible-depth-credible_depth) reads only the displayed top-20 levels. A market dominated by iceberg / hidden orders reports a low Credible Depth that does not reflect actual executable size. [Realized vs Predicted Impact](#95-realized-vs-predicted-impact-exec_impact) is the only existing measurement that can contradict this: when `realized_bps ≪ expected_bps` with `book_exhausted = False`, hidden liquidity is the most likely explanation. The platform does not auto-attribute it as such.
 - **Liquidation-driven false signals.** A liq cascade fires every alert kind (`liq_spike`, `spread_explosion`, `depth_collapse`) simultaneously, and propagation_graph picks up synchronized cross-symbol activity. The `common_driver` test in `causal_propagation` rejects pairs whose co-movement can be explained by a shared shock — but the test is per-pair, not per-market-wide-event. Distributed Stress Detection's `anomaly_synchronization` probe is the closest signal that "this is a cascade, not many independent stresses."
 - **Spoof saturation regimes.** When > 50% of displayed depth is sub-400-ms quote flicker, [Credible Depth](#91-credible-depth-credible_depth) does its job correctly (reports near-zero) but the **operator-visible field is the same as a genuinely-empty book**. The two states are distinguishable only by cross-referencing the raw book — no automated flag is emitted.
 - **Quote-stuffing.** Burst rates of WS messages above what the sampler reads at 1 Hz cause **information loss inside the tick**. The current 1 Hz sample rate does not surface this — the metric just sees the last state of the tick.
@@ -1062,7 +1063,7 @@ If a verdict, edge, or score appears without one of the upstream factors above b
 
 ## 12. Validation framework — calibration backlog
 
-**Status:** this section is a **calibration backlog**, not a results report. Every entry below is a measurement that **would strengthen institutional credibility but has not been run yet**. No numbers in this section are real — they are placeholders for future calibration passes. Do not cite figures from this section.
+**Status:** this section is a **calibration backlog**, not a results report. Every entry below is a measurement that **has not been run yet**. No numbers in this section are real — they are placeholders for future calibration passes. Do not cite figures from this section.
 
 ### 12.1 What "validation" means here
 
@@ -1100,14 +1101,14 @@ While calibration measurements above are pending, the codebase already encodes e
 - Forecast: `cap_factor = 0.5` whenever slope or extrapolation was clipped.
 - Sanity audit `propagation_loop` finding feeds `discovery_suppression_modifier = 0.50` when sanity is CRITICAL — the adaptation loop currently halves recommendation importance.
 
-### 12.4 Operational trustworthiness summary
+### 12.4 What an operator can verify today (without the calibration backlog)
 
-In the absence of yet-uncollected calibration numbers, operator trust currently rests on:
+Without the measurements above, the layer's outputs are still inspectable on five concrete properties:
 
-1. **Decomposition discipline.** Every verdict publishes its inputs and per-factor values. A reader who disagrees with a verdict can find the exact factor that drove it.
-2. **Explicit absence.** INSUFFICIENT / UNDER_EVIDENCED / PRUNED / `book_exhausted = True` / `None`-return are first-class states, not suppressed errors.
-3. **Falsification paths.** §12.3 above — demotions are encoded in code, not in policy.
-4. **Acyclic dependencies.** §8 — `adaptation_state` reads from observed layers but never writes back. Operator priorities reads from everything but never feeds back.
+1. **Published decomposition.** Every verdict carries its per-factor inputs; a reader who disagrees can locate the factor that drove the outcome.
+2. **Explicit absence states.** INSUFFICIENT · UNDER_EVIDENCED · PRUNED · `book_exhausted = True` · `None`-return are first-class verdicts, not suppressed errors.
+3. **Code-level demotion paths.** §12.3 enumerates demotion chains — they are in code, not in policy.
+4. **Acyclic dependencies.** §8 — `adaptation_state` reads from observed layers but never writes back.
 5. **Bounded modifiers.** `ADAPTATION_BOUNDS` clips every coefficient; nothing compounds without limit.
 
 When the calibration backlog above is run, this section will move from "framework" to "framework + measured results" — see the entries marked **not yet measured** for what is missing.
@@ -1143,7 +1144,7 @@ The tier ladder never reaches "A caused B." T3 is the ceiling, and T3 is still o
 
 - Alerts are timestamped at coarse granularity relative to actual transmission. Within ~5 s, the timestamps do not carry enough resolution to identify a first mover.
 - "First-mover" assignment on sub-`min_lead_ms` pairs is therefore **structurally unknowable** — not low-confidence, not uncertain, but unknowable from the data we have.
-- Dropping rather than penalizing is the right move: a penalized score is still a score, and a score still appears in the graph. A dropped pair leaves no edge, which is the honest representation.
+- Dropping rather than penalizing is the right move: a penalized score is still a score, and a score still appears in the graph. A dropped pair leaves no edge at all, which is the only representation consistent with "first mover is unknowable below this lag."
 
 Generalized rule, for any future propagation layer added to this codebase: `if observed_lag ≤ effective_sampling_resolution: propagation_claim = invalid`. The current resolution proxy is the WS sampler cadence (1 Hz) plus the alert-engine M5-boundary alignment — `min_lead_ms = 5_000` is the conservative envelope around both.
 
@@ -1352,7 +1353,7 @@ The TZ-proposed cross_venue enum (CONFIRMED / LOCAL_ONLY / CONTRADICTED / UNAVAI
 - Bybit-side stress is not surfaced into the probes — Binance is the only WS source for [Resiliency Score](#92-resiliency-score-resiliency_score), [Credible Depth](#91-credible-depth-credible_depth), [Impact Score](#93-impact-score-impact_score--kyle-λ-sigmoid), and [Fragility Score](#94-fragility-score-fragility_score). The `resiliency_decay` probe sees only Binance-derived resiliency_score values.
 - The platform should currently be read as a **Binance-centric stress detector** with Bybit as an ad-hoc divergence check on the per-symbol detail modal only.
 
-This means any "distributed stress" claim is **structurally** Binance-spot/perp-distributed, not cross-venue-distributed. Documenting this is more honest than adding an UNAVAILABLE flag — the absence is real.
+This means any "distributed stress" claim is **structurally** Binance-spot/perp-distributed, not cross-venue-distributed. The absence is documented as a present limitation rather than represented by an UNAVAILABLE flag on a field that does not exist.
 
 ### 14.9 Event scope distinction
 
@@ -1419,3 +1420,47 @@ The layer **measures**: 7 independent probe scores from already-published upstre
 The layer **does not measure** and **does not infer**: future market direction, the originating asset of a stress episode, the strategic objectives of any participant, cross-venue confirmed stress (§14.8), event-level lifecycle timing (§14.10), or causal transmission between probes — the probes are independent measurements over the same time window, not a causal chain.
 
 If a downstream consumer (operator UI, alert routing, investigation auto-draft) reads the PRE_CASCADE verdict as a market forecast rather than as the multi-probe residue described in §14.5, the consumer is reading past the layer's epistemic ceiling. The auto-draft path explicitly says so: investigations created from PRE_CASCADE are labelled `kind = auto_draft` and inherit the experimental status of their inputs.
+
+---
+
+## 15. Phrase compression reference
+
+This table is the standing reference for any future addition to this document, to UI copy, or to any companion doc. The left column is a phrase that **sounds strong but carries no operational contract**. The right column is the substitute that makes the same claim verifiable. If a contributor cannot point at a code path that justifies a phrase, they should reach for the right column.
+
+This table replaces what an earlier draft of this document called "operational trustworthiness" with an explicit mapping from rhetoric to behavior.
+
+| avoid (no operational contract) | use instead (verifiable) |
+|---|---|
+| institutional-grade | replay-consistent measurement pipeline with append-only sample history |
+| forensic-grade | append-only deterministic as-of replay against retained history tables |
+| production-grade | depended-on for daily operation; covered by `/admin/runtime-health` |
+| operator-grade | persisted operator workflow with replay-linked findings (`operator_priority_*`) |
+| research-grade | best-current-estimate; gated by `data_quality` and decomposition-published |
+| world-class / elite / advanced / high-end | *delete* |
+| operational maturity / discipline (as a noun) | the specific code path that enforces the behavior |
+| execution intelligence | execution-impact measurement and replay |
+| stress intelligence | distributed-stress detection (7-probe composite) |
+| causal intelligence | cross-asset lag measurement layer |
+| market intelligence | aggregated measurement outputs |
+| deep observability | replay visibility · trace inspection · `data_quality` per surface |
+| smart-money / hidden actors | (do not infer; see §11) |
+| structural certainty | recurrence-confirmed under validation gates |
+| structural deterioration | synchronized multi-symbol deterioration above configured thresholds |
+| systemic | multi-symbol AND multi-window AND data_quality ≠ INSUFFICIENT |
+| systemic deterioration | distributed stress (§14.2) with `hot_count ≥ 3` |
+| the system understands / sees / knows / interprets | the layer measures / validates / suppresses / rejects / emits |
+| the platform believes | the verdict is computed from these inputs |
+| forensic reconstruction | as-of reconstruction with per-surface `data_quality` |
+| microstructure observability | the realtime tier — Credible Depth, Resiliency, Kyle λ, Exec-Impact (§9) |
+| liquidity intelligence | the §9 metric set + §3 aggregator set |
+| memory over reactivity | `liquidity_anomaly_memory` is the persisted basis for any historical claim |
+| silence over hallucination | layers return INSUFFICIENT / `None` when validation gates fail (§14.5, §3) |
+| honest uncertainty | data_quality gating + published decomposition |
+| crisis detected | verdict promoted to PRE_CASCADE (§14.5 conditions) |
+| crisis genesis | Distributed Stress Detection (engine code: `crisis_genesis`) — see Terminology preamble |
+| narrative causality | Event Chain Reconstruction (engine code: `narrative_causality`) |
+| operator attention is finite | the Attention Pass concretely demoted chronic items to muted color (§1) |
+| truth engine / truth layer | the specific layer + the data_quality state it publishes |
+| operator-facing observability | operator queue + replay + investigations (Phases 17 / 18 / 19) |
+
+**The test, when in doubt:** would removing the phrase make any sentence in this document *false*? If not, the phrase was decoration. Remove it or replace it with the column on the right.
