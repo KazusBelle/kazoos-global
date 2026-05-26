@@ -56,6 +56,7 @@ Every layer answers three questions: *what is measured · how it is measured · 
 11. [Non-inference boundaries](#11-non-inference-boundaries)
 12. [Validation framework — calibration backlog](#12-validation-framework--calibration-backlog)
 13. [Propagation & causality limits](#13-propagation--causality-limits)
+14. [Distributed Stress — quantitative state machine](#14-distributed-stress--quantitative-state-machine)
 
 ---
 
@@ -1218,3 +1219,203 @@ The propagation layer **measures**: pair counts of A→B alert sequences, lag di
 The propagation layer **does not measure** and **does not infer**: true economic causality, participant intent, hidden coordination, transmission certainty, directional influence under unresolved simultaneity, hidden actor identity, macro-driven co-stress without an observable common-driver symbol in the dataset, off-exchange flow that drives both endpoints.
 
 If an operator is reading a propagation surface as evidence of causation in the strong sense, they are reading past the layer's published epistemic ceiling. The layer's job is to make that reading harder; the operator's discipline closes the rest of the gap.
+
+---
+
+## 14. Distributed Stress — quantitative state machine
+
+This section reads the [Distributed Stress Detection layer](#layer-8--causal-inference-layer-phase-15) (engine code: `crisis_genesis()` — [`research.py:6221`](shared/kazus_logic/liquidity/research.py#L6221)) as a **strict multi-factor stress-state engine** rather than a "crisis" intuition. Every field, threshold, and status state below maps to actual code. Anything that the TZ asks for and the code does not yet implement is called out explicitly with **NOT IMPLEMENTED** so future readers do not mistake aspiration for current behavior.
+
+### 14.1 What the layer measures (current implementation)
+
+Per-window output of `crisis_genesis(db, lookback_days=7)`:
+
+| field | type | meaning |
+|---|---|---|
+| `verdict` | enum | CALM / EARLY_DISTORTION / ELEVATED_RISK / PRE_CASCADE / INSUFFICIENT |
+| `genesis_score` | float [0, 100] | mean of *contributing* probe scores; equal-weighted |
+| `confidence` | float [0, 1] | `contributing_probes / 7` |
+| `probe_count` | int = 7 | always; non-contributing probes still appear with `status = "insufficient"` |
+| `hot_count` / `elevated_count` / `calm_count` / `insufficient_count` | int | distribution over 7 probes |
+| `probes[]` | list[dict] | full per-probe decomposition — see §14.3 |
+| `summary` | string | deterministic, verdict-shaped sentence |
+
+The verdict is **point-in-time**, recomputed on each call (300 s cache TTL via `_ttl_cached`). The layer is **not** event-driven; it does not emit start/peak/end markers for a sustained stress episode.
+
+### 14.2 State-name mapping (documentation overlay)
+
+The TZ asks for a NORMAL → ELEVATED → STRESSED → DISTRESSED state machine. The engine emits an existing 5-state enum that maps to those names without renaming code:
+
+| documentation state | code verdict | code condition |
+|---|---|---|
+| **NORMAL** | `CALM` | `genesis_score < 25` |
+| **EARLY STRESS** | `EARLY_DISTORTION` | `genesis_score ∈ [25, 50)` OR scarcity-capped from above |
+| **ELEVATED** | `ELEVATED_RISK` | `genesis_score ∈ [50, 75)` |
+| **DISTRIBUTED STRESS** | `PRE_CASCADE` | `genesis_score ≥ 75` AND `hot_count ≥ 3` |
+| **UNKNOWN** | `INSUFFICIENT` | `contributing_probes == 0` |
+
+Scarcity cap: if `insufficient_count > 3` (more than half of seven probes blind), the verdict is **floored at EARLY_DISTORTION** regardless of score. ELEVATED and DISTRIBUTED STRESS verdicts therefore require at least four contributing probes.
+
+The PRE_CASCADE / DISTRIBUTED STRESS verdict additionally requires `hot_count ≥ 3` — three independent probes individually firing at status `hot` (probe score ≥ 65). A single hot probe at 100/100 cannot promote the verdict beyond ELEVATED_RISK. This is the closest existing analogue to the TZ's "synchronized deterioration" requirement.
+
+### 14.3 Probe-level decomposition (what is published)
+
+Every published verdict carries `probes[]` — a list of 7 entries, each shaped:
+
+```
+{
+  "kind":          str,    # one of the 7 probe kinds (§14.4)
+  "name":          str,    # short human-readable label
+  "score":         float,  # [0, 100], or 0.0 when insufficient
+  "status":        str,    # "calm" (< 30) | "elevated" (< 65) | "hot" (≥ 65) | "insufficient"
+  "rationale":     str,    # one-sentence explanation including the metric values used
+  "metric_value":  any,    # the underlying raw value (ratio, slope, delta, etc.)
+  "contributes":  bool,   # False ⇔ status == "insufficient"
+}
+```
+
+The probe `status` thresholds (`< 30 calm`, `< 65 elevated`, `≥ 65 hot`) are encoded in [`_crisis_probe()`](shared/kazus_logic/liquidity/research.py#L6182) — they are **fixed constants in code**, not per-probe percentiles. Recalibrating them would change the meaning of `hot_count`. Currently uncalibrated against any labelled corpus — see §12 calibration backlog.
+
+### 14.4 The seven probes (component decomposition)
+
+| probe `kind` | source layer | what is measured | insufficient gate |
+|---|---|---|---|
+| `fragmentation_growth` | `liquidity_intelligence_history.coordinated_state` | distinct coordinated_state values in last 24 h vs prior 24 h, ratio mapped 1.0× → 0, 2.5× → 100 | no prior-24h baseline → insufficient |
+| `resiliency_decay` | `liquidity_samples` metric `resiliency_score` | Δ between recent-6h avg and prior-6h avg; mapped `−delta × 4` clipped to [0,100] | `n < 20` either side |
+| `propagation_widening` | `propagation_graph` output | `integrity_score` dropping, weak/symmetric-edge share rising | propagation result missing or scarcity-gated |
+| `dependency_concentration` | `structural_dependencies` output | top dominant-driver's out-degree share of the network | upstream INSUFFICIENT |
+| `anomaly_synchronization` | `liquidity_anomaly_memory` write rate | rate acceleration of anomaly writes | empty memory in baseline window |
+| `transition_instability` | `market_state_transitions` aggregates | `flicker_ratio` + oscillation_periods | upstream INSUFFICIENT |
+| `stress_acceleration` | composite stress slope vs baseline | slope-of-slope on synthesized_stress | < 2 history points |
+
+The composite is `genesis_score = sum(contributing.score) / count(contributing)` — **plain mean, no weights**. The TZ asks for weighted decomposition; **weights are NOT implemented**. Each probe contributes equally when it contributes at all. Future weighting would require calibration against a labelled corpus of stress vs non-stress windows; documented as pending in [§14.10](#1410-not-yet-implemented--calibration-backlog).
+
+### 14.5 Refusal-first verdict order
+
+The composite verdict is computed in priority order — refusal paths evaluate first:
+
+```
+1.  contributing == 0                          → INSUFFICIENT          (full refusal)
+2.  insufficient_count > 3                     → floor at EARLY_DISTORTION
+                                                  (scarcity cap, applied BEFORE score check)
+3.  genesis_score ≥ 75 AND hot_count ≥ 3       → PRE_CASCADE
+4.  genesis_score ≥ 50                         → ELEVATED_RISK
+5.  genesis_score ≥ 25                         → EARLY_DISTORTION
+6.  else                                       → CALM
+```
+
+A PRE_CASCADE verdict is the residue after (i) at least 4 probes contributed, (ii) `genesis_score ≥ 75`, AND (iii) at least 3 distinct probes individually crossed the `hot` threshold. It is not the default reading of "things look bad" — it is the residue of a four-step refusal ladder.
+
+### 14.6 Common-shock suppression (probe-level, NOT composite-level)
+
+The composite layer does **not** run its own common-shock detector. Suppression is inherited from the probes that themselves suppress shared drivers:
+
+- `propagation_widening` inherits the `common_driver_factor = 0.35` multiplicative penalty and the COMMON_DRIVEN / COINCIDENCE refusal verdicts from [`causal_propagation`](#causal-propagation-phase-15-1) (see §13.4). If propagation is contaminated by a common driver, its `integrity_score` is already discounted before the probe reads it.
+- `dependency_concentration` reads `structural_dependencies`, which itself composes causal verdicts — same inheritance path.
+- `transition_instability` uses `flicker_ratio` which already represents instability, not magnitude — it tends to **rise** on real regime jitter and **stays flat** on synchronized clean moves.
+
+**Known blind spots** (NOT IMPLEMENTED at composite level):
+
+- **Synchronized liquidation burst.** A market-wide liq cascade can make `fragmentation_growth`, `resiliency_decay`, `anomaly_synchronization`, and `stress_acceleration` all fire simultaneously. The layer correctly registers this as multi-probe heat — but does not distinguish it from a genuinely-distributed deterioration. Documented in [§10.3](#103-market-structure-failures-not-handled--out-of-scope).
+- **Macro BTC-beta move.** All-symbol price moves driven by a shared exogenous catalyst show up identically to distributed liquidity stress in the current probe set.
+- **Funding-reset windows / exchange-wide outage.** No probe explicitly detects these; they will surface as probe firings without contextual annotation.
+
+Operator-side mitigation: the per-probe `rationale` string includes the metric values used. An operator who reads the rationale can identify a synchronized-shock signature manually. There is currently no automated downgrade for these patterns.
+
+### 14.7 Persistence and hysteresis — NOT IMPLEMENTED
+
+The TZ requests entry/exit threshold asymmetry, minimum hold time, cooldown, and demotion-after-M-windows hysteresis. None of this exists at the verdict layer:
+
+- `crisis_genesis` is **stateless** between calls. Consecutive calls 300 s apart may flip CALM ↔ EARLY_DISTORTION ↔ ELEVATED_RISK with no persistence requirement.
+- There is no `entry_threshold` vs `exit_threshold` asymmetry. The same `25 / 50 / 75` boundaries apply on the way up and on the way down.
+- There is no minimum-hold period before a verdict promotes.
+- There is no cooldown that prevents repeated re-promotion.
+
+**Existing partial counterweights** (probe-level, not composite-level):
+
+- `resiliency_decay` is **window-averaged** over 6 h, so it cannot jitter on a single tick.
+- `stress_acceleration` requires ≥ 2 history points, also windowed.
+- `anomaly_synchronization` uses a rate baseline, smoothed.
+- `transition_instability`'s `flicker_ratio` is itself a jitter measure — high values *signal* that downstream verdicts could be unreliable.
+
+The operator-facing **flicker → adaptation** path (the [Attention Pass](#attention--trust-simplification-pass-2026-05-24-presentation-only) chronic-vs-new bucketing in `frontend/src/lib/labels.ts`) is the closest current substitute for hysteresis at the **presentation layer** — a verdict that has been PERSISTENT for many cycles renders with muted color rather than full saturation. This is presentation, not engine-level hysteresis.
+
+Promoting hysteresis to engine-level is a clean P2 item — see [§14.10](#1410-not-yet-implemented--calibration-backlog).
+
+### 14.8 Cross-venue confirmation — NOT INTEGRATED into the verdict
+
+[Cross-venue divergence](#97-cross-venue-divergence-crossex) exists as a separate API surface (`/crossex/{symbol}`, Binance reference, Bybit comparison) but is **not** read by `crisis_genesis`. The verdict does not have a cross_venue_status field.
+
+The TZ-proposed cross_venue enum (CONFIRMED / LOCAL_ONLY / CONTRADICTED / UNAVAILABLE / INSUFFICIENT) is **NOT IMPLEMENTED**. Currently:
+
+- A PRE_CASCADE verdict makes no claim about whether the stress is venue-local or cross-venue confirmed.
+- Bybit-side stress is not surfaced into the probes — Binance is the only WS source for [Resiliency Score](#92-resiliency-score-resiliency_score), [Credible Depth](#91-credible-depth-credible_depth), [Impact Score](#93-impact-score-impact_score--kyle-λ-sigmoid), and [Fragility Score](#94-fragility-score-fragility_score). The `resiliency_decay` probe sees only Binance-derived resiliency_score values.
+- The platform should currently be read as a **Binance-centric stress detector** with Bybit as an ad-hoc divergence check on the per-symbol detail modal only.
+
+This means any "distributed stress" claim is **structurally** Binance-spot/perp-distributed, not cross-venue-distributed. Documenting this is more honest than adding an UNAVAILABLE flag — the absence is real.
+
+### 14.9 Event scope distinction
+
+The TZ asks the layer to distinguish LOCAL / VENUE-LOCAL / CROSS-ASSET / CROSS-VENUE-CONFIRMED / DISTRIBUTED scopes. Current implementation:
+
+| TZ scope | how the current layer represents it |
+|---|---|
+| LOCAL (single symbol) | not the layer's level — single-symbol stress shows up in `/metrics/{symbol}` and the operator queue, not in `crisis_genesis` |
+| VENUE-LOCAL (multi-symbol, one venue) | this is the layer's *default* scope — see §14.8. The verdict is implicitly venue-local without saying so |
+| CROSS-ASSET (multi-symbol, cross-cluster) | partially captured by `dependency_concentration` (top driver's reach) + `propagation_widening` — but not labelled as such on the output |
+| CROSS-VENUE-CONFIRMED | NOT IMPLEMENTED — see §14.8 |
+| DISTRIBUTED STRESS | maps to PRE_CASCADE (genesis_score ≥ 75 AND hot_count ≥ 3) — but again, structurally venue-bound |
+| UNKNOWN | `INSUFFICIENT` verdict |
+
+Adding an explicit `scope` field to the verdict payload is documented as pending. Until then, the `probes[]` decomposition is the audit trail an operator must read to determine scope manually.
+
+### 14.10 NOT YET IMPLEMENTED — calibration / hardening backlog
+
+Items the TZ requests that are not in the codebase. Listed here so a future reader cannot mistake the documentation for a description of current behavior.
+
+| item | status | rationale |
+|---|---|---|
+| Weighted probe aggregation (Aggregate Stress Score with explicit per-component weights) | NOT IMPLEMENTED | Composite is plain mean of contributing. Weighting requires calibration against labelled stress windows — see §12 |
+| Engine-level persistence / hysteresis (entry vs exit thresholds, min hold time, cooldown) | NOT IMPLEMENTED | Layer is stateless between calls. Presentation layer's chronic-vs-new bucketing is a partial substitute |
+| Cross-venue confirmation field on verdict | NOT IMPLEMENTED | `/crossex` exists but is not read by `crisis_genesis` |
+| Explicit event lifecycle (event_id / started_ts / peak_ts / ended_ts) | NOT IMPLEMENTED | Layer is point-in-time, not event-stream. `liquidity_anomaly_memory` carries persisted anomalies, but they are recorded by a separate writer and not tied to a stress-event lifecycle |
+| Scope field (LOCAL / VENUE-LOCAL / CROSS-ASSET / CROSS-VENUE-CONFIRMED) | NOT IMPLEMENTED | Operator must read `probes[]` decomposition to infer scope |
+| Composite-level common-shock detector (synchronized-liquidation / macro-beta / funding-reset / outage-window) | NOT IMPLEMENTED | Probe-level inheritance exists for `propagation_widening` and `dependency_concentration` only |
+| Timestamp-drift detector | NOT IMPLEMENTED (already noted in §10.2 and §13.5) |
+| Refusal annotation in verdict payload (which refusal-ladder step rejected the higher verdict) | NOT IMPLEMENTED | The verdict and the `summary` string carry the residue, but not the refusal trace. An operator can infer it from `insufficient_count`, `hot_count`, and `genesis_score` |
+
+**Pending measurements** (in addition to §12 generic backlog):
+
+- Stress-event recurrence rate per regime
+- False-positive rate of PRE_CASCADE vs forward-realized market behavior
+- Verdict transition stability (CALM ↔ EARLY_DISTORTION jitter rate)
+- Stress persistence distribution (how long PRE_CASCADE typically holds)
+- Per-probe contribution rate (already partially trackable via `insufficient_count`)
+- Per-probe agreement matrix (do multiple probes correlate, or are they independent?)
+
+All marked **PENDING MEASUREMENT** — no numbers in this document.
+
+### 14.11 UI / language discipline for the stress layer
+
+Already applied in the [Attention Pass](#attention--trust-simplification-pass-2026-05-24-presentation-only): `PRE_CASCADE` renders as "pre-cascade conditions present", not "crisis detected". Continuing the discipline:
+
+| avoid | preferred |
+|---|---|
+| "crisis origin" | "first probe to fire `hot`" / "earliest contributing probe" |
+| "market breakdown started here" | (does not apply — the layer is point-in-time) |
+| "systemic collapse detected" | "DISTRIBUTED STRESS verdict (4+ probes contributing, ≥ 3 hot)" |
+| "source of crisis" | (does not apply — composite has no single source) |
+| "root cause" | (does not apply) |
+| "contagion path" | "propagation graph at this window" |
+| "the market entered crisis" | "verdict promoted from ELEVATED_RISK to PRE_CASCADE" |
+| "X caused the cascade" | "X was the earliest probe to reach `hot` status" |
+
+The verdict label `PRE_CASCADE` is itself the most aggressive copy the layer is licensed to publish; even that is hedged in the UI as "pre-cascade conditions present" rather than "cascade in progress."
+
+### 14.12 What the stress layer does and does not do
+
+The layer **measures**: 7 independent probe scores from already-published upstream metrics, their distribution (hot / elevated / calm / insufficient), the contributing fraction, and a point-in-time verdict over the composite.
+
+The layer **does not measure** and **does not infer**: future market direction, the originating asset of a stress episode, the strategic objectives of any participant, cross-venue confirmed stress (§14.8), event-level lifecycle timing (§14.10), or causal transmission between probes — the probes are independent measurements over the same time window, not a causal chain.
+
+If a downstream consumer (operator UI, alert routing, investigation auto-draft) reads the PRE_CASCADE verdict as a market forecast rather than as the multi-probe residue described in §14.5, the consumer is reading past the layer's epistemic ceiling. The auto-draft path explicitly says so: investigations created from PRE_CASCADE are labelled `kind = auto_draft` and inherit the experimental status of their inputs.
