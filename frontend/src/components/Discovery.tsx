@@ -1297,7 +1297,10 @@ function CrisisGenesisPanel() {
   );
 }
 
-// ── Narrative Causality (Phase 15 #6) ───────────────────────────────────
+// ── Event Chain Reconstruction (Phase 15 #6) ───────────────────────────
+// Semantic identity per docs/lip-causal-propagation.md §1.4 / §7.
+// Legacy code identifier `narrative_causality` retained (deferred Class B
+// rename gated on call-site inventory + endpoint migration).
 
 const NARRATIVE_SECTION_ICON: Record<string, string> = {
   state:        "●",
@@ -1324,8 +1327,8 @@ function NarrativeCausalityPanel() {
 
   return (
     <Panel
-      title="Narrative Causality"
-      subtitle={data ? data.headline : "deterministic narrative over Phase 15 layers"}
+      title="Event Chain Reconstruction"
+      subtitle={data ? data.headline : "deterministic event-order reconstruction over Phase 15 layers"}
       toolbar={
         data ? (
           <span className="text-[9px] uppercase tracking-[0.18em] text-muted">
