@@ -1,8 +1,11 @@
-"""Realized vs Predicted Impact — observational truth engine.
+"""Realized vs Predicted Impact — execution validation layer.
 
 Forward-only measurement of how trade bursts actually move the market
-versus how the visible top-of-book said they should. No predictions,
-no scores, no auto-conclusions — only four numbers per event:
+versus how the visible top-of-book said they should. Measures divergence,
+not market truth — see docs/lip-execution-validation.md for the full
+contract (boundary statement, blind-spot inventory, vocabulary discipline,
+precedence ordering). No predictions, no scores, no auto-conclusions —
+only four numbers per event:
 
   expected_bps   — book-walk impact using the pre-burst top-20 (signed
                    positive in the direction of taker pressure).

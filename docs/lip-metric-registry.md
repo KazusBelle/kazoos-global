@@ -28,7 +28,7 @@ Per-symbol metrics computed in [`shared/kazus_logic/liquidity/realtime/`](../sha
 | Threshold | Reported as raw USD. Higher = more genuine resting liquidity at the touch |
 | Failure conditions | `mid_price()` returns None → metric returns None (no fabricated value). Empty book → None. Per-symbol thresholds for "low credible depth" are not centralized — read via the per-symbol percentile context the operator pulls from `/metrics/{symbol}` |
 | Replay behavior | **Not reconstructible from history**: the metric depends on per-level `first_ts` which is only held in memory in `SymbolState`. Historical samples carry the computed value, not the inputs. Replay tier uses the persisted `liquidity_samples` row as authoritative |
-| Validation constraints | The 400 ms persistence floor is the anti-spoof primitive. Lowering it weakens the metric's core property; raising it makes the metric blind to short-but-real liquidity. Any change must be paired with a recalibration against known spoof / non-spoof regimes — currently not measured (see [validation-and-calibration](lip-validation-and-calibration.md)) |
+| Validation constraints | The 400 ms persistence floor is the anti-spoof primitive. Lowering it weakens the metric's core property; raising it makes the metric blind to near-touch state that lived shorter than the floor. Any change must be paired with a recalibration against persistence-labelled samples — currently not measured (see [validation-and-calibration](lip-validation-and-calibration.md)) |
 
 ### A.2 Resiliency Score (`resiliency_score`)
 
@@ -70,6 +70,8 @@ Per-symbol metrics computed in [`shared/kazus_logic/liquidity/realtime/`](../sha
 | Validation constraints | The `cv × 50` scaling and the "CV ≥ 2 = fragile" anchor are interim. Calibration requires labelling regimes of known fragility, not yet collected |
 
 ### A.5 Realized vs Predicted Impact (`exec_impact`)
+
+**Full execution-validation contract → [`docs/lip-execution-validation.md`](lip-execution-validation.md).** The table below is the registry-tier summary; semantics, blind-spot inventory, vocabulary discipline, precedence ordering, and the per-burst outcome enum live in the companion. This row deliberately does not duplicate them.
 
 | | |
 |---|---|
@@ -197,6 +199,8 @@ Output range: `pattern_confidence` ∈ [0, 100]. Sort key is `effective_lift` (n
 
 ### B.4 Propagation graph
 
+**Canonical companion:** [`lip-causal-propagation.md`](lip-causal-propagation.md) — semantic decomposition of this stack into seven primitives, allowed/forbidden verdict interpretations, banned vocabulary, anti-overclaim invariant. The formulas below are the measurement contract; the canonical companion is the epistemic contract.
+
 **Sampling-resolution guard.** Pairs with `lead < min_lead_ms = 5_000` ms are **dropped at ingestion** before any score is computed. `lead_window_ms = 30 × 60_000` (30 min) upper bound similarly drops pairs separated by so much time that recurrence cannot be distinguished from background co-incidence. See [epistemic-boundaries.md §3](lip-epistemic-boundaries.md) for the simultaneity rationale.
 
 Per-edge (computed only on pairs that survived the simultaneity + window guards):
@@ -252,6 +256,9 @@ is only emitted when every refusal path was rejected):
 ```
 
 ### B.6 Influence hierarchy (Phase 15 #5)
+
+**Note on legacy enum vocabulary.** The role labels `{ISOLATED, INSTABILITY_HUB, LEADER, FOLLOWER, AMPLIFIER}` below are **legacy code identifiers**. They name observable properties of out-ratio and average confidence — **not** market roles. See [`lip-causal-propagation.md §8.3`](lip-causal-propagation.md) for the operative reading discipline (e.g., `LEADER` ≡ "out-dense node in this window", not "asset led the market"). UI surfaces using these labels MUST carry the inline disclosure required by that section.
+
 
 ```
 stability             = directional_edge_count / total_edges

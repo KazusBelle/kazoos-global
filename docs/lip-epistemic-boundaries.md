@@ -50,6 +50,8 @@ If a verdict, edge, or score appears without one of the upstream factors above b
 
 ## 3. Propagation epistemic ceiling
 
+**Canonical decomposition of the propagation/event-chain stack:** [`lip-causal-propagation.md`](lip-causal-propagation.md) — seven primitives (propagation edge · temporal adjacency · dependency graph · event chain reconstruction · conditional propagation candidate · common-shock suppression · replay-bounded sequence reconstruction), banned-vocabulary table, anti-overclaim invariant. This section is the load-bearing ceiling; that companion is the decomposition. Any divergence is a defect of the companion.
+
 ### 3.1 The load-bearing invariant
 
 > **Propagation edges represent repeated lagged association under observed conditions. They do not establish causal certainty.**
