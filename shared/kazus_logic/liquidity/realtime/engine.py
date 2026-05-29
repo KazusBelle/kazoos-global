@@ -31,7 +31,11 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Set
 
-from .exec_impact import detect_and_measure_bursts, rolling_exec_metrics
+from .exec_impact import (
+    detect_and_measure_bursts,
+    detect_exec_validation_records,
+    rolling_exec_metrics,
+)
 from .intelligence import (
     fragility_score,
     impact_score,
@@ -76,6 +80,7 @@ class RealtimeEngine:
         self._known_conn_id: int = 0
         self._sample_buffer: list[dict] = []
         self._burst_buffer: list[dict] = []
+        self._exec_val_buffer: list[dict] = []
         self._last_message_at: float = 0.0  # epoch seconds of latest frame
 
     # ── desired-set reconciliation ────────────────────────────────────────
@@ -244,6 +249,11 @@ class RealtimeEngine:
             # marker on transition into UNKNOWN/INSUFFICIENT/DROPPED.
             for rec in detect_bursts(state, now_ms):
                 self._burst_buffer.append(rec.as_row())
+            # Execution Validation (PHASE 3B): per-burst expected-vs-realized
+            # over the SAME shared burst boundaries; refusal-first explicit
+            # states. Append-only to liquidity_exec_validation.
+            for ev in detect_exec_validation_records(state, now_ms):
+                self._exec_val_buffer.append(ev.as_row())
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
@@ -317,20 +327,28 @@ class RealtimeEngine:
             db.commit()
 
     async def _flush(self) -> int:
-        if not self._sample_buffer and not self._burst_buffer:
+        if not self._sample_buffer and not self._burst_buffer and not self._exec_val_buffer:
             return 0
-        from kazus_db.models import LiquidityBurst, LiquiditySample
+        from kazus_db.models import (
+            LiquidityBurst,
+            LiquidityExecValidation,
+            LiquiditySample,
+        )
         batch = self._sample_buffer
         self._sample_buffer = []
         bursts = self._burst_buffer
         self._burst_buffer = []
+        exec_vals = self._exec_val_buffer
+        self._exec_val_buffer = []
         with self.db_factory() as db:
             if batch:
                 db.bulk_insert_mappings(LiquiditySample, batch)
             if bursts:
                 db.bulk_insert_mappings(LiquidityBurst, bursts)
+            if exec_vals:
+                db.bulk_insert_mappings(LiquidityExecValidation, exec_vals)
             db.commit()
-        return len(batch) + len(bursts)
+        return len(batch) + len(bursts) + len(exec_vals)
 
     # ── main loop ─────────────────────────────────────────────────────────
 

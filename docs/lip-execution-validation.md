@@ -66,17 +66,23 @@ The publishable per-burst quantities are exhaustively: `expected_bps · realized
 
 ---
 
-## 4. Execution outcomes — the real per-burst enum
+## 4. Execution outcomes — the per-burst state enum (PHASE 3B)
 
-The code does **not** implement a market-state machine. There is no `VISIBLE_DEPTH_OK → PARTIAL_DEPLETION → BOOK_EXHAUSTED → RECOVERY_PENDING` graph in `exec_impact.py`. What exists is a per-burst **outcome enum** with three values:
+The code does **not** implement a market-state machine. There is no `VISIBLE_DEPTH_OK → PARTIAL_DEPLETION → BOOK_EXHAUSTED → RECOVERY_PENDING` graph. What exists is a per-burst **state enum**, assigned by *proximate observable cause* in `exec_impact.evaluate_burst()` (the single measurement core shared by the rolling-median path and the PHASE 3B per-burst records). **Frozen set — no new states without governance review** (lip-governance §2; explicitly NO `CONTAMINATED` or similar):
 
-| Outcome | Conditions (grounded in `exec_impact.py:204-254`) | Published fields |
+| State | Condition | Published fields |
 |---|---|---|
-| **DROPPED** | `notional < NOTIONAL_FLOOR_USD = 5_000` OR `total_qty ≤ 0` OR pre-snapshot missing OR post-snapshot missing OR `pre.mid ≤ 0` OR `post.mid ≤ 0` | None. Cursor advances; event never appears in `state.exec_events` |
-| **EXHAUSTED** | Pre + post snapshots present; book-walk over visible top-20 cannot fill `total_qty` (returns `exhausted=True`) | `realized_bps` only. `expected_bps · divergence_bps · ratio = None`. `book_exhausted = True`. Counted in `exec_exhausted_<side>_<bucket>` and global `exec_book_exhausted` |
-| **MEASURED** | Pre + post present; walk completed with finite vwap; all mids positive | All four values populated. `ratio` is None when `expected_bps < EXPECTED_FLOOR_BPS = 0.5`; otherwise populated |
+| **INSUFFICIENT** | `notional < NOTIONAL_FLOOR_USD = 5_000` OR `total_qty ≤ 0` | none (refusal). `exhaustion_state = UNDETERMINED` |
+| **DROPPED** | pre-snapshot OR post-snapshot missing (observable `book_history` gap) | none (refusal). `exhaustion_state = UNDETERMINED` |
+| **UNKNOWN** | `pre.mid ≤ 0` OR `post.mid ≤ 0` (degenerate/absent price) | none (refusal). `exhaustion_state = UNDETERMINED` |
+| **EXHAUSTED** | pre + post present; book-walk over visible top-20 cannot fill `total_qty` | `realized_impact_bps` (rolling path also keeps it). `expected · divergence · label = None`. `exhaustion_state = EXHAUSTED` |
+| **MEASURED** | pre + post present; walk completed; all mids positive | `expected_impact_bps · realized_impact_bps · divergence_bps` populated; `divergence_label ∈ {POSITIVE_DIVERGENCE, NEGATIVE_DIVERGENCE}` by sign; `exhaustion_state = WITHIN_VISIBLE`. `ratio` (rolling path) None when `expected_bps < EXPECTED_FLOOR_BPS = 0.5` |
 
-**Transition between outcomes** is per-event and stateless across events. The layer does not track sequences of outcomes, does not classify regimes of exhaustion, does not infer market state from the outcome history. If sequence-level analysis is wanted, it lives at the observation/notebook tier (see [project_exec_impact_layer.md](../.claude/projects/-home-deploy-workspace-kazus-global/memory/project_exec_impact_layer.md) Observation Protocol), not in this layer.
+> **Historical note:** before PHASE 3B the layer published a coarser 3-value outcome (DROPPED / EXHAUSTED / MEASURED) where DROPPED lumped sub-floor + missing-snapshot + bad-mid, and refusals were *silent* (returned `None`, never persisted per-burst). PHASE 3B splits that coarse DROPPED into INSUFFICIENT / DROPPED / UNKNOWN by proximate cause and emits every state **explicitly** (refusal-first), one record per settled burst.
+
+**Per-burst persistence (PHASE 3B).** Each settled burst now yields one append-only row in **`liquidity_exec_validation`** (`execution_validation_state` + burst boundaries/side/notional + `expected_impact_bps / realized_impact_bps / divergence_bps / divergence_label / exhaustion_state`). This is *in addition to* — not a replacement for — the existing 5-min rolling per-(side,bucket) medians in `liquidity_samples`, which are unchanged. Burst boundaries are the **shared** `iter_settled_bursts` (PHASE 3A); there is no second grouping. `divergence_label` is **sign only** — the layer never interprets the *cause* of a divergence (no hidden-liquidity / spoofing / manipulation / absorption / intent claim). Governance: Class B+E, [lip-governance §14](lip-governance.md) `2026-05-29-03`.
+
+**Transition between states** is per-event and stateless across events. The layer does not track sequences, classify exhaustion regimes, or infer market state from history. Sequence-level analysis lives at the observation tier, not here.
 
 **What the enum is not:** it is not a liquidity health classifier, not a market-regime label, not a stress level. EXHAUSTED means *one specific burst's notional exceeded one specific snapshot's visible top-20* — not "the market is exhausted".
 

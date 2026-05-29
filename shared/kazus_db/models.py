@@ -203,6 +203,46 @@ class LiquidityBurst(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class LiquidityExecValidation(Base):
+    """Append-only per-burst Execution Validation record (PHASE 3B).
+
+    Measures the difference between visible expected impact (book-walk of the
+    burst notional over the pre-burst visible top-20) and the realized mid
+    move over a fixed SETTLE_MS window, for each settled burst — over the SAME
+    shared burst boundaries as PHASE 3A. Refusal-first: every settled burst
+    yields a row, including refusal states. It does NOT interpret the cause of
+    divergence (no hidden-liquidity / spoofing / manipulation / intent claim);
+    `divergence_label` is sign only. expected/realized/divergence are NULL
+    unless state == MEASURED (realized/divergence also NULL for EXHAUSTED).
+    """
+
+    __tablename__ = "liquidity_exec_validation"
+    __table_args__ = (
+        Index("ix_liq_execval_symbol_end", "symbol", "burst_end_ts"),
+        Index("ix_liq_execval_symbol_recv", "symbol", "local_recv_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    # MEASURED | EXHAUSTED | INSUFFICIENT | DROPPED | UNKNOWN  (frozen set;
+    # no new states without governance review — no CONTAMINATED etc.)
+    execution_validation_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Burst boundaries — identical to the PHASE 3A burst they validate.
+    burst_start_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    burst_end_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    burst_side: Mapped[str] = mapped_column(String(8), nullable=False)
+    burst_notional: Mapped[float] = mapped_column(Float, nullable=False)
+    expected_impact_bps: Mapped[Optional[float]] = mapped_column(Float)
+    realized_impact_bps: Mapped[Optional[float]] = mapped_column(Float)
+    divergence_bps: Mapped[Optional[float]] = mapped_column(Float)
+    # POSITIVE_DIVERGENCE | NEGATIVE_DIVERGENCE (sign only, no causal claim)
+    divergence_label: Mapped[Optional[str]] = mapped_column(String(20))
+    # WITHIN_VISIBLE | EXHAUSTED | UNDETERMINED
+    exhaustion_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    local_recv_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class LiquidityActiveSub(Base):
     """A request that a symbol be live-tracked via WS for liquidity
     microstructure metrics. Written by the backend when a modal opens

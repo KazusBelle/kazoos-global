@@ -126,6 +126,9 @@ class SymbolState:
     # Timestamp through which the burst-detector has already scanned the
     # trade tape. Trades with ts <= cursor are never re-considered.
     exec_cursor_ts: int = 0
+    # Independent forward-only cursor for PHASE 3B Execution Validation
+    # per-burst records (same shared burst boundaries, separate consumer).
+    exec_val_cursor_ts: int = 0
     # Burst Detection (PHASE 3A) bookkeeping — independent forward-only cursor
     # over the same tape, the last emitted refusal status (for transition-only
     # markers), the warmup anchor (first trade ts after (re)subscription), and
