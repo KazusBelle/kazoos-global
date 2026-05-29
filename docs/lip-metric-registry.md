@@ -30,6 +30,34 @@ Per-symbol metrics computed in [`shared/kazus_logic/liquidity/realtime/`](../sha
 | Replay behavior | **Not reconstructible from history**: the metric depends on per-level `first_ts` which is only held in memory in `SymbolState`. Historical samples carry the computed value, not the inputs. Replay tier uses the persisted `liquidity_samples` row as authoritative |
 | Validation constraints | The 400 ms persistence floor is the anti-spoof primitive. Lowering it weakens the metric's core property; raising it makes the metric blind to near-touch state that lived shorter than the floor. Any change must be paired with a recalibration against persistence-labelled samples — currently not measured (see [validation-and-calibration](lip-validation-and-calibration.md)) |
 
+### A.1a Credible Depth — per-side decomposition (`credible_bid_depth` · `credible_ask_depth` · `credible_depth_delta`)
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/metrics.py`](../shared/kazus_logic/liquidity/realtime/metrics.py) `credible_depth_sides()` (single survivorship walk), with `credible_bid_depth_usd()` / `credible_ask_depth_usd()` / `credible_depth_delta_usd()` thin wrappers |
+| Purpose | Decomposition of [A.1 Credible Depth](#a1-credible-depth-credible_depth) into the per-side persistent visible liquidity (`credible_bid_depth`, `credible_ask_depth`) and the **observable imbalance** between them (`credible_depth_delta = bid − ask`). No new instrumentation, data source, or filter — same ±0.5% band and same 400 ms survivorship floor, reported per side instead of summed |
+| Inputs | Identical to A.1: `state.bids` / `state.asks` `(qty, first_ts)` levels and `state.mid_price()`. All three outputs and the combined `credible_depth` come from one `credible_depth_sides()` walk per tick, so the four cannot drift apart |
+| Formula | `(bid_usd, ask_usd)` = per-side sums of `price × qty` over in-band levels with `(now_ms − first_ts) ≥ 400`. `credible_depth_delta = bid_usd − ask_usd` (USD; sign convention: **positive → persistent visible liquidity leans to the bid side**). `credible_depth = bid_usd + ask_usd` (unchanged) |
+| Threshold | Raw USD. `credible_depth_delta` is a descriptive observable imbalance only — **not** a directional signal, a structural-irregularity verdict, or an executable-liquidity estimate |
+| Failure conditions | `mid_price()` is None → all three outputs are **None** (UNKNOWN), propagated uniformly with `credible_depth`. Mid known but a side has no surviving level → that side is `0.0` — an *observed* absence of persistent visible liquidity, which is **distinct from UNKNOWN** and must not be conflated downstream |
+| Replay behavior | Same as A.1: not reconstructible from history (depends on in-memory `first_ts`); the persisted `liquidity_samples` rows are authoritative. Emitted as **dense** rows every tick (None when UNKNOWN); no interpolation, append-only |
+| Validation constraints | Inherits A.1's 400 ms / ±0.5% calibration debt — these outputs add no new threshold. `credible_depth_delta` magnitude is uncalibrated raw USD with no per-symbol baseline; comparison across symbols is not meaningful without one |
+
+### A.1b Persistence Quality (`persistence_quality`)
+
+Measurement-quality self-assessment for Credible Depth. Full design contract: [`lip-credible-depth-persistence.md`](lip-credible-depth-persistence.md).
+
+| | |
+|---|---|
+| Code | [`shared/kazus_logic/liquidity/realtime/metrics.py`](../shared/kazus_logic/liquidity/realtime/metrics.py) `persistence_quality()` |
+| Purpose | Grades **how well Credible Depth could be measured at this tick** from the snapshot sequence — completeness, gaps, freshness of the depth20 frames. It describes the *measurement*, never the market: no direction, no event probability, and **no manipulation / spoof / fake-liquidity / executable-liquidity verdict** |
+| Inputs | `state.book_history` (frozen depth20 frame timestamps, pushed every frame in `apply_depth20`) and `state.mid_price()`. No new data source — purely existing ingestion state |
+| Formula | Over the last `PQ_WINDOW_MS = 5_000` ms of in-window frames: `freshness = ramp(now − latest_ts, 100, PQ_STALE_MS=1_000)`; `coverage = min(frames_in_window / (PQ_WINDOW_MS / PQ_FRAME_INTERVAL_MS=100), 1)`; `continuity = ramp(max_inter_frame_gap, 100, PQ_MAX_GAP_MS=1_000)` where `ramp(x, good, bad)` is 1 below `good`, 0 above `bad`, linear between. Output = `freshness · continuity · coverage ∈ [0, 1]`. Multiplicative: any axis collapsing to 0 (stale book / a ≥ 1 s gap) zeroes the quality — the gate under-claims rather than over-claims |
+| Threshold | Raw [0, 1] score; higher = better-measured. Grade bands are interim and uncalibrated. Read relative to a per-symbol baseline, not as an absolute |
+| Failure conditions | `mid_price()` is None → **None (UNKNOWN)** — quality of an unmeasurable Credible Depth is itself UNKNOWN. `< PQ_MIN_FRAMES = 10` frames in window → **None (INSUFFICIENT)**. A *measured* degradation returns a low float (e.g. `0.0`), which is **distinct from None**: `0.0` = "measured, and bad"; `None` = "could not measure / not enough to judge". At this tier both UNKNOWN and INSUFFICIENT are represented as `None` (no score); the distinguishing reason is not separately persisted, consistent with `resiliency_score`'s no-events → None |
+| Replay behavior | Like A.1: depends on in-memory frame timestamps; the persisted `liquidity_samples` row is authoritative for replay. Pure function of `(state, now_ms)` — deterministic, no interpolation, no hidden fallback. Emitted as a **dense** row every tick (None when UNKNOWN/INSUFFICIENT); additive and append-only |
+| Validation constraints | `PQ_FRAME_INTERVAL_MS = 100` (the `@depth20@100ms` cadence) is the load-bearing assumption — if real arrival cadence differs, `coverage` mis-reads. It and the four other interim constants (`PQ_WINDOW_MS`, `PQ_MIN_FRAMES`, `PQ_STALE_MS`, `PQ_MAX_GAP_MS`) are uncalibrated and constitute a Class C item against observed inter-arrival distributions (see [validation-and-calibration](lip-validation-and-calibration.md)). Governance: authorized additive Class B+E change, [lip-governance §14](lip-governance.md) entry 2026-05-29-01 |
+
 ### A.2 Resiliency Score (`resiliency_score`)
 
 | | |
@@ -385,6 +413,8 @@ One row per published metric / aggregator; one column per measurement-contract f
 | metric | units | cadence | normalization | aggregation | stale behavior | replay | calibration |
 |---|---|---|---|---|---|---|---|
 | [Credible Depth](#a1-credible-depth-credible_depth) | USD | 1 Hz | none (raw USD); per-symbol baselines via `/metrics/{symbol}` | per-tick scalar | empty book → None | persisted value only; not recomputable | uncalibrated (±0.5% band, 400 ms floor interim) |
+| [Credible Depth per-side / delta](#a1a-credible-depth--per-side-decomposition-credible_bid_depth--credible_ask_depth--credible_depth_delta) | USD (delta signed: + = bid-leaning) | 1 Hz | none (raw USD); no per-symbol baseline for delta | per-tick scalars from one survivorship walk | mid None → all None (UNKNOWN); side with no survivor → 0.0 (observed, ≠ UNKNOWN) | persisted value only; not recomputable | inherits A.1 ±0.5% / 400 ms debt; delta magnitude uncalibrated |
+| [Persistence Quality](#a1b-persistence-quality-persistence_quality) | [0, 1] (measurement quality, not market) | 1 Hz | multiplicative freshness·coverage·continuity; no per-symbol baseline | per-tick scalar from book_history frame timestamps | mid None → None (UNKNOWN); < 10 frames → None (INSUFFICIENT); measured-bad → 0.0 (≠ None) | persisted value only; not recomputable | uncalibrated; `PQ_FRAME_INTERVAL_MS=100` load-bearing (Class C) |
 | [Resiliency Score](#a2-resiliency-score-resiliency_score) | [0, 100] | 1 Hz | sigmoid + tanh + exp-decay; no per-symbol baseline | exp-weighted (5-min half-life) blend of completed events; weights 0.6 / 0.4 on `time_part` / `velo_part` | no completed events → None | persisted only | uncalibrated (30 s exp anchor, 50 k USD/s tanh anchor) |
 | [Impact Score (Kyle λ)](#a3-impact-score-impact_score--kyle-λ-sigmoid) | [0, 100] | 1 Hz | sigmoid centred at λ = 1 | median over ≥ 8 buckets in 60 s | < 8 filled buckets → None | persisted only | uncalibrated (λ = 1 → 50 anchor stated, not measured) |
 | [Fragility Score](#a4-fragility-score-fragility_score) | [0, 100] | 1 Hz | CV × 50, clipped | std / mean of bucket λs | < 8 buckets → None | persisted only | uncalibrated (CV ≥ 2 → 100 interim) |

@@ -331,3 +331,13 @@ This invariant is the parent of every contract in §§1–10. Any proposed chang
 - Not philosophy.
 
 It is a contract. Sections §2 through §10 are operative; §1, §11, §12, §13 are framing. A proposed change is evaluated against §2 (classification) and §3 (forbidden list) first; everything else follows from the class.
+
+---
+
+## 14. Governance changelog (audit trail, §10)
+
+Append-only. Entries are immutable post-write (§10.9). Promoted to a dedicated `lip-governance-changelog.md` once this exceeds 30 entries.
+
+| Event ID | UTC date | Class | Change | Observation-Period basis | Author / reviewer | Replay-visible distinction |
+|---|---|---|---|---|---|---|
+| `2026-05-29-01` | 2026-05-29 | B + E | Added `persistence_quality` realtime emit — a measurement-quality self-assessment for Credible Depth (freshness · coverage · continuity over the depth20 frame sequence; `[0,1]`, `None` for UNKNOWN/INSUFFICIENT). Contract: [lip-metric-registry §A.1b](lip-metric-registry.md#a1b-persistence-quality-persistence_quality) + [lip-credible-depth-persistence.md](lip-credible-depth-persistence.md). | Permitted under the **Class E carve-out for additive, append-only fields with no behaviour dependence**: changes no existing emit's value/distribution/timing/order/suppression; nothing downstream consumes it (no composite, no §6 firewall surface); no schema migration (new metric name, new rows in key/value `liquidity_samples`). Operator-authorized (PHASE 2B). Not a new intelligence layer / spoof-manipulation detector / venue-quality / trust score; increases measurability without increasing inference or autonomy (§11). | Nikita Oliinyk / pending review | New metric name — pre-change windows simply lack the row; no existing-output version bump needed. Interim constants are a pending Class C calibration item. |

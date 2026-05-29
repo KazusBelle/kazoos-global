@@ -41,7 +41,7 @@ from .intelligence import (
     resiliency_score,
     update_intelligence,
 )
-from .metrics import credible_depth_usd, obi_rt
+from .metrics import credible_depth_sides, obi_rt, persistence_quality
 from .orderbook import SymbolState, Trade
 from .ws_client import FuturesWsClient
 
@@ -206,7 +206,14 @@ class RealtimeEngine:
         now_ms = int(time.time() * 1000)
         for symbol, state in self.states.items():
             mid = state.mid_price()
-            depth = credible_depth_usd(state, now_ms)
+            # Single survivorship pass → combined + per-side + observable
+            # imbalance, all from one (price, age) walk so they cannot drift
+            # apart and all share this tick's now_ms (replay-deterministic).
+            # bid_d/ask_d are both None iff mid is unavailable → UNKNOWN
+            # propagates uniformly into every derived output below.
+            bid_d, ask_d = credible_depth_sides(state, now_ms)
+            depth = None if bid_d is None else bid_d + ask_d
+            credible_delta = None if bid_d is None else bid_d - ask_d
             # Intelligence layer needs the latest depth before we sample
             # the resiliency/kyle outputs — it advances the recovery
             # state machine and records the depth sample for the rolling
@@ -224,6 +231,18 @@ class RealtimeEngine:
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
+                # Per-side decomposition + observable imbalance of the same
+                # survivorship-filtered depth. Dense rows (emitted every
+                # tick, None when mid is UNKNOWN) — same persistence
+                # discipline as credible_depth; no interpolation.
+                ("credible_bid_depth", bid_d),
+                ("credible_ask_depth", ask_d),
+                ("credible_depth_delta", credible_delta),
+                # Measurement-quality of the credible_depth read above —
+                # grades the snapshot sequence (freshness/coverage/gaps),
+                # NOT the market. None = UNKNOWN/INSUFFICIENT (propagates);
+                # additive diagnostic, nothing downstream consumes it.
+                ("persistence_quality", persistence_quality(state, now_ms)),
                 # `liq_stress` dropped: `<s>@forceOrder` is unavailable
                 # from this network perimeter (verified at the wire),
                 # so the metric had no input and was writing constant
