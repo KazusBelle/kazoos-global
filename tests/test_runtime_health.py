@@ -54,18 +54,28 @@ def test_consumer_stall():
     assert _c(last_sample_ms=NOW - 9000) == h.CONSUMER_STALL
 
 
-def test_persistence_bottleneck_flush_stuck():
-    # flush in-flight (started > completed) and stuck by age
-    assert _c(flush_started_ms=NOW - 8000, flush_completed_ms=NOW - 20000) == h.PERSISTENCE_BOTTLENECK
-
-
-def test_persistence_bottleneck_loop_lag_with_inflight_flush():
-    assert _c(loop_lag_ms=3000.0, flush_started_ms=NOW - 500,
+def test_persistence_when_inflight_flush_explains_majority():
+    # loop starved 4s; flush in-flight for 3.5s ≥ 0.5×4s → flush explains it.
+    assert _c(loop_lag_ms=4000.0, flush_started_ms=NOW - 3500,
               flush_completed_ms=NOW - 9000) == h.PERSISTENCE_BOTTLENECK
 
 
+def test_persistence_when_completed_flush_explains_majority():
+    # loop starved 4s; last flush completed 0.1s ago took 3s ≥ 0.5×4s.
+    assert _c(loop_lag_ms=4000.0, flush_started_ms=NOW - 3100,
+              flush_completed_ms=NOW - 100, flush_duration_ms=3000.0) == h.PERSISTENCE_BOTTLENECK
+
+
+def test_scheduler_when_inflight_flush_does_NOT_explain_majority():
+    # Revised-rule guard: a flush is in-flight but only 0.3s of a 3s lag →
+    # flush OCCURRENCE alone is insufficient → SCHEDULER_STARVATION, not
+    # PERSISTENCE.
+    assert _c(loop_lag_ms=3000.0, flush_started_ms=NOW - 300,
+              flush_completed_ms=NOW - 9000) == h.SCHEDULER_STARVATION
+
+
 def test_scheduler_starvation_loop_lag_no_inflight_flush():
-    # loop starved, no flush in-flight → cannot name the blocking call
+    # loop starved, no flush in-flight, small recent flush → cannot name cause.
     assert _c(loop_lag_ms=3000.0) == h.SCHEDULER_STARVATION
 
 

@@ -35,10 +35,13 @@ FAILURE_BOUNDARIES = frozenset({
 
 # ── Heartbeat cadence + interim thresholds (Class C, uncalibrated) ─────────
 HEALTH_INTERVAL_S = 5
+HEALTH_INTERVAL_MS = HEALTH_INTERVAL_S * 1_000
 LOOP_LAG_HIGH_MS = 1_000      # heartbeat woke this much later than scheduled
 MESSAGE_SILENCE_MS = 5_000    # no frame crossed the boundary for this long
 SAMPLE_STALE_MS = 5_000       # sampler has not progressed for this long
-FLUSH_STUCK_MS = 5_000        # a flush has been in-flight (uncommitted) this long
+# Persistence is blamed for loop lag ONLY when flush activity explains at least
+# this fraction of the observed lag. Flush *occurrence* alone is insufficient.
+PERSISTENCE_LAG_FRACTION = 0.5
 
 
 def classify_failure_boundary(
@@ -68,17 +71,29 @@ def classify_failure_boundary(
     sample_age = (now_ms - last_sample_ms) if last_sample_ms > 0 else None
     loop_starved = loop_lag_ms >= LOOP_LAG_HIGH_MS
     flush_in_flight = flush_started_ms > flush_completed_ms
-    flush_stuck = flush_in_flight and (now_ms - flush_started_ms) >= FLUSH_STUCK_MS
 
-    # 2) Persistence stuck in-flight — the most specific, attributable signal.
-    if flush_stuck:
-        return PERSISTENCE_BOTTLENECK
+    # How much of THIS lag window is attributable to flushing? In-flight → the
+    # elapsed in-flight time; just-completed within the blocked window → its
+    # measured duration; otherwise nothing. Flush OCCURRENCE alone is NOT
+    # enough — its duration must explain the MAJORITY of the loop lag before we
+    # attribute starvation to persistence (revised WS_RELIABILITY_001 rule).
+    if flush_in_flight:
+        flush_contribution_ms: float = float(now_ms - flush_started_ms)
+    elif flush_completed_ms > 0 and (now_ms - flush_completed_ms) <= (loop_lag_ms + HEALTH_INTERVAL_MS):
+        flush_contribution_ms = flush_duration_ms
+    else:
+        flush_contribution_ms = 0.0
+    flush_explains_lag = (
+        loop_lag_ms > 0
+        and flush_contribution_ms >= PERSISTENCE_LAG_FRACTION * loop_lag_ms
+    )
 
-    # 3) Event loop starved. Attribute to persistence iff a flush is in-flight;
-    #    otherwise the loop is starved by SOME blocking call we deliberately do
-    #    NOT name.
+    # 2) Event loop starved. Attribute to persistence ONLY when flush duration
+    #    explains the majority of the lag; otherwise the loop was starved by
+    #    SOME blocking call we deliberately do NOT name ("the loop was starved",
+    #    not "we know what starved it").
     if loop_starved:
-        return PERSISTENCE_BOTTLENECK if flush_in_flight else SCHEDULER_STARVATION
+        return PERSISTENCE_BOTTLENECK if flush_explains_lag else SCHEDULER_STARVATION
 
     # 4) No frames crossing the boundary, loop healthy → silence upstream of /
     #    at ingest (Binance vs network vs ingest-read NOT sub-attributed).

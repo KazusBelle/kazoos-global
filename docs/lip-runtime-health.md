@@ -45,14 +45,13 @@ Append-only, forward-only time-series (created via `create_all`). Columns: `ts, 
 Evaluation order (first match wins):
 
 1. `subscribed_count ≤ 0` → **HEALTHY** (idle by design — demand-driven engine, nothing should be flowing).
-2. flush in-flight (`flush_started_ms > flush_completed_ms`) and stuck (`ts − flush_started_ms ≥ FLUSH_STUCK_MS`) → **PERSISTENCE_BOTTLENECK**.
-3. `loop_lag_ms ≥ LOOP_LAG_HIGH_MS`: if a flush is in-flight → **PERSISTENCE_BOTTLENECK** (lag attributable to the DB write); else → **SCHEDULER_STARVATION** (loop starved by *some* blocking call — **never named**).
-4. frames silent (`ts − last_ws_message_ms ≥ MESSAGE_SILENCE_MS`), loop not starved → **FEED_NETWORK_SILENCE** (cannot sub-attribute Binance vs network vs ingest-read).
-5. frames fresh, sampler stale (`ts − last_sample_ms ≥ SAMPLE_STALE_MS`), loop not starved → **CONSUMER_STALL**.
-6. frames fresh, sampler fresh, loop not starved, no flush in-flight → **HEALTHY**.
-7. otherwise → **DOWNSTREAM_OF_INGEST_SUCCESS** (ingest succeeded; finer boundary not provable).
+2. `loop_lag_ms ≥ LOOP_LAG_HIGH_MS` (event loop starved): attribute to **PERSISTENCE_BOTTLENECK** *only if* flush activity explains the **majority** of the lag — `flush_contribution_ms ≥ PERSISTENCE_LAG_FRACTION × loop_lag_ms`, where `flush_contribution_ms` = in-flight elapsed (`ts − flush_started_ms`) if a flush is in-flight, else the last flush's `flush_duration_ms` when it completed within the blocked window (`ts − flush_completed_ms ≤ loop_lag_ms + HEALTH_INTERVAL_MS`), else 0. **Flush occurrence alone is insufficient.** Otherwise → **SCHEDULER_STARVATION** ("the loop was starved" — *not* "we know what starved it"; no attribution to CPU/parser/locks/DB/network).
+3. frames silent (`ts − last_ws_message_ms ≥ MESSAGE_SILENCE_MS`), loop not starved → **FEED_NETWORK_SILENCE** (cannot sub-attribute Binance vs network vs socket vs ingest-read).
+4. frames fresh, sampler stale (`ts − last_sample_ms ≥ SAMPLE_STALE_MS`), loop not starved → **CONSUMER_STALL**.
+5. frames fresh, sampler fresh, loop not starved, no flush in-flight → **HEALTHY**.
+6. otherwise → **DOWNSTREAM_OF_INGEST_SUCCESS** (ingest succeeded; finer boundary not provable — preferred over an incorrect precise diagnosis).
 
-Interim thresholds (Class C, uncalibrated): `LOOP_LAG_HIGH_MS = 1000`, `MESSAGE_SILENCE_MS = 5000`, `SAMPLE_STALE_MS = 5000`, `FLUSH_STUCK_MS = 5000`.
+Interim thresholds (Class C, uncalibrated, diagnostic-only): `LOOP_LAG_HIGH_MS = 1000`, `MESSAGE_SILENCE_MS = 5000`, `SAMPLE_STALE_MS = 5000`, `PERSISTENCE_LAG_FRACTION = 0.5`.
 
 ## 7. Frozen enum
 
