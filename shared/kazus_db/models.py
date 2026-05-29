@@ -243,6 +243,42 @@ class LiquidityExecValidation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class LiquidityRuntimeHealth(Base):
+    """Append-only runtime-health telemetry (WS_RELIABILITY_001).
+
+    Diagnostic-only: localizes WHERE in the instrumented realtime pipeline
+    forward progress stopped. Written by the engine heartbeat every
+    HEALTH_INTERVAL_S. The row is authoritative for replay; `failure_boundary`
+    is a pure deterministic function of the numeric fields stored alongside it
+    (see health.classify_failure_boundary), so it is reproducible from the row.
+    Not a market/metric measurement. Frozen boundary enum — finer labels need a
+    separate governance review.
+    """
+
+    __tablename__ = "liquidity_runtime_health"
+    __table_args__ = (
+        Index("ix_liq_runtime_health_ts", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)            # wall-clock ms
+    loop_lag_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    last_ws_message_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    frames_total: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_sample_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    samples_total: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    flush_started_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    flush_completed_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    flush_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    flush_rows_total: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    conn_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    subscribed_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # HEALTHY | FEED_NETWORK_SILENCE | CONSUMER_STALL | PERSISTENCE_BOTTLENECK
+    # | SCHEDULER_STARVATION | DOWNSTREAM_OF_INGEST_SUCCESS  (frozen set)
+    failure_boundary: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class LiquidityActiveSub(Base):
     """A request that a symbol be live-tracked via WS for liquidity
     microstructure metrics. Written by the backend when a modal opens

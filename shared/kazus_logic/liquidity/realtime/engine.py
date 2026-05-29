@@ -45,6 +45,7 @@ from .intelligence import (
     resiliency_score,
     update_intelligence,
 )
+from . import health
 from .burst import detect_bursts
 from .metrics import credible_depth_sides, obi_rt, persistence_quality
 from .orderbook import SymbolState, Trade
@@ -82,6 +83,15 @@ class RealtimeEngine:
         self._burst_buffer: list[dict] = []
         self._exec_val_buffer: list[dict] = []
         self._last_message_at: float = 0.0  # epoch seconds of latest frame
+        # ── Runtime-health stage probes (WS_RELIABILITY_001) — additive,
+        # in-memory only; read by the heartbeat, never feed any metric. ──
+        self._frames_total: int = 0
+        self._last_sample_ms: int = 0
+        self._samples_total: int = 0
+        self._flush_started_ms: int = 0
+        self._flush_completed_ms: int = 0
+        self._flush_duration_ms: float = 0.0
+        self._flush_rows_total: int = 0
 
     # ── desired-set reconciliation ────────────────────────────────────────
 
@@ -185,6 +195,7 @@ class RealtimeEngine:
 
         now_ms = int(time.time() * 1000)
         self._last_message_at = now_ms / 1000.0
+        self._frames_total += 1  # health probe: reader is draining the socket
         try:
             if suffix.startswith("depth20"):
                 # data fields: "b": [["price","qty"], ...], "a": [...]
@@ -301,6 +312,9 @@ class RealtimeEngine:
                     "value": value,
                     "price": mid,
                 })
+        # Health probe: the sampler completed a pass.
+        self._last_sample_ms = now_ms
+        self._samples_total += 1
 
     def _write_status(self) -> None:
         """Persist current ws health into the single-row liquidity_ws_status
@@ -340,6 +354,10 @@ class RealtimeEngine:
         self._burst_buffer = []
         exec_vals = self._exec_val_buffer
         self._exec_val_buffer = []
+        # Health probe: mark flush in-flight (started > completed) so a stuck
+        # DB write is observable as PERSISTENCE_BOTTLENECK. Completed/duration
+        # are stamped only after commit returns.
+        self._flush_started_ms = int(time.time() * 1000)
         with self.db_factory() as db:
             if batch:
                 db.bulk_insert_mappings(LiquiditySample, batch)
@@ -348,7 +366,57 @@ class RealtimeEngine:
             if exec_vals:
                 db.bulk_insert_mappings(LiquidityExecValidation, exec_vals)
             db.commit()
+        done_ms = int(time.time() * 1000)
+        self._flush_completed_ms = done_ms
+        self._flush_duration_ms = float(done_ms - self._flush_started_ms)
+        self._flush_rows_total += len(batch) + len(bursts) + len(exec_vals)
         return len(batch) + len(bursts) + len(exec_vals)
+
+    # ── runtime health (WS_RELIABILITY_001) ───────────────────────────────
+
+    def _write_health(self, loop_lag_ms: float) -> None:
+        """Append one diagnostic row localizing the runtime failure boundary.
+        Pure read of the stage probes; classification is deterministic from the
+        persisted numerics. Diagnostic-only — never feeds any metric."""
+        from kazus_db.models import LiquidityRuntimeHealth
+        row = health.build_health_row(
+            now_ms=int(time.time() * 1000),
+            loop_lag_ms=loop_lag_ms,
+            subscribed_count=len(self.subscribed),
+            conn_id=self.ws.conn_id,
+            last_ws_message_ms=int(self._last_message_at * 1000),
+            frames_total=self._frames_total,
+            last_sample_ms=self._last_sample_ms,
+            samples_total=self._samples_total,
+            flush_started_ms=self._flush_started_ms,
+            flush_completed_ms=self._flush_completed_ms,
+            flush_duration_ms=self._flush_duration_ms,
+            flush_rows_total=self._flush_rows_total,
+        )
+        with self.db_factory() as db:
+            db.add(LiquidityRuntimeHealth(**row))
+            db.commit()
+
+    async def _health_loop(self, stop_event: asyncio.Event) -> None:
+        """Fixed-cadence heartbeat. Measures event-loop lag (actual vs expected
+        wake — the only direct scheduler-starvation signal) and appends a
+        health row. Wrapped so a diagnostic failure can NEVER disrupt ingestion;
+        not part of run()'s FIRST_COMPLETED set."""
+        interval = health.HEALTH_INTERVAL_S
+        prev = time.monotonic()
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            now_mono = time.monotonic()
+            loop_lag_ms = max(0.0, (now_mono - prev) * 1000.0 - interval * 1000.0)
+            prev = now_mono
+            try:
+                self._write_health(loop_lag_ms)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("runtime-health write failed: %s", exc)
 
     # ── main loop ─────────────────────────────────────────────────────────
 
@@ -399,10 +467,13 @@ class RealtimeEngine:
     async def run(self, stop_event: asyncio.Event) -> None:
         reader = asyncio.create_task(self._reader_loop(stop_event), name="ws-reader")
         ticker = asyncio.create_task(self._ticker_loop(stop_event), name="ws-ticker")
+        # Diagnostic heartbeat (WS_RELIABILITY_001). Deliberately NOT in the
+        # FIRST_COMPLETED set — if it ever dies, ingestion must continue.
+        hb = asyncio.create_task(self._health_loop(stop_event), name="ws-health")
         try:
             await asyncio.wait([reader, ticker], return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (reader, ticker):
+            for t in (reader, ticker, hb):
                 t.cancel()
                 try:
                     await t
