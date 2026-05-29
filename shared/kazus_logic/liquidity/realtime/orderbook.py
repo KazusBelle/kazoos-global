@@ -126,6 +126,16 @@ class SymbolState:
     # Timestamp through which the burst-detector has already scanned the
     # trade tape. Trades with ts <= cursor are never re-considered.
     exec_cursor_ts: int = 0
+    # Burst Detection (PHASE 3A) bookkeeping — independent forward-only cursor
+    # over the same tape, the last emitted refusal status (for transition-only
+    # markers), the warmup anchor (first trade ts after (re)subscription), and
+    # a pending discontinuity marker set by the engine on WS reconnect.
+    burst_cursor_ts: int = 0
+    # Last emitted refusal status, for transition-only markers. Baseline "OK"
+    # = no refusal outstanding, so the first non-OK status emits one marker.
+    burst_status: str = "OK"
+    tape_started_ts: Optional[int] = None
+    tape_gap_ts: Optional[int] = None
 
     def apply_depth20(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], now_ms: int) -> None:
         """Replace the top-20 with the new snapshot. Levels whose qty
@@ -161,6 +171,10 @@ class SymbolState:
         self.best_ts = ts_ms
 
     def push_trade(self, t: Trade) -> None:
+        if self.tape_started_ts is None:
+            # Warmup anchor: first print after (re)subscription. Burst
+            # Detection refuses (UNKNOWN) until BURST_WARMUP_MS past this.
+            self.tape_started_ts = t.ts
         self.trades.append(t)
         self._prune_tape(self.trades, t.ts)
 

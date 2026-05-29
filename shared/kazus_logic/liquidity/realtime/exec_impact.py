@@ -41,16 +41,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+# Burst boundaries are owned by `burst.py` — the single source of truth shared
+# with Burst Detection (PHASE 3A). We import the grouping primitive and the
+# two burst-timing constants so this layer and burst records can never drift.
+from .burst import BURST_GAP_MS, SETTLE_MS, iter_settled_bursts
+
 
 # ── Knobs ─────────────────────────────────────────────────────────────────
-
-# Same-side prints within this gap are grouped into one burst.
-BURST_GAP_MS = 250
-
-# After the last print of a burst, we wait this long before reading the
-# post-settle mid. Short enough to capture the impulse, long enough to
-# let the touch quotes refresh.
-SETTLE_MS = 500
+# BURST_GAP_MS / SETTLE_MS imported from .burst (re-exported here so existing
+# `exec_impact.BURST_GAP_MS` references keep working).
 
 # Bursts below this USD notional are skipped — noise dominates.
 NOTIONAL_FLOOR_USD = 5_000.0
@@ -161,45 +160,19 @@ def detect_and_measure_bursts(state, now_ms: int) -> List[ExecEvent]:
     SETTLE_MS` so the post-mid has time to form. The cursor is advanced
     past any burst we emit OR drop — we never re-evaluate the same prints.
     """
-    cursor = state.exec_cursor_ts
-    trades = [t for t in state.trades if t.ts > cursor]
-    if not trades:
-        return []
+    trades = [t for t in state.trades if t.ts > state.exec_cursor_ts]
+    bursts, advance_to = iter_settled_bursts(trades, now_ms)
 
     emitted: List[ExecEvent] = []
-    n = len(trades)
-    i = 0
-    while i < n:
-        first = trades[i]
-        side = "sell" if first.is_buyer_maker else "buy"
-        j = i
-        while j + 1 < n:
-            nxt = trades[j + 1]
-            nxt_side = "sell" if nxt.is_buyer_maker else "buy"
-            if nxt_side != side:
-                break
-            if (nxt.ts - trades[j].ts) > BURST_GAP_MS:
-                break
-            j += 1
-
-        last = trades[j]
-
-        # Burst must be settled before we read it. If we're at the end
-        # of the visible tape AND no gap has elapsed yet, more same-side
-        # prints could still extend it — wait.
-        if (now_ms - last.ts) < SETTLE_MS:
-            break
-        if j == n - 1 and (now_ms - last.ts) < BURST_GAP_MS + SETTLE_MS:
-            # Could still grow; wait one more cycle.
-            break
-
-        burst = trades[i:j + 1]
+    for burst in bursts:
+        side = "sell" if burst[0].is_buyer_maker else "buy"
         evt = _measure(state, burst, side)
         if evt is not None:
             emitted.append(evt)
-        # Cursor advances regardless of emission — we don't retry drops.
-        state.exec_cursor_ts = last.ts
-        i = j + 1
+    # Cursor advances past every settled burst regardless of emission — we
+    # never retry drops. `advance_to` is the last settled burst's last ts.
+    if advance_to is not None:
+        state.exec_cursor_ts = advance_to
 
     return emitted
 

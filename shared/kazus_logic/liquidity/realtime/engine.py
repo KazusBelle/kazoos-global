@@ -41,6 +41,7 @@ from .intelligence import (
     resiliency_score,
     update_intelligence,
 )
+from .burst import detect_bursts
 from .metrics import credible_depth_sides, obi_rt, persistence_quality
 from .orderbook import SymbolState, Trade
 from .ws_client import FuturesWsClient
@@ -74,6 +75,7 @@ class RealtimeEngine:
         self.subscribed: Set[str] = set()
         self._known_conn_id: int = 0
         self._sample_buffer: list[dict] = []
+        self._burst_buffer: list[dict] = []
         self._last_message_at: float = 0.0  # epoch seconds of latest frame
 
     # ── desired-set reconciliation ────────────────────────────────────────
@@ -124,6 +126,14 @@ class RealtimeEngine:
             )
             self.subscribed.clear()
             self._known_conn_id = self.ws.conn_id
+            # Mark a tape discontinuity on every live symbol: prints may have
+            # been missed across the reconnect, so Burst Detection refuses
+            # (DROPPED) any burst spanning the gap rather than fabricating one.
+            # Also reset the warmup anchor — post-reconnect tape is partial.
+            gap_ms = int(time.time() * 1000)
+            for st in self.states.values():
+                st.tape_gap_ts = gap_ms
+                st.tape_started_ts = None
 
         to_add = desired - self.subscribed
         to_drop = self.subscribed - desired
@@ -228,6 +238,12 @@ class RealtimeEngine:
             new_exec = detect_and_measure_bursts(state, now_ms)
             if new_exec:
                 state.exec_events.extend(new_exec)
+            # Burst Detection (PHASE 3A): standalone burst records over the
+            # SAME shared burst boundaries exec-impact consumes. Append-only
+            # to liquidity_bursts; OK rows per settled burst + one refusal
+            # marker on transition into UNKNOWN/INSUFFICIENT/DROPPED.
+            for rec in detect_bursts(state, now_ms):
+                self._burst_buffer.append(rec.as_row())
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
@@ -301,15 +317,20 @@ class RealtimeEngine:
             db.commit()
 
     async def _flush(self) -> int:
-        if not self._sample_buffer:
+        if not self._sample_buffer and not self._burst_buffer:
             return 0
-        from kazus_db.models import LiquiditySample
+        from kazus_db.models import LiquidityBurst, LiquiditySample
         batch = self._sample_buffer
         self._sample_buffer = []
+        bursts = self._burst_buffer
+        self._burst_buffer = []
         with self.db_factory() as db:
-            db.bulk_insert_mappings(LiquiditySample, batch)
+            if batch:
+                db.bulk_insert_mappings(LiquiditySample, batch)
+            if bursts:
+                db.bulk_insert_mappings(LiquidityBurst, bursts)
             db.commit()
-        return len(batch)
+        return len(batch) + len(bursts)
 
     # ── main loop ─────────────────────────────────────────────────────────
 

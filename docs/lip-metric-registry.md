@@ -99,6 +99,8 @@ Measurement-quality self-assessment for Credible Depth. Full design contract: [`
 
 ### A.5 Realized vs Predicted Impact (`exec_impact`)
 
+> **Burst Detection (PHASE 3A) — `liquidity_bursts` table, not `liquidity_samples`.** The burst (a temporally clustered same-side `@trade` run, gap ≤ 250 ms, sliding window) is the unit this layer measures; PHASE 3A emits each settled burst as a standalone append-only record (`burst_start_ts · burst_end_ts · burst_duration_ms · burst_trade_count · burst_notional · burst_side`) plus explicit refusal markers (UNKNOWN/INSUFFICIENT/DROPPED). Burst boundaries are the **single shared definition** (`burst.iter_settled_bursts`) consumed by both burst records and `exec_impact`. Full contract → [`docs/lip-burst-detection.md`](lip-burst-detection.md). Not a liquidity_samples scalar — lives in its own table; replay-deterministic, forward-only.
+
 **Full execution-validation contract → [`docs/lip-execution-validation.md`](lip-execution-validation.md).** The table below is the registry-tier summary; semantics, blind-spot inventory, vocabulary discipline, precedence ordering, and the per-burst outcome enum live in the companion. This row deliberately does not duplicate them.
 
 | | |

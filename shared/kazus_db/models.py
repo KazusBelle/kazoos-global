@@ -166,6 +166,43 @@ class LiquiditySample(Base):
     price: Mapped[Optional[float]] = mapped_column(Float)
 
 
+class LiquidityBurst(Base):
+    """Append-only record of one detected burst (PHASE 3A) — a temporally
+    clustered run of same-side `@trade` prints, as observed by the sensor.
+
+    A burst is a mesoscopic observation of temporal clustering; it is NOT a
+    signal, prediction, intent, or manipulation measure. burst_* fields are
+    exchange-timestamp based and replay-deterministic. Refusal markers
+    (status ∈ UNKNOWN/INSUFFICIENT/DROPPED) carry only `status` +
+    `local_recv_ts`; their burst_* fields are NULL. `burst_trade_count`
+    counts @trade prints (the sensor's events), not taker orders.
+    """
+
+    __tablename__ = "liquidity_bursts"
+    __table_args__ = (
+        # Chronological per-symbol scan across both bursts and refusal markers
+        # (local-receive domain is always present; burst_end_ts is NULL for
+        # markers).
+        Index("ix_liq_bursts_symbol_recv", "symbol", "local_recv_ts"),
+        Index("ix_liq_bursts_symbol_end", "symbol", "burst_end_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    # OK | UNKNOWN | INSUFFICIENT | DROPPED
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="OK")
+    burst_start_ts: Mapped[Optional[int]] = mapped_column(BigInteger)
+    burst_end_ts: Mapped[Optional[int]] = mapped_column(BigInteger)
+    burst_duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    burst_trade_count: Mapped[Optional[int]] = mapped_column(Integer)
+    burst_notional: Mapped[Optional[float]] = mapped_column(Float)
+    burst_side: Mapped[Optional[str]] = mapped_column(String(8))
+    # Local-receive (detection) timestamp — existing dual-domain model, not a
+    # new time domain. Always present, including for refusal markers.
+    local_recv_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class LiquidityActiveSub(Base):
     """A request that a symbol be live-tracked via WS for liquidity
     microstructure metrics. Written by the backend when a modal opens
