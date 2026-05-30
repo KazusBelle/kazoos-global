@@ -47,6 +47,7 @@ from .intelligence import (
 )
 from . import health
 from .burst import detect_bursts
+from .resiliency import detect_resiliency
 from .metrics import credible_depth_sides, obi_rt, persistence_quality
 from .orderbook import SymbolState, Trade
 from .ws_client import FuturesWsClient
@@ -82,6 +83,7 @@ class RealtimeEngine:
         self._sample_buffer: list[dict] = []
         self._burst_buffer: list[dict] = []
         self._exec_val_buffer: list[dict] = []
+        self._resiliency_buffer: list[dict] = []  # PHASE 4A (additive over 3A/3B)
         self._last_message_at: float = 0.0  # epoch seconds of latest frame
         # ── Runtime-health stage probes (WS_RELIABILITY_001) — additive,
         # in-memory only; read by the heartbeat, never feed any metric. ──
@@ -265,6 +267,11 @@ class RealtimeEngine:
             # states. Append-only to liquidity_exec_validation.
             for ev in detect_exec_validation_records(state, now_ms):
                 self._exec_val_buffer.append(ev.as_row())
+            # PHASE 4A: burst-synchronized resiliency episodes over the SAME
+            # shared burst boundaries; recovery tracked on the credible_depth
+            # series (`depth`). Append-only; refusal-first; resiliency_score
+            # (intelligence) left untouched.
+            self._resiliency_buffer.extend(detect_resiliency(state, now_ms, depth))
             samples = (
                 ("obi_rt", obi_rt(state)),
                 ("credible_depth", depth),
@@ -341,11 +348,13 @@ class RealtimeEngine:
             db.commit()
 
     async def _flush(self) -> int:
-        if not self._sample_buffer and not self._burst_buffer and not self._exec_val_buffer:
+        if (not self._sample_buffer and not self._burst_buffer
+                and not self._exec_val_buffer and not self._resiliency_buffer):
             return 0
         from kazus_db.models import (
             LiquidityBurst,
             LiquidityExecValidation,
+            LiquidityResiliency,
             LiquiditySample,
         )
         batch = self._sample_buffer
@@ -354,6 +363,8 @@ class RealtimeEngine:
         self._burst_buffer = []
         exec_vals = self._exec_val_buffer
         self._exec_val_buffer = []
+        resiliency = self._resiliency_buffer
+        self._resiliency_buffer = []
         # Health probe: mark flush in-flight (started > completed) so a stuck
         # DB write is observable as PERSISTENCE_BOTTLENECK. Completed/duration
         # are stamped only after commit returns.
@@ -365,12 +376,15 @@ class RealtimeEngine:
                 db.bulk_insert_mappings(LiquidityBurst, bursts)
             if exec_vals:
                 db.bulk_insert_mappings(LiquidityExecValidation, exec_vals)
+            if resiliency:
+                db.bulk_insert_mappings(LiquidityResiliency, resiliency)
             db.commit()
         done_ms = int(time.time() * 1000)
         self._flush_completed_ms = done_ms
         self._flush_duration_ms = float(done_ms - self._flush_started_ms)
-        self._flush_rows_total += len(batch) + len(bursts) + len(exec_vals)
-        return len(batch) + len(bursts) + len(exec_vals)
+        n = len(batch) + len(bursts) + len(exec_vals) + len(resiliency)
+        self._flush_rows_total += n
+        return n
 
     # ── runtime health (WS_RELIABILITY_001) ───────────────────────────────
 

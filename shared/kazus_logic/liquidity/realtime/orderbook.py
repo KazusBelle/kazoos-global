@@ -129,6 +129,10 @@ class SymbolState:
     # Independent forward-only cursor for PHASE 3B Execution Validation
     # per-burst records (same shared burst boundaries, separate consumer).
     exec_val_cursor_ts: int = 0
+    # PHASE 4A burst-synchronized resiliency: forward-only cursor over settled
+    # bursts + in-flight recovery episodes (resolve within RECOVERY_MAX_AGE_MS).
+    resiliency_cursor_ts: int = 0
+    resiliency_episodes: Deque[object] = field(default_factory=deque)
     # Burst Detection (PHASE 3A) bookkeeping — independent forward-only cursor
     # over the same tape, the last emitted refusal status (for transition-only
     # markers), the warmup anchor (first trade ts after (re)subscription), and

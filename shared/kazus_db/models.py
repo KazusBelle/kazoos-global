@@ -243,6 +243,44 @@ class LiquidityExecValidation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class LiquidityResiliency(Base):
+    """Append-only per-episode burst-synchronized resiliency (PHASE 4A).
+
+    One row per settled-burst recovery episode: observable post-impact recovery
+    of credible_depth toward the pre-burst baseline (`pre_depth`), starting at
+    `t0_ms = burst_end_ts + SETTLE_MS` from the settled floor (`settle_depth`).
+    Hardening of the existing resiliency primitive — replay-deterministic
+    (persisted row authoritative), explicit refusal states, synced to the
+    shared 3A/3B burst boundaries. `resiliency_score` (intelligence.py) is
+    unchanged and separate. Measures recovery characteristics ONLY — not market
+    strength / rebound probability / hidden liquidity / intent.
+
+    `resiliency_state ∈ {MEASURED, UNKNOWN, INSUFFICIENT, DROPPED}` (frozen).
+    recovery_time_ms / refill_velocity / settle_depth are NULL for refusal
+    states. No new score / ratio / verdict (out of PHASE 4A scope).
+    """
+
+    __tablename__ = "liquidity_resiliency"
+    __table_args__ = (
+        Index("ix_liq_resiliency_symbol_end", "symbol", "burst_end_ts"),
+        Index("ix_liq_resiliency_symbol_recv", "symbol", "local_recv_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    burst_start_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    burst_end_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    t0_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)  # recovery start
+    # MEASURED | UNKNOWN | INSUFFICIENT | DROPPED  (frozen)
+    resiliency_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    pre_depth: Mapped[Optional[float]] = mapped_column(Float)       # D_pre baseline
+    settle_depth: Mapped[Optional[float]] = mapped_column(Float)    # D0 floor at t0
+    recovery_time_ms: Mapped[Optional[float]] = mapped_column(Float)
+    refill_velocity: Mapped[Optional[float]] = mapped_column(Float)  # depth USD/s
+    local_recv_ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class LiquidityRuntimeHealth(Base):
     """Append-only runtime-health telemetry (WS_RELIABILITY_001).
 

@@ -60,6 +60,8 @@ Measurement-quality self-assessment for Credible Depth. Full design contract: [`
 
 ### A.2 Resiliency Score (`resiliency_score`)
 
+> **Burst-synchronized resiliency episodes (PHASE 4A) — `liquidity_resiliency` table.** Hardening of this primitive (this `resiliency_score` row is UNCHANGED): per-settled-burst recovery of `credible_depth` toward the **pre-burst baseline** `D_pre` (Option A), starting at `t0 = burst_end_ts + SETTLE_MS` from the settled floor `D0`, recovered at `≥ RECOVERY_FRACTION·D_pre`. Append-only, replay-deterministic (persisted row authoritative), synced to the shared 3A/3B burst boundaries. Outputs `recovery_time_ms · refill_velocity` + `resiliency_state ∈ {MEASURED·UNKNOWN·INSUFFICIENT·DROPPED}` (frozen; refusal-first — UNKNOWN=no D_pre, INSUFFICIENT=no depletion/no D0, DROPPED=feed gap in-window). **No** new score/ratio/verdict (out of 4A scope). Code: [`realtime/resiliency.py`](../shared/kazus_logic/liquidity/realtime/resiliency.py). Governance: [lip-governance §14](lip-governance.md) `2026-05-29-06`.
+
 | | |
 |---|---|
 | Code | [`shared/kazus_logic/liquidity/realtime/intelligence.py:194`](../shared/kazus_logic/liquidity/realtime/intelligence.py#L194) `resiliency_score()` |
