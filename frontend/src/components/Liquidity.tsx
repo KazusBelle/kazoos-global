@@ -859,8 +859,15 @@ export function Liquidity() {
   useEffect(() => {
     const grouped: Record<string, AlertEvent[]> = {};
     const now = Date.now();
+    // Same display-collapse as the timeline: one entry per (symbol, kind) so the
+    // per-symbol ALERT column doesn't show bucketed-id duplicates. timeline is
+    // pre-sorted priority desc → first seen per key is the highest-priority gen.
+    const seenKeys = new Set<string>();
     for (const a of timeline) {
       if (now - a.lastSeenAt > COOLDOWN_MS) continue;
+      const k = `${a.symbol}:${a.kind}`;
+      if (seenKeys.has(k)) continue;
+      seenKeys.add(k);
       (grouped[a.symbol] ??= []).push(a);
     }
     setActiveAlertsBySymbol(grouped);
@@ -1929,15 +1936,34 @@ function AnomalyTimeline({
     if (age < 3600) return `${(age / 60).toFixed(0)}m`;
     return `${(age / 3600).toFixed(0)}h`;
   };
+  // Display-level collapse: the alert engine mints a new bucketed alertId every
+  // 30s, so a persistent condition yields several timeline entries with the
+  // same (symbol, kind). Show ONE chip per condition — keep the highest-priority
+  // generation (timeline is pre-sorted priority desc, lastSeenAt desc) and
+  // surface the freshest lastSeenAt for its age. Presentation only: the
+  // underlying timeline array, alertId, persistence and validation are untouched.
+  const collapsed: AlertEvent[] = [];
+  const repByKey = new Map<string, AlertEvent>();
+  for (const a of timeline) {
+    const k = `${a.symbol}:${a.kind}`;
+    const rep = repByKey.get(k);
+    if (!rep) {
+      const copy = { ...a };
+      repByKey.set(k, copy);
+      collapsed.push(copy);
+    } else if (a.lastSeenAt > rep.lastSeenAt) {
+      rep.lastSeenAt = a.lastSeenAt; // freshen displayed age; keep highest-priority rep
+    }
+  }
   return (
     <div className="rounded-xl border border-border bg-panel/40 px-3 py-2 flex items-center gap-2 overflow-x-auto">
       <span className="text-[10px] uppercase tracking-[0.2em] text-muted whitespace-nowrap">
         anomaly timeline
       </span>
       <div className="flex items-center gap-1 flex-1 min-w-0">
-        {timeline.map((a) => (
+        {collapsed.map((a) => (
           <button
-            key={a.id}
+            key={`${a.symbol}:${a.kind}`}
             type="button"
             onClick={() => onJump(a.symbol)}
             className="flex items-center gap-1 rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em] whitespace-nowrap hover:bg-white/[0.04]"
