@@ -123,8 +123,8 @@ const METRIC_COLS: MetricCol[] = [
   {
     key: "liq_stress",
     header: "LIQ STRESS",
-    title: "Total USD of forced liquidations over last 60s. Only for symbols actively opened (WS-only).",
-    format: (v) => (v == null || v === 0 ? "—" : `$${formatBig(v)}`),
+    title: "Total USD of forced liquidations over last 60s. Only for symbols actively opened (WS-only). “—” = no measurement; “0” = measured, zero liquidations.",
+    format: (v) => (v == null ? "—" : v === 0 ? "0" : `$${formatBig(v)}`),
     colorMode: "warning_pos",
   },
   {
