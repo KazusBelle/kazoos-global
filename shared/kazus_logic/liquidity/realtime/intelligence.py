@@ -43,6 +43,13 @@ LIQ_SPIKE_USD = 50_000              # single-liquidation USD threshold
 OBI_FLIP_DELTA = 0.4                # |Δ OBI| over a 10s window
 RECOVERY_MAX_AGE_MS = 90_000        # give up tracking after this
 
+# LIQ STRESS restoration guard. `state.liquidations` is fed again (so liq_stress
+# can be measured), but liq_spike-triggered resiliency must stay DISABLED until
+# separately authorized. False ⇒ no liq_spike RecoveryEvent is ever created,
+# regardless of tape contents — restoring LIQ STRESS does not change resiliency.
+# Flipping this to True is a separate governed change (resiliency reactivation).
+LIQ_SPIKE_RESILIENCY_ENABLED = False
+
 # Kyle Lambda knobs --------------------------------------------------------
 
 KYLE_WINDOW_MS = 60_000             # 60s rolling tape window
@@ -89,14 +96,17 @@ def _detect_events(state: SymbolState, now_ms: int, spread_bps: Optional[float],
     pre_depth = depth_usd
 
     # Liquidation spike — any single liquidation > LIQ_SPIKE_USD within
-    # the last 5s. Cheap check against the existing tape.
-    five_s_ago = now_ms - 5_000
-    for liq in reversed(state.liquidations):
-        if liq.ts < five_s_ago:
-            break
-        if liq.price * liq.qty >= LIQ_SPIKE_USD:
-            out.append(RecoveryEvent(kind="liq_spike", started_ts=now_ms, pre_depth=pre_depth))
-            break
+    # the last 5s. GUARDED: stays disabled while LIQ_SPIKE_RESILIENCY_ENABLED is
+    # False, so re-feeding state.liquidations for LIQ STRESS does not create
+    # liq_spike resiliency episodes (separate governed change).
+    if LIQ_SPIKE_RESILIENCY_ENABLED:
+        five_s_ago = now_ms - 5_000
+        for liq in reversed(state.liquidations):
+            if liq.ts < five_s_ago:
+                break
+            if liq.price * liq.qty >= LIQ_SPIKE_USD:
+                out.append(RecoveryEvent(kind="liq_spike", started_ts=now_ms, pre_depth=pre_depth))
+                break
 
     # Spread explosion
     if spread_bps is not None and spread_bps > SPREAD_EXPLOSION_BPS:

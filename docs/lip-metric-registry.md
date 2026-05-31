@@ -124,7 +124,7 @@ Measurement-quality self-assessment for Credible Depth. Full design contract: [`
 |---|---|
 | Code | [`shared/kazus_logic/liquidity/realtime/metrics.py:80`](../shared/kazus_logic/liquidity/realtime/metrics.py#L80) `liquidation_stress_usd()` |
 | Purpose | Rolling USD value of forced liquidations — cascade indicator |
-| Inputs | `state.liquidations` (WS `@forceOrder` feed — note: switched from dead `forceOrder` stream in commit 5c4acbc) |
+| Inputs | `state.liquidations`, fed by a **dedicated always-on reader** on `wss://fstream.binance.com/market/ws/!forceOrder@arr` (the `/market` endpoint class — isolation-matrix verified as the only class that delivers forceOrder from this VPS). All-market stream filtered to tracked symbols. *History: dropped 2026-05-25 (`5c4acbc`) when the `/stream`+SUBSCRIBE path delivered nothing; restored once endpoint class was identified as the cause.* The same tape feeds the `liq_spike` resiliency trigger, which stays **disabled** via `intelligence.LIQ_SPIKE_RESILIENCY_ENABLED = False` (separate governed change) so restoration does not alter resiliency |
 | Formula | Sum of `price × qty` over liquidations within `LIQ_WINDOW_MS = 60_000` ms |
 | Threshold | Raw USD, no verdict |
 | Failure conditions | No liquidations in window → 0.0 (not None — absence of stress is a valid measurement) |

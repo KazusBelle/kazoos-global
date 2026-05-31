@@ -26,10 +26,13 @@ Note on missing streams (operator-reality 2026-05-25):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Set
+
+import websockets
 
 from .exec_impact import (
     detect_and_measure_bursts,
@@ -48,13 +51,20 @@ from .intelligence import (
 from . import health
 from .burst import detect_bursts
 from .resiliency import detect_resiliency
-from .metrics import credible_depth_sides, obi_rt, persistence_quality
-from .orderbook import SymbolState, Trade
+from .metrics import credible_depth_sides, liquidation_stress_usd, obi_rt, persistence_quality
+from .orderbook import Liquidation, SymbolState, Trade
 from .ws_client import FuturesWsClient
 
 logger = logging.getLogger("kazus.liquidity.realtime")
 
 _STREAM_SUFFIXES = ("depth20@100ms", "bookTicker", "trade")
+
+# Dedicated all-market liquidation feed (LIQ STRESS restoration). The main
+# per-symbol socket is on `/stream` (default class), which does NOT deliver
+# forceOrder; the `/market` class does (isolation-matrix verified). This is a
+# separate always-on raw single-stream connection — no SUBSCRIBE — that the
+# main FuturesWsClient is untouched by.
+FORCE_ORDER_WS_URL = "wss://fstream.binance.com/market/ws/!forceOrder@arr"
 
 RECONCILE_INTERVAL_S = 5
 SAMPLE_INTERVAL_S = 1.0
@@ -287,11 +297,12 @@ class RealtimeEngine:
                 # NOT the market. None = UNKNOWN/INSUFFICIENT (propagates);
                 # additive diagnostic, nothing downstream consumes it.
                 ("persistence_quality", persistence_quality(state, now_ms)),
-                # `liq_stress` dropped: `<s>@forceOrder` is unavailable
-                # from this network perimeter (verified at the wire),
-                # so the metric had no input and was writing constant
-                # 0.0 — silently false. Surface is dropped at the
-                # registry level so the chart never claims emptiness.
+                # `liq_stress` RESTORED: forceOrder is reachable via the
+                # `/market` endpoint class (isolation-matrix verified); the
+                # dedicated `_liquidation_loop` feeds state.liquidations for
+                # tracked symbols. Sums forced-liquidation USD over the last
+                # LIQ_WINDOW_MS; 0.0 when no liquidations in window.
+                ("liq_stress", liquidation_stress_usd(state, now_ms)),
                 ("resiliency_score", resiliency_score(state, now_ms)),
                 ("recovery_time_ms", recovery_time_ms(state)),
                 ("refill_velocity", refill_velocity_usd_per_s(state)),
@@ -432,6 +443,60 @@ class RealtimeEngine:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("runtime-health write failed: %s", exc)
 
+    # ── liquidation feed (LIQ STRESS restoration) ──────────────────────────
+
+    def _on_liquidation_frame(self, raw: str) -> None:
+        """Parse one all-market forceOrder frame and feed state.liquidations
+        for TRACKED symbols only. Feeds LIQ STRESS exclusively — liq_spike
+        resiliency stays disabled via intelligence.LIQ_SPIKE_RESILIENCY_ENABLED."""
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        o = (msg.get("o") if isinstance(msg, dict) else None) or {}
+        sym = (o.get("s") or "").upper()
+        state = self.states.get(sym)
+        if state is None:
+            return  # all-market stream → keep only symbols we actually track
+        try:
+            price = float(o.get("ap") or o.get("p") or 0.0)   # avg fill price
+            qty = float(o.get("z") or o.get("q") or 0.0)       # filled qty
+            ts = int(o.get("T") or msg.get("E") or int(time.time() * 1000))
+            side = str(o.get("S") or "")
+        except (TypeError, ValueError):
+            return
+        if price > 0 and qty > 0:
+            state.push_liquidation(Liquidation(ts=ts, side=side, price=price, qty=qty))
+
+    async def _liquidation_loop(self, stop_event: asyncio.Event) -> None:
+        """Always-on dedicated reader for the all-market forceOrder stream on the
+        `/market` endpoint class (the only class that delivers it). Raw single
+        stream — no SUBSCRIBE — so the main FuturesWsClient is untouched. Wrapped
+        so a feed failure can NEVER disrupt ingestion; NOT in run()'s
+        FIRST_COMPLETED set."""
+        backoff = 1.0
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(
+                    FORCE_ORDER_WS_URL, ping_interval=20, ping_timeout=10,
+                    close_timeout=5, max_size=2 * 1024 * 1024,
+                ) as ws:
+                    backoff = 1.0
+                    logger.info("liquidation feed connected (%s)", FORCE_ORDER_WS_URL)
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            continue
+                        self._on_liquidation_frame(raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("liquidation feed error: %s", exc)
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=min(30.0, backoff))
+                    break
+                except asyncio.TimeoutError:
+                    backoff = min(30.0, backoff * 2)
+
     # ── main loop ─────────────────────────────────────────────────────────
 
     async def _reader_loop(self, stop_event: asyncio.Event) -> None:
@@ -484,10 +549,13 @@ class RealtimeEngine:
         # Diagnostic heartbeat (WS_RELIABILITY_001). Deliberately NOT in the
         # FIRST_COMPLETED set — if it ever dies, ingestion must continue.
         hb = asyncio.create_task(self._health_loop(stop_event), name="ws-health")
+        # Dedicated all-market liquidation feed (LIQ STRESS). Like the heartbeat,
+        # excluded from FIRST_COMPLETED — its failure must not stop ingestion.
+        lq = asyncio.create_task(self._liquidation_loop(stop_event), name="ws-liquidation")
         try:
             await asyncio.wait([reader, ticker], return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (reader, ticker, hb):
+            for t in (reader, ticker, hb, lq):
                 t.cancel()
                 try:
                     await t
