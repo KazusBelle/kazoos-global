@@ -1233,7 +1233,7 @@ export function Liquidity() {
                     <AlertsCell alerts={activeAlertsBySymbol[row.binance_symbol] ?? []} />
                   </td>
                   <td className="px-3 py-2 align-top">
-                    <FlagsCell flags={intelByRow[row.binance_symbol]?.flags ?? []} />
+                    <FlagsCell flags={intelByRow[row.binance_symbol]?.flags ?? []} alerts={alerts} />
                   </td>
                 </tr>
               );
@@ -1986,11 +1986,38 @@ function AnomalyTimeline({
 
 // ── Flag chips ─────────────────────────────────────────────────────────────
 
-function FlagsCell({ flags }: { flags: Flag[] }) {
-  if (flags.length === 0) return <span className="text-muted">—</span>;
+// Display-only dedup: a flag whose root fact is already shown in the row by a
+// more informative instance is hidden. The engine still computes every flag and
+// alert unchanged — this only filters what the FLAGS cell renders so one fact
+// occupies one chip. Maps a flag label to the alert kind that supersedes it
+// (the alert carries severity + persistence, so it is the more informative twin).
+const FLAG_TWIN_ALERT: Record<string, AlertKind> = {
+  "THIN": "DEPTH_COLLAPSE",
+  "SPOOF-RISK": "DEPTH_COLLAPSE",
+  "LIQ-STRESS": "LIQ_CASCADE",
+  "FRAGILITY": "FRAGILITY_SPIKE",
+  "FUNDING-EXTREME": "FUNDING_EXTREME",
+  // OI-SURGE± is a dynamic label (`OI-SURGE${dir}`) → matched by prefix below.
+};
+
+function dedupeFlagsForDisplay(flags: Flag[], alerts: AlertEvent[]): Flag[] {
+  const kinds = new Set(alerts.map((a) => a.kind));
+  const labels = new Set(flags.map((f) => f.label));
+  return flags.filter((f) => {
+    if (f.label === "THIN" && labels.has("SPOOF-RISK")) return false;       // subset: THIN ⊂ SPOOF-RISK
+    if (f.label.startsWith("OI-SURGE") && kinds.has("OI_SURGE")) return false; // OI twin (prefix match)
+    const twin = FLAG_TWIN_ALERT[f.label];
+    if (twin && kinds.has(twin)) return false;                              // alert twin already shown
+    return true;
+  });
+}
+
+function FlagsCell({ flags, alerts }: { flags: Flag[]; alerts: AlertEvent[] }) {
+  const shown = dedupeFlagsForDisplay(flags, alerts);
+  if (shown.length === 0) return <span className="text-muted">—</span>;
   return (
     <div className="flex flex-wrap gap-1 max-w-[220px]">
-      {flags.map((f) => (
+      {shown.map((f) => (
         <span
           key={f.label}
           title={f.title}
