@@ -61,6 +61,13 @@ services:
       CHART_RENDER_USERNAME: ${CHART_RENDER_USERNAME:-${ADMIN_USERNAME:-kazus}}
       # X-zoom for the setup (LTF) chart in Telegram alerts. 1.0 = no zoom.
       CHART_RENDER_ZOOM: ${CHART_RENDER_ZOOM:-3.0}
+      # Day-1 collection watchdog — value-based continuity guard. Baseline is a
+      # DECLARED constant (not live pins); threshold is shell-overridable so a
+      # fire-test can use a low value without a code change.
+      WATCHDOG_BASELINE: ${WATCHDOG_BASELINE:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT}
+      WATCHDOG_POLL_SECONDS: ${WATCHDOG_POLL_SECONDS:-60}
+      WATCHDOG_STALL_THRESHOLD_SECONDS: ${WATCHDOG_STALL_THRESHOLD_SECONDS:-900}
+      WATCHDOG_CONN_STORM: ${WATCHDOG_CONN_STORM:-12}
 
   frontend:
     build:
