@@ -43,6 +43,7 @@ from kazus_db.models import AlertEvent, AlertState, Coin, Snapshot, SystemStatus
 from .chart_renderer import ChartRenderer
 from .db import SessionLocal
 from .settings import get_settings
+from .telegram import send_telegram
 from .telegram_alerts import send_setup_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -477,6 +478,138 @@ async def _investigation_autodraft_loop(stop_event: asyncio.Event) -> None:
             continue
 
 
+# ── Collection watchdog (Day-1) ─────────────────────────────────────────────
+# Value-based continuity guard for realtime collection. It does NOT trust
+# row-recency or frames_total alone — a stall is depth VALUE going stale/frozen
+# even while bookTicker frames keep advancing (the masking failure seen during
+# R2). Anchored on a DECLARED baseline (env, not live pins) so a pin-collapse is
+# caught rather than silenced. Alerts via the existing send_telegram path on
+# GREEN→RED transition + recovery on RED→GREEN. All credible_depth/burst checks
+# are measured over the stall-threshold window, so a short self-recovering WS
+# quiet-spell (minutes) does not trip a 15-min threshold.
+
+def _watchdog_baseline() -> list[str]:
+    raw = get_settings().watchdog_baseline
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
+def evaluate_collection_state(
+    db: Session, *, baseline: list[str], stall_threshold_s: int, conn_storm: int
+) -> Tuple[str, List[str], dict]:
+    """Return (state, reasons, metrics). state in {'GREEN','RED'}."""
+    from sqlalchemy import text as _t
+
+    h = db.execute(_t(
+        "SELECT subscribed_count, frames_total, conn_id "
+        "FROM liquidity_runtime_health ORDER BY created_at DESC LIMIT 1")).first()
+    subscribed = int(h[0]) if h and h[0] is not None else 0
+    frames = int(h[1]) if h and h[1] is not None else 0
+    conn = int(h[2]) if h and h[2] is not None else 0
+
+    rows = db.execute(_t(
+        "SELECT symbol, "
+        " round((extract(epoch from now())*1000 - max(ts))/1000.0,1) AS age_s, "
+        " count(DISTINCT value) AS dv, count(value) AS nonnull "
+        "FROM liquidity_samples "
+        "WHERE metric='credible_depth' AND symbol = ANY(:syms) "
+        "  AND ts > (extract(epoch from now()) - :win)*1000 "
+        "GROUP BY symbol"), {"syms": list(baseline), "win": stall_threshold_s}).all()
+    by_sym = {r[0]: (float(r[1]), int(r[2]), int(r[3])) for r in rows}
+
+    bursts = db.execute(_t(
+        "SELECT count(*) FROM liquidity_bursts "
+        "WHERE created_at > now() - (:w * interval '1 second')"),
+        {"w": stall_threshold_s}).scalar() or 0
+    churn = db.execute(_t(
+        "SELECT coalesce(max(conn_id)-min(conn_id),0) FROM liquidity_runtime_health "
+        "WHERE created_at > now() - (:w * interval '1 second')"),
+        {"w": stall_threshold_s}).scalar() or 0
+
+    reasons: List[str] = []
+    if subscribed < len(baseline):
+        reasons.append(f"subscribed_count={subscribed}<{len(baseline)}")
+    for sym in baseline:
+        v = by_sym.get(sym)
+        if v is None:
+            reasons.append(f"{sym}: no credible_depth in {stall_threshold_s}s")
+            continue
+        age_s, dv, nonnull = v
+        if age_s > stall_threshold_s:
+            reasons.append(f"{sym}: credible_depth stale {age_s}s")
+        elif dv < 2 or nonnull == 0:
+            reasons.append(f"{sym}: credible_depth value frozen (dv={dv})")
+    if int(bursts) == 0:
+        reasons.append(f"no bursts in {stall_threshold_s}s")
+    if int(churn) > conn_storm:
+        reasons.append(f"conn_id churn {churn}>{conn_storm}")
+
+    value_stalled = any(("stale" in r) or ("frozen" in r) or ("no credible_depth" in r) for r in reasons)
+    if value_stalled and frames > 0:
+        reasons.append("frames advancing while value-path stalled (masking)")
+
+    state = "RED" if reasons else "GREEN"
+    metrics = {"subscribed": subscribed, "frames": frames, "conn": conn,
+               "bursts": int(bursts), "conn_churn": int(churn)}
+    return state, reasons, metrics
+
+
+async def _watchdog_send(text_msg: str) -> bool:
+    s = get_settings()
+    if not s.telegram_bot_token or not s.telegram_chat_id:
+        logger.warning("watchdog: telegram not configured; skipping: %s", text_msg)
+        return False
+    try:
+        return await send_telegram(s.telegram_bot_token, s.telegram_chat_id, text_msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("watchdog telegram send failed: %s", exc)
+        return False
+
+
+async def _collection_watchdog_loop(stop_event: asyncio.Event) -> None:
+    s = get_settings()
+    baseline = _watchdog_baseline()
+    poll = max(10, int(s.watchdog_poll_seconds))
+    threshold = max(30, int(s.watchdog_stall_threshold_seconds))
+    conn_storm = int(s.watchdog_conn_storm)
+    logger.info(
+        "collection watchdog started (baseline=%s poll=%ss threshold=%ss)",
+        baseline, poll, threshold,
+    )
+    alerted = False
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=min(float(poll), 60.0))
+        return
+    except asyncio.TimeoutError:
+        pass
+    while not stop_event.is_set():
+        try:
+            with SessionLocal() as db:
+                state, reasons, metrics = evaluate_collection_state(
+                    db, baseline=baseline, stall_threshold_s=threshold, conn_storm=conn_storm
+                )
+            if state == "RED" and not alerted:
+                alerted = True
+                msg = (
+                    "\U0001F534 LIQ COLLECTION STALL\n"
+                    + "; ".join(reasons[:6])
+                    + f"\nsubscribed={metrics['subscribed']} bursts={metrics['bursts']} "
+                    f"frames_total={metrics['frames']} conn_churn={metrics['conn_churn']}"
+                )
+                await _watchdog_send(msg)
+                logger.warning("collection watchdog RED: %s", reasons)
+            elif state == "GREEN" and alerted:
+                alerted = False
+                await _watchdog_send("\U0001F7E2 LIQ COLLECTION RESUMED — value-path healthy again.")
+                logger.info("collection watchdog recovered")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("collection watchdog failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(poll))
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def main() -> None:
     settings = get_settings()
     logger.info(
@@ -532,6 +665,11 @@ async def main() -> None:
     investigation_capture_task = asyncio.create_task(
         _investigation_capture_loop(stop_event), name="investigation-capture"
     )
+    # Day-1 value-based collection watchdog — protects continuity across the
+    # long wait; isolated sibling task, exceptions caught, never blocks ingest.
+    collection_watchdog_task = asyncio.create_task(
+        _collection_watchdog_loop(stop_event), name="collection-watchdog"
+    )
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -566,7 +704,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task):
+        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task, collection_watchdog_task):
             t.cancel()
             try:
                 await t

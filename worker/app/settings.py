@@ -34,6 +34,14 @@ class WorkerSettings(BaseSettings):
     # Telegram image. 1.0 = no zoom. Env-tunable without a code redeploy.
     chart_render_zoom: float = 3.0
 
+    # ── Collection watchdog (Day-1) — value-based continuity guard ──────────
+    # Anchored on a declared baseline (NOT live pins), env-overridable so the
+    # fire-test can use a low threshold without a code change.
+    watchdog_baseline: str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+    watchdog_poll_seconds: int = 60
+    watchdog_stall_threshold_seconds: int = 900
+    watchdog_conn_storm: int = 12
+
 
 @lru_cache
 def get_settings() -> WorkerSettings:
