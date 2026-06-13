@@ -18,9 +18,13 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import json
 import logging
 import signal
+import sys
+import threading
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Set, Tuple
 
@@ -48,6 +52,39 @@ from .telegram_alerts import send_setup_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("kazus.worker")
+
+# ── TEMPORARY event-loop stall detector (Day-3 diagnostic) ──────────────────
+# An asyncio task bumps _LOOP_HB every second; a plain daemon thread (NOT on
+# the event loop, so it keeps running even when the loop is wedged) watches it
+# and, when the heartbeat goes stale, dumps every thread's stack to stderr.
+# This pinpoints the synchronous blocking frame that freezes the loop.
+_LOOP_HB = _time.monotonic()
+_STALL_DUMP_THRESHOLD_S = 20.0
+
+
+async def _loop_heartbeat(stop_event: asyncio.Event) -> None:
+    global _LOOP_HB
+    while not stop_event.is_set():
+        _LOOP_HB = _time.monotonic()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
+def _stall_monitor() -> None:
+    last_dump_for = 0.0
+    while True:
+        _time.sleep(5.0)
+        lag = _time.monotonic() - _LOOP_HB
+        if lag > _STALL_DUMP_THRESHOLD_S and lag != last_dump_for:
+            last_dump_for = lag
+            sys.stderr.write(
+                f"\n=== EVENT-LOOP STALL lag={lag:.1f}s @ {datetime.now(timezone.utc).isoformat()} — ALL THREAD STACKS ===\n"
+            )
+            faulthandler.dump_traceback(all_threads=True)
+            sys.stderr.flush()
 
 
 async def run_once(
@@ -670,6 +707,9 @@ async def main() -> None:
     collection_watchdog_task = asyncio.create_task(
         _collection_watchdog_loop(stop_event), name="collection-watchdog"
     )
+    # TEMPORARY (Day-3): loop-stall stack dumper.
+    loop_hb_task = asyncio.create_task(_loop_heartbeat(stop_event), name="loop-heartbeat")
+    threading.Thread(target=_stall_monitor, name="stall-monitor", daemon=True).start()
     # A tick gap wider than this means a boundary was missed (slow cycle,
     # restart, API outage) — the next tick then re-checks every timeframe.
     gap_threshold = timedelta(minutes=7)
@@ -710,7 +750,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task, collection_watchdog_task):
+        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task, collection_watchdog_task, loop_hb_task):
             t.cancel()
             try:
                 await t
