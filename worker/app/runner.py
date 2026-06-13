@@ -405,8 +405,14 @@ async def _anomaly_loop(stop_event: asyncio.Event) -> None:
         pass
     while not stop_event.is_set():
         try:
-            with SessionLocal() as db:
-                result = auto_record_anomalies_with_links(db)
+            # Heavy synchronous DB scan (structural_breaks → _interaction_in_window
+            # issues a multi-minute query) — run it in a thread so it cannot block
+            # the event loop / starve realtime ingestion. Session is opened inside
+            # the thread (not shared across threads).
+            def _run():
+                with SessionLocal() as db:
+                    return auto_record_anomalies_with_links(db)
+            result = await asyncio.to_thread(_run)
             inserted = len(result.get("inserted") or [])
             edges = len(result.get("edges") or [])
             if inserted or edges:
@@ -435,8 +441,10 @@ async def _intel_snapshot_loop(stop_event: asyncio.Event) -> None:
         pass
     while not stop_event.is_set():
         try:
-            with SessionLocal() as db:
-                row = snapshot_intelligence_history(db)
+            def _run():
+                with SessionLocal() as db:
+                    return snapshot_intelligence_history(db)
+            row = await asyncio.to_thread(_run)
             logger.debug("intel snapshot persisted id=%s state=%s", row["id"], row["coordinated_state"])
         except Exception as exc:  # noqa: BLE001
             logger.exception("intel snapshot failed: %s", exc)
@@ -464,8 +472,10 @@ async def _investigation_capture_loop(stop_event: asyncio.Event) -> None:
         pass
     while not stop_event.is_set():
         try:
-            with SessionLocal() as db:
-                result = investigation_capture_pending(db, limit=20)
+            def _run():
+                with SessionLocal() as db:
+                    return investigation_capture_pending(db, limit=20)
+            result = await asyncio.to_thread(_run)
             if result.get("captured_ids") or result.get("failed_ids"):
                 logger.info(
                     "investigation capture drained: %d captured · %d failed",
@@ -497,8 +507,10 @@ async def _investigation_autodraft_loop(stop_event: asyncio.Event) -> None:
         pass
     while not stop_event.is_set():
         try:
-            with SessionLocal() as db:
-                drafted = investigation_auto_draft_tick(db)
+            def _run():
+                with SessionLocal() as db:
+                    return investigation_auto_draft_tick(db)
+            drafted = await asyncio.to_thread(_run)
             if drafted:
                 logger.info(
                     "investigation auto-drafted: id=%s title=%s",
