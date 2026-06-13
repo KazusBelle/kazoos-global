@@ -16,6 +16,7 @@ The detector is pure but stateful across worker cycles: callers pass
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -130,8 +131,28 @@ async def compute_symbol(
     if needs_m5:
         fetches.append(client.klines(symbol, "5m", limit=m5_limit))
 
-    import asyncio
     results = await asyncio.gather(*fetches)
+    # Offload the CPU-bound setup computation to a worker thread. The
+    # full-universe M5 scan feeds ~1400 bars/symbol through the engines plus
+    # 2-3 detect_setup passes; running that on the event-loop thread starved
+    # realtime websocket ingestion (SCHEDULER_STARVATION, ~7-min dark spells).
+    # asyncio.to_thread keeps the loop responsive (the GIL is released
+    # periodically) without changing any computation — the helper body is
+    # byte-identical to the former inline form.
+    return await asyncio.to_thread(
+        _compute_snapshot_sync, symbol, results, needs_m5, prev_states
+    )
+
+
+def _compute_snapshot_sync(
+    symbol: str,
+    results: List[List[Bar]],
+    needs_m5: bool,
+    prev_states: Dict[str, SetupState],
+) -> "SymbolSnapshot":
+    """Pure-sync setup computation, extracted from compute_symbol so it can
+    run via asyncio.to_thread. No behavioural change. Runs in a worker
+    thread — must not touch async I/O or the shared httpx client."""
     d1_bars, h1_bars, m15_bars = results[0], results[1], results[2]
     m5_bars: List[Bar] = results[3] if needs_m5 else []
 

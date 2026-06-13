@@ -697,7 +697,13 @@ async def main() -> None:
                 due_tfs = set(ALL_ALERT_TFS)
 
             try:
+                _scan_t0 = datetime.now(timezone.utc)
+                logger.info("M5 scan start (tfs=%s)", sorted(due_tfs))
                 await run_once(client, renderer, settings, due_tfs)
+                logger.info(
+                    "M5 scan end (%.1fs)",
+                    (datetime.now(timezone.utc) - _scan_t0).total_seconds(),
+                )
             except Exception as exc:
                 logger.exception("cycle failed: %s", exc)
 
