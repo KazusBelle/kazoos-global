@@ -4355,11 +4355,35 @@ class TableSnapshot(BaseModel):
     bytes_per_row: float
 
 
+# Declared baseline for the value-path probe — NOT live pins, so a pin
+# collapse is caught rather than silenced. Mirrors the worker watchdog's
+# WATCHDOG_BASELINE default.
+LIQ_BASELINE_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+# Value-path probe window + freshness/value-change thresholds (display-tier,
+# not scientific): GREEN only when credible_depth is genuinely moving.
+_VALUE_PROBE_WINDOW_S = 120
+_VALUE_PROBE_MAX_AGE_S = 30.0
+_VALUE_PROBE_MIN_DV = 2
+
+
+class ValuePathSymbol(BaseModel):
+    symbol: str
+    age_s: Optional[float] = None
+    dv: int = 0
+
+
+class ValuePathStatus(BaseModel):
+    ok: bool
+    per_symbol: List[ValuePathSymbol]
+    window_s: int
+
+
 class RuntimeHealthOut(BaseModel):
     pool: dict
     research_cache: dict
     worker_heartbeats: List[WorkerHeartbeat]
     tables: List[TableSnapshot]
+    value_path: ValuePathStatus
     overall: str  # "ok" | "degraded" | "down"
 
 
@@ -4444,6 +4468,53 @@ async def runtime_health_endpoint(
     except Exception:  # noqa: BLE001
         pass
 
+    # Value-path probe: credible_depth must be genuinely MOVING (value-change),
+    # not merely written, across every DECLARED baseline symbol. This is the
+    # anti-false-GREEN gate — row-recency (MAX(ts)) probes above stay fresh even
+    # when the value path is frozen, so a passing heartbeat is not sufficient.
+    per_symbol: List[ValuePathSymbol] = []
+    try:
+        vp_rows = db.execute(
+            text(
+                """
+                SELECT symbol,
+                       (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s,
+                       count(DISTINCT value) AS dv
+                FROM liquidity_samples
+                WHERE metric = 'credible_depth'
+                  AND symbol = ANY(:baseline)
+                  AND ts > (extract(epoch from now()) - :win) * 1000
+                GROUP BY symbol
+                """
+            ),
+            {"baseline": list(LIQ_BASELINE_SYMBOLS), "win": _VALUE_PROBE_WINDOW_S},
+        ).fetchall()
+        by_symbol = {r.symbol: r for r in vp_rows}
+    except Exception:  # noqa: BLE001
+        # Never mask a DB failure as healthy — treat as no data (→ not ok).
+        by_symbol = {}
+
+    for sym in LIQ_BASELINE_SYMBOLS:
+        r = by_symbol.get(sym)
+        if r is None:
+            per_symbol.append(ValuePathSymbol(symbol=sym, age_s=None, dv=0))
+        else:
+            per_symbol.append(ValuePathSymbol(
+                symbol=sym,
+                age_s=float(r.age_s) if r.age_s is not None else None,
+                dv=int(r.dv or 0),
+            ))
+
+    value_path_ok = all(
+        p.age_s is not None
+        and p.age_s < _VALUE_PROBE_MAX_AGE_S
+        and p.dv >= _VALUE_PROBE_MIN_DV
+        for p in per_symbol
+    )
+    value_path = ValuePathStatus(
+        ok=value_path_ok, per_symbol=per_symbol, window_s=_VALUE_PROBE_WINDOW_S,
+    )
+
     # Overall: "down" if any task is stale, "degraded" if any lagging,
     # else "ok". Heartbeat-by-proxy can have false positives on cold
     # boot (table never written to yet) — that's why "dead" includes
@@ -4455,10 +4526,16 @@ async def runtime_health_endpoint(
     else:
         overall = "ok"
 
+    # Anti-false-GREEN gate: a frozen/stale/missing value path forces "down"
+    # regardless of how fresh the row-recency heartbeats look.
+    if not value_path_ok:
+        overall = "down"
+
     return RuntimeHealthOut(
         pool=pool_status(),
         research_cache=_research.cache_stats(),
         worker_heartbeats=heartbeats,
         tables=tables,
+        value_path=value_path,
         overall=overall,
     )

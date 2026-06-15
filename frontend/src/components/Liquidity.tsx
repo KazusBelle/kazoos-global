@@ -54,6 +54,16 @@ import { LiquidityChartModal } from "./LiquidityChartModal";
 
 const PIN_CAP = 20;
 const STALE_AFTER_MS = 8000;        // sample older than this → grey dot
+// Metric keys eligible for the 8s stale-cell dimming: value-path / realtime
+// (WS) metrics only, ~1–5s cadence. REST/poller metrics (~60s cadence) update
+// far slower than 8s, so dimming them would create a false "stale" signal.
+// Exact membership only (STALE_DIM_METRICS.has(key)) — "obi" (REST) and
+// "obi_rt" (WS) are distinct metrics; never substring/prefix match.
+const STALE_DIM_METRICS = new Set<string>([
+  "credible_depth",
+  "obi_rt",
+  "liq_stress",
+]);
 const WS_STATUS_POLL_MS = 4000;
 
 // Non-overlapping slices of CoinGecko's top-500 by market cap. The label
@@ -1104,14 +1114,12 @@ export function Liquidity() {
               const metrics = snapshot?.symbols?.[row.binance_symbol] ?? {};
               const isPinned = row.binance_symbol in pinOrder;
               const isSubscribed = subscribedSet.has(row.binance_symbol);
-              // Newest sample ts across all WS metrics for this symbol —
-              // determines stale vs live dot.
-              const lastWsTs = Math.max(
-                metrics.obi_rt?.ts ?? 0,
-                metrics.credible_depth?.ts ?? 0,
-                metrics.liq_stress?.ts ?? 0,
-              );
-              const fresh = lastWsTs > 0 && Date.now() - lastWsTs < STALE_AFTER_MS;
+              // LiveDot GREEN must require credible_depth specifically. A fresh
+              // obi_rt / liq_stress must NEVER mask a frozen/stale/missing
+              // credible_depth (anti-false-GREEN): green only when the
+              // credible_depth value exists and its ts is recent.
+              const cd = metrics.credible_depth;
+              const fresh = cd?.value != null && Date.now() - cd.ts < STALE_AFTER_MS;
               const pinnedCount = pins.length;
               const pinIdx = pinOrder[row.binance_symbol];
               // Worst severity from active alerts feeds the left-edge
@@ -1195,11 +1203,31 @@ export function Liquidity() {
                   <td className={`px-3 py-2 text-right ${pctColor}`}>{formatPct(pct)}</td>
                   <td className="px-3 py-2 text-right text-zinc-200">{formatBig(row.volume_24h ?? NaN)}</td>
                   {METRIC_COLS.map((c) => {
-                    const v = metrics[c.key]?.value ?? null;
+                    const cell = metrics[c.key];
+                    const v = cell?.value ?? null;
                     const bar = barFor(v, colDistributions[c.key] ?? [], c.colorMode);
+                    // Anti-false-GREEN: a present value whose sample ts is older
+                    // than STALE_AFTER_MS is dimmed + age-labelled so a frozen
+                    // collection path can't read as a live number. Null keeps
+                    // the existing "—" rendering untouched.
+                    // Stale-dimming applies ONLY to value-path/realtime
+                    // metrics (exact key membership). REST/poller metrics
+                    // (~60s cadence: obi, oi, spread, funding, atr_liquidity…)
+                    // would always read >8s old and must NOT be dimmed.
+                    const cellAge =
+                      STALE_DIM_METRICS.has(c.key) && v != null && cell
+                        ? Date.now() - cell.ts
+                        : null;
+                    const isStale = cellAge != null && cellAge > STALE_AFTER_MS;
                     return (
                       <td key={c.key} className="px-3 py-2 text-right text-zinc-200 relative">
-                        <span className="relative z-10">{c.format(v)}</span>
+                        <span
+                          className="relative z-10"
+                          style={isStale ? { opacity: 0.5 } : undefined}
+                          title={isStale ? `stale: ${Math.round((cellAge as number) / 1000)}s old` : undefined}
+                        >
+                          {c.format(v)}
+                        </span>
                         {bar && (
                           <span
                             className="absolute left-1 right-1 bottom-1 h-[2px] rounded-sm pointer-events-none"
