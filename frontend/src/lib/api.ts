@@ -84,9 +84,17 @@ export function setToken(token: string | null, remember = true) {
   }
 }
 
+// Default client-side request timeout. A hung backend (e.g. analytics
+// endpoints aggregating the ~66M-row liquidity_samples while the DB is
+// saturated) would otherwise leave fetch pending forever and panels stuck on
+// "Loading…". The timeout aborts the request so the promise rejects, letting
+// each panel's existing .catch render an error/unavailable state.
+const DEFAULT_TIMEOUT_MS = 20_000;
+
 async function request<T>(
   path: string,
-  init: RequestInit = {}
+  init: RequestInit = {},
+  opts: { timeoutMs?: number } = {}
 ): Promise<T> {
   const headers = new Headers(init.headers);
   const token = getToken();
@@ -95,7 +103,24 @@ async function request<T>(
     headers.set("Content-Type", "application/json");
   }
 
-  const res = await fetch(`/api${path}`, { ...init, headers });
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(`/api${path}`, { ...init, headers, signal: controller.signal });
+  } catch (e) {
+    // AbortController.abort() rejects fetch with an AbortError — surface it as
+    // a clear, non-retried timeout. Other network errors pass through.
+    if (controller.signal.aborted) {
+      throw new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (res.status === 401) {
     setToken(null);
     throw new Error("unauthorized");
@@ -2739,5 +2764,8 @@ export type RuntimeState = {
 };
 
 export async function getRuntimeState() {
-  return request<RuntimeState>("/liquidity/runtime-state");
+  // Polled every 10s by ObservationBanner — use a tighter 5s timeout so a slow
+  // backend cannot make polls overlap/pile up; a timed-out poll rejects and the
+  // banner shows its RED "status unavailable" state until the next poll.
+  return request<RuntimeState>("/liquidity/runtime-state", {}, { timeoutMs: 5_000 });
 }
