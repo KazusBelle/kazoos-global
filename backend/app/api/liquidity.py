@@ -4394,12 +4394,12 @@ def _baseline_value_path(db: Session) -> ValuePathStatus:
             text(
                 """
                 SELECT symbol,
-                       (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s,
+                       ((extract(epoch from now()) * 1000)::bigint - max(ts)) / 1000.0 AS age_s,
                        count(DISTINCT value) AS dv
                 FROM liquidity_samples
                 WHERE metric = 'credible_depth'
                   AND symbol = ANY(:baseline)
-                  AND ts > (extract(epoch from now()) - :win) * 1000
+                  AND ts > (extract(epoch from now()) * 1000)::bigint - (:win * 1000)
                 GROUP BY symbol
                 """
             ),
