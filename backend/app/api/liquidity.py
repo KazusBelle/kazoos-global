@@ -4651,9 +4651,14 @@ async def runtime_state_endpoint(
     value_path = _baseline_value_path(db)
 
     # liq_stress latest age — epoch-ms domain (ts), uses (metric, ts) index.
+    # `value IS NOT NULL` lets this use the partial index
+    # ix_liq_samples_metric_ts (metric, ts) WHERE value IS NOT NULL — an
+    # Index Only Scan instead of a Parallel Seq Scan over the ~66M-row table.
+    # liq_stress is written non-null every tick, so max(ts) is unchanged
+    # (verified: old_max_ts == new_max_ts).
     ls_row = db.execute(text(
         "SELECT (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s "
-        "FROM liquidity_samples WHERE metric = 'liq_stress'"
+        "FROM liquidity_samples WHERE metric = 'liq_stress' AND value IS NOT NULL"
     )).first()
     liq_stress_age = float(ls_row.age_s) if ls_row and ls_row.age_s is not None else None
 
