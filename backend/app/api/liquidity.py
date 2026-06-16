@@ -39,6 +39,7 @@ from kazus_logic.liquidity import REGISTRY
 
 PIN_CAP = 20
 
+from ..core.config import get_settings
 from ..db.base import get_db
 from ..models.models import User
 from .deps import get_current_user
@@ -4378,6 +4379,58 @@ class ValuePathStatus(BaseModel):
     window_s: int
 
 
+def _baseline_value_path(db: Session) -> ValuePathStatus:
+    """Anti-false-GREEN value-path probe over the declared baseline.
+
+    credible_depth must be genuinely MOVING (value-change), not merely written.
+    Shared by /admin/runtime-health and /liquidity/runtime-state — one source of
+    truth. `.ok` requires every baseline symbol present AND age_s < 30 AND
+    dv >= 2 over the 120s window; missing symbols → age_s=None, dv=0; a DB
+    exception is treated as no data (→ not ok), never masked as healthy.
+    """
+    per_symbol: List[ValuePathSymbol] = []
+    try:
+        vp_rows = db.execute(
+            text(
+                """
+                SELECT symbol,
+                       (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s,
+                       count(DISTINCT value) AS dv
+                FROM liquidity_samples
+                WHERE metric = 'credible_depth'
+                  AND symbol = ANY(:baseline)
+                  AND ts > (extract(epoch from now()) - :win) * 1000
+                GROUP BY symbol
+                """
+            ),
+            {"baseline": list(LIQ_BASELINE_SYMBOLS), "win": _VALUE_PROBE_WINDOW_S},
+        ).fetchall()
+        by_symbol = {r.symbol: r for r in vp_rows}
+    except Exception:  # noqa: BLE001
+        by_symbol = {}
+
+    for sym in LIQ_BASELINE_SYMBOLS:
+        r = by_symbol.get(sym)
+        if r is None:
+            per_symbol.append(ValuePathSymbol(symbol=sym, age_s=None, dv=0))
+        else:
+            per_symbol.append(ValuePathSymbol(
+                symbol=sym,
+                age_s=float(r.age_s) if r.age_s is not None else None,
+                dv=int(r.dv or 0),
+            ))
+
+    value_path_ok = all(
+        p.age_s is not None
+        and p.age_s < _VALUE_PROBE_MAX_AGE_S
+        and p.dv >= _VALUE_PROBE_MIN_DV
+        for p in per_symbol
+    )
+    return ValuePathStatus(
+        ok=value_path_ok, per_symbol=per_symbol, window_s=_VALUE_PROBE_WINDOW_S,
+    )
+
+
 class RuntimeHealthOut(BaseModel):
     pool: dict
     research_cache: dict
@@ -4472,48 +4525,8 @@ async def runtime_health_endpoint(
     # not merely written, across every DECLARED baseline symbol. This is the
     # anti-false-GREEN gate — row-recency (MAX(ts)) probes above stay fresh even
     # when the value path is frozen, so a passing heartbeat is not sufficient.
-    per_symbol: List[ValuePathSymbol] = []
-    try:
-        vp_rows = db.execute(
-            text(
-                """
-                SELECT symbol,
-                       (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s,
-                       count(DISTINCT value) AS dv
-                FROM liquidity_samples
-                WHERE metric = 'credible_depth'
-                  AND symbol = ANY(:baseline)
-                  AND ts > (extract(epoch from now()) - :win) * 1000
-                GROUP BY symbol
-                """
-            ),
-            {"baseline": list(LIQ_BASELINE_SYMBOLS), "win": _VALUE_PROBE_WINDOW_S},
-        ).fetchall()
-        by_symbol = {r.symbol: r for r in vp_rows}
-    except Exception:  # noqa: BLE001
-        # Never mask a DB failure as healthy — treat as no data (→ not ok).
-        by_symbol = {}
-
-    for sym in LIQ_BASELINE_SYMBOLS:
-        r = by_symbol.get(sym)
-        if r is None:
-            per_symbol.append(ValuePathSymbol(symbol=sym, age_s=None, dv=0))
-        else:
-            per_symbol.append(ValuePathSymbol(
-                symbol=sym,
-                age_s=float(r.age_s) if r.age_s is not None else None,
-                dv=int(r.dv or 0),
-            ))
-
-    value_path_ok = all(
-        p.age_s is not None
-        and p.age_s < _VALUE_PROBE_MAX_AGE_S
-        and p.dv >= _VALUE_PROBE_MIN_DV
-        for p in per_symbol
-    )
-    value_path = ValuePathStatus(
-        ok=value_path_ok, per_symbol=per_symbol, window_s=_VALUE_PROBE_WINDOW_S,
-    )
+    value_path = _baseline_value_path(db)
+    value_path_ok = value_path.ok
 
     # Overall: "down" if any task is stale, "degraded" if any lagging,
     # else "ok". Heartbeat-by-proxy can have false positives on cold
@@ -4538,4 +4551,158 @@ async def runtime_health_endpoint(
         tables=tables,
         value_path=value_path,
         overall=overall,
+    )
+
+
+# ── Observation Period runtime-state (Stage 2) ──────────────────────────────
+# Read-only operator-visibility endpoint powering the LIQ ObservationBanner.
+# T0_NEW is parsed once at import; `Z` is normalised to a tz-aware UTC datetime.
+def _parse_t0_new() -> datetime:
+    raw = get_settings().t0_new.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+_T0_NEW = _parse_t0_new()
+
+# Per-flow chip thresholds (seconds). Display-tier, not scientific.
+_FLOW_YELLOW_S = 300    # >= 5 min stale → YELLOW chip / liq_stress soft-warn
+_FLOW_RED_S = 900       # >= 15 min stale → RED chip / event-flow soft-warn
+
+
+class FlowIndicator(BaseModel):
+    latest_age_s: Optional[float] = None
+    status: str  # "GREEN" | "YELLOW" | "RED"
+
+
+class RuntimeStateOut(BaseModel):
+    t0_new: str
+    elapsed_s: float
+    hrs_to_3d: float
+    hrs_to_7d: float
+    baseline: List[str]
+    subscribed_count: Optional[int]
+    conn_id: Optional[int]
+    failure_boundary: str
+    health_age_s: Optional[float]
+    value_path: ValuePathStatus
+    flows: dict  # {name: FlowIndicator}
+    continuity: Optional[dict] = None  # computed in a later iteration
+    derived_status: str  # "GREEN" | "YELLOW" | "RED"
+
+
+def _flow_status(age_s: Optional[float]) -> str:
+    if age_s is None:
+        return "RED"
+    if age_s < _FLOW_YELLOW_S:
+        return "GREEN"
+    if age_s < _FLOW_RED_S:
+        return "YELLOW"
+    return "RED"
+
+
+def _latest_age_created_at(db: Session, table: str) -> Optional[float]:
+    """Latest-row age (seconds) via PK-desc — O(1). created_at is a SQL
+    timestamp, so compare in the timestamp domain (NOT epoch-ms)."""
+    row = db.execute(text(
+        f"SELECT extract(epoch from (now() - created_at)) AS age_s "
+        f"FROM {table} ORDER BY id DESC LIMIT 1"
+    )).first()
+    return float(row.age_s) if row and row.age_s is not None else None
+
+
+@router.get("/runtime-state", response_model=RuntimeStateOut)
+async def runtime_state_endpoint(
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> RuntimeStateOut:
+    """Operator-visibility snapshot for the Observation Period banner. Read-only.
+
+    derived_status RED authority is the value path (Stage-1-aligned); event-like
+    flows and failure_boundary are soft (YELLOW at most). Any build failure
+    raises 500 — the frontend renders that as a RED banner, never GREEN.
+    """
+    now_utc = datetime.now(timezone.utc)
+    elapsed_s = (now_utc - _T0_NEW).total_seconds()
+    hrs_to_3d = max(0.0, 3 * 24 - elapsed_s / 3600.0)
+    hrs_to_7d = max(0.0, 7 * 24 - elapsed_s / 3600.0)
+
+    # Latest runtime_health row (timestamp domain for the age).
+    h = db.execute(text(
+        "SELECT subscribed_count, conn_id, failure_boundary, "
+        "extract(epoch from (now() - created_at)) AS age_s "
+        "FROM liquidity_runtime_health ORDER BY id DESC LIMIT 1"
+    )).first()
+    if h is None:
+        subscribed_count: Optional[int] = None
+        conn_id: Optional[int] = None
+        failure_boundary = "UNKNOWN"
+        health_age_s: Optional[float] = None
+    else:
+        subscribed_count = int(h.subscribed_count) if h.subscribed_count is not None else None
+        conn_id = int(h.conn_id) if h.conn_id is not None else None
+        failure_boundary = h.failure_boundary or "UNKNOWN"
+        health_age_s = float(h.age_s) if h.age_s is not None else None
+
+    value_path = _baseline_value_path(db)
+
+    # liq_stress latest age — epoch-ms domain (ts), uses (metric, ts) index.
+    ls_row = db.execute(text(
+        "SELECT (extract(epoch from now()) * 1000 - max(ts)) / 1000.0 AS age_s "
+        "FROM liquidity_samples WHERE metric = 'liq_stress'"
+    )).first()
+    liq_stress_age = float(ls_row.age_s) if ls_row and ls_row.age_s is not None else None
+
+    flows = {
+        "bursts": FlowIndicator(
+            latest_age_s=(a := _latest_age_created_at(db, "liquidity_bursts")), status=_flow_status(a)),
+        "resiliency": FlowIndicator(
+            latest_age_s=(a := _latest_age_created_at(db, "liquidity_resiliency")), status=_flow_status(a)),
+        "exec_validation": FlowIndicator(
+            latest_age_s=(a := _latest_age_created_at(db, "liquidity_exec_validation")), status=_flow_status(a)),
+        "liq_stress": FlowIndicator(latest_age_s=liq_stress_age, status=_flow_status(liq_stress_age)),
+    }
+
+    baseline = list(LIQ_BASELINE_SYMBOLS)
+    # Per-flow chips use their own thresholds. For event-like flows
+    # (bursts/resiliency/exec_validation), a RED chip never forces banner RED —
+    # value_path is the authoritative sampler-down signal. Do not symmetrize.
+    red = (
+        h is None
+        or not value_path.ok
+        or (subscribed_count is not None and subscribed_count < len(baseline))
+        or (subscribed_count is None)
+    )
+    if red:
+        derived_status = "RED"
+    else:
+        yellow = (
+            (liq_stress_age is not None and liq_stress_age > _FLOW_YELLOW_S)
+            or (liq_stress_age is None)
+            or any(
+                flows[name].latest_age_s is None or flows[name].latest_age_s >= _FLOW_RED_S
+                for name in ("bursts", "resiliency", "exec_validation")
+            )
+            or failure_boundary != "HEALTHY"
+        )
+        derived_status = "YELLOW" if yellow else "GREEN"
+
+    return RuntimeStateOut(
+        t0_new=get_settings().t0_new,
+        elapsed_s=elapsed_s,
+        hrs_to_3d=hrs_to_3d,
+        hrs_to_7d=hrs_to_7d,
+        baseline=baseline,
+        subscribed_count=subscribed_count,
+        conn_id=conn_id,
+        failure_boundary=failure_boundary,
+        health_age_s=health_age_s,
+        value_path=value_path,
+        flows={k: v.model_dump() for k, v in flows.items()},
+        continuity=None,
+        derived_status=derived_status,
     )

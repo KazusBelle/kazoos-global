@@ -51,6 +51,7 @@ import {
   type ValidationStats,
 } from "../lib/liquidityIntelligence";
 import { LiquidityChartModal } from "./LiquidityChartModal";
+import { ObservationBanner } from "./ObservationBanner";
 
 const PIN_CAP = 20;
 const STALE_AFTER_MS = 8000;        // sample older than this → grey dot
@@ -928,6 +929,7 @@ export function Liquidity() {
 
   return (
     <div className="space-y-4">
+      <ObservationBanner />
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex items-baseline gap-3">
           <div className="text-accent text-xl font-bold tracking-[0.3em]">LIQ</div>

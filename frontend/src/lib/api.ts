@@ -2701,3 +2701,43 @@ export type RuntimeHealth = {
 export async function getRuntimeHealth() {
   return request<RuntimeHealth>("/liquidity/admin/runtime-health");
 }
+
+// ── Observation Period runtime-state (Stage 2) ──────────────────────────────
+export type FlowStatus = "GREEN" | "YELLOW" | "RED";
+
+export type FlowIndicator = {
+  latest_age_s: number | null;
+  status: FlowStatus;
+};
+
+export type ValuePathSymbol = {
+  symbol: string;
+  age_s: number | null;
+  dv: number;
+};
+
+export type ValuePathStatus = {
+  ok: boolean;
+  window_s: number;
+  per_symbol: ValuePathSymbol[];
+};
+
+export type RuntimeState = {
+  t0_new: string;
+  elapsed_s: number;
+  hrs_to_3d: number;
+  hrs_to_7d: number;
+  baseline: string[];
+  subscribed_count: number | null;
+  conn_id: number | null;
+  failure_boundary: string;
+  health_age_s: number | null;
+  value_path: ValuePathStatus;
+  flows: Record<string, FlowIndicator>;
+  continuity: Record<string, unknown> | null;
+  derived_status: FlowStatus;
+};
+
+export async function getRuntimeState() {
+  return request<RuntimeState>("/liquidity/runtime-state");
+}

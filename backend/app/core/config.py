@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     server_metrics_retention_hours: int = 24 * 7
     default_coins: str = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 
+    # Observation Period anchor (operational-visibility only). Env-overridable.
+    t0_new: str = "2026-06-13T08:47:38Z"
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_cors(cls, v):
