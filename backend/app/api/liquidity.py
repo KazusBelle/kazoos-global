@@ -72,23 +72,80 @@ class LiqResponse(BaseModel):
     fetched_at: float
 
 
-# Module-level cache. Single-process worker, so a plain dict is enough —
-# no need for redis here. Keyed by (source, limit_or_none).
+# Module-level cache. Single-process backend on one event loop, so a plain
+# dict + per-key asyncio locks are enough — no redis. Keyed by (source, limit).
+# Entry shape: key -> (updated_at, value).
 _cache: dict[str, tuple[float, object]] = {}
-_cache_lock = asyncio.Lock()
+# Per-key locks (NOT one global lock): a slow CoinGecko refresh must never
+# serialize the unrelated Binance key (or vice-versa).
+_key_locks: dict[str, asyncio.Lock] = {}
+# Keys with an in-flight background refresh — dedupes concurrent refreshes so
+# only ONE runs per key (bounded; never unbounded task creation).
+_refreshing: set[str] = set()
+# Strong refs to background refresh tasks so they aren't GC'd mid-flight.
+_bg_refresh_tasks: set = set()
+
+
+def _key_lock(key: str) -> asyncio.Lock:
+    lk = _key_locks.get(key)
+    if lk is None:
+        lk = asyncio.Lock()
+        _key_locks[key] = lk
+    return lk
+
+
+async def _refresh_cache_key(key: str, fn) -> None:
+    """Background refresh for a stale key. Runs as an independent task so it
+    survives the originating request's cancellation. On failure it KEEPS the
+    last-good value (never deletes) and logs a warning."""
+    try:
+        async with _key_lock(key):
+            value = await fn()
+            _cache[key] = (time.time(), value)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cache refresh failed for %s: %s (keeping stale value)", key, exc)
+    finally:
+        _refreshing.discard(key)
+
+
+def _schedule_refresh(key: str, fn) -> None:
+    # Dedupe: at most one background refresh per key (no unbounded tasks).
+    # No await between the membership check and add() → race-free on the loop.
+    if key in _refreshing:
+        return
+    _refreshing.add(key)
+    task = asyncio.create_task(_refresh_cache_key(key, fn))
+    _bg_refresh_tasks.add(task)
+    task.add_done_callback(_bg_refresh_tasks.discard)
 
 
 async def _cached(key: str, ttl: float, fn):
+    """Stale-while-revalidate cache.
+
+    - Fresh entry (age < ttl): return it.
+    - Stale entry: return the stale value IMMEDIATELY and trigger a background
+      refresh (the user request never blocks on the slow external fetch, and
+      the refresh survives request cancellation).
+    - No entry at all: fetch synchronously once under the PER-KEY lock (so the
+      first-ever load still works), double-checking after acquiring the lock.
+    """
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
-    async with _cache_lock:
+    if hit is not None:
+        updated_at, value = hit
+        if now - updated_at < ttl:
+            return value  # fresh
+        # stale → serve last-good now, refresh in background (non-blocking)
+        _schedule_refresh(key, fn)
+        return value
+    # Cold (no last-good value): must fetch once. Per-key lock prevents a
+    # stampede on this key without blocking other keys.
+    async with _key_lock(key):
         hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
+        if hit is not None:
             return hit[1]
         value = await fn()
-        _cache[key] = (now, value)
+        _cache[key] = (time.time(), value)
         return value
 
 
