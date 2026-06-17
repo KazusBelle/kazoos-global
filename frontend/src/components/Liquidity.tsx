@@ -1023,7 +1023,7 @@ export function Liquidity() {
       )}
 
       <div className="bg-panel border border-border rounded-2xl overflow-x-auto">
-        <table className="w-full text-sm font-mono">
+        <table className="w-full text-sm font-mono tabular-nums">
           <thead>
             <tr className="text-[10px] uppercase tracking-[0.2em] text-muted border-b border-border select-none">
               <th className="px-2 py-3 font-normal text-left w-10">PIN</th>
@@ -1138,7 +1138,10 @@ export function Liquidity() {
                 <tr
                   key={row.binance_symbol}
                   onClick={() => setChartSymbol(row.binance_symbol)}
-                  className={`border-t border-border/60 hover:bg-white/[0.02] transition-colors cursor-pointer ${
+                  // Fixed row height: badge/flag/alert state changes
+                  // (green→yellow→red, more/fewer chips) must never reflow the
+                  // row. h-11 (44px) + single-line cells keeps every row equal.
+                  className={`h-11 border-t border-border/60 hover:bg-white/[0.02] transition-colors cursor-pointer ${
                     isPinned ? "bg-white/[0.015]" : ""
                   }`}
                   style={
@@ -1504,12 +1507,12 @@ function AlertsCell({ alerts }: { alerts: AlertEvent[] }) {
   // Worst severity wins for the cell's dominant color, but each alert is
   // rendered as its own chip so multiple kinds are visible at once.
   return (
-    <div className="flex flex-wrap gap-1 max-w-[240px]">
+    <div className="flex flex-nowrap items-center gap-1 max-w-[240px] overflow-hidden">
       {alerts.map((a) => (
         <span
           key={a.id}
           title={`${a.kind} · ${a.trigger} · regime=${a.regime} · conf=${a.confidence.toFixed(0)}`}
-          className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+          className="inline-block shrink-0 whitespace-nowrap rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
           style={{
             color: SEVERITY_COLOR[a.severity],
             borderColor: SEVERITY_COLOR[a.severity].replace(/0\.95\)$/, "0.5)"),
@@ -2046,12 +2049,12 @@ function FlagsCell({ flags, alerts }: { flags: Flag[]; alerts: AlertEvent[] }) {
   const shown = dedupeFlagsForDisplay(flags, alerts);
   if (shown.length === 0) return <span className="text-muted">—</span>;
   return (
-    <div className="flex flex-wrap gap-1 max-w-[220px]">
+    <div className="flex flex-nowrap items-center gap-1 max-w-[220px] overflow-hidden">
       {shown.map((f) => (
         <span
           key={f.label}
           title={f.title}
-          className="inline-block rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
+          className="inline-block shrink-0 whitespace-nowrap rounded-sm border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.12em]"
           style={{
             color: f.color,
             borderColor: f.color.replace(/0\.95\)$/, "0.45)"),
