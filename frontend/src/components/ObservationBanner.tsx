@@ -1,12 +1,13 @@
-import { useEffect, useState } from "react";
-import { getRuntimeState, type RuntimeState, type FlowStatus } from "../lib/api";
+import { type RuntimeState, type FlowStatus } from "../lib/api";
 
 // Observation Period status bar (Stage 2). Read-only operator visibility.
 // derived_status RED authority is the value path (Stage 1) — event-like flows
 // and failure_boundary are soft (YELLOW at most). On fetch error the bar is RED
 // ("status unavailable"), never green.
-
-const POLL_MS = 10_000;
+//
+// Presentational only: runtime-state is polled once in the parent (Liquidity)
+// and passed in as { data, loading, error } so the banner and the header
+// WsStatusPill always read the same snapshot (no divergent caches).
 
 const COLORS: Record<FlowStatus, { fg: string; border: string; bg: string }> = {
   GREEN: { fg: "rgba(82, 185, 122, 0.95)", border: "rgba(82, 185, 122, 0.5)", bg: "rgba(82, 185, 122, 0.08)" },
@@ -41,22 +42,15 @@ const FLOW_LABELS: Record<string, string> = {
   liq_stress: "stress",
 };
 
-export function ObservationBanner() {
-  const [data, setData] = useState<RuntimeState | null>(null);
-  const [error, setError] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      getRuntimeState()
-        .then((d) => { if (!cancelled) { setData(d); setError(false); setLoading(false); } })
-        .catch(() => { if (!cancelled) { setError(true); setLoading(false); } });
-    load();
-    const id = window.setInterval(load, POLL_MS);
-    return () => { cancelled = true; window.clearInterval(id); };
-  }, []);
-
+export function ObservationBanner({
+  data,
+  loading,
+  error,
+}: {
+  data: RuntimeState | null;
+  loading: boolean;
+  error: boolean;
+}) {
   // Error → RED bar, never green.
   if (error || (!loading && !data)) {
     const c = COLORS.RED;

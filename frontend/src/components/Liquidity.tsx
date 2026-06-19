@@ -7,6 +7,7 @@ import {
   getLiquidityReplaySnapshot,
   getLiquidityTop,
   getLiquidityWsStatus,
+  getRuntimeState,
   listLiquidityPins,
   moveLiquidityPin,
   patchLiquidityAlertValidation,
@@ -17,6 +18,7 @@ import {
   type LiqPin,
   type LiqRow,
   type LiqWsStatus,
+  type RuntimeState,
 } from "../lib/api";
 import {
   aggregateValidation,
@@ -66,6 +68,15 @@ const STALE_DIM_METRICS = new Set<string>([
   "liq_stress",
 ]);
 const WS_STATUS_POLL_MS = 4000;
+// Runtime-state poll feeds the header pill's collection-health gate so a stale
+// ws_status write (scheduler starvation / WS churn) is shown as a soft "WS LAG"
+// warning instead of a false "WORKER DOWN" while value-path/subscriptions are
+// healthy. 10s matches ObservationBanner's cadence; these fields change slowly.
+const RUNTIME_HEALTH_POLL_MS = 10000;
+// How long the header pill keeps trusting the last successful runtime-state
+// snapshot once polls start failing. ~3 poll cycles: tolerates a couple of
+// transient misses before the health gate is declared blind (HEALTH UNKNOWN).
+const RUNTIME_GRACE_MS = 30000;
 
 // Non-overlapping slices of CoinGecko's top-500 by market cap. The label
 // shows the upper bound; the slice is (prev_upper, upper]. Tier 1 is
@@ -324,6 +335,14 @@ export function Liquidity() {
   const [chartSymbol, setChartSymbol] = useState<string | null>(null);
   const [pins, setPins] = useState<LiqPin[]>([]);
   const [wsStatus, setWsStatus] = useState<LiqWsStatus | null>(null);
+  // Single source of truth for runtime-state on the LIQ page. Both the
+  // ObservationBanner and the header WsStatusPill read this one snapshot so they
+  // can never diverge from two independent caches. lastRuntimeSuccessAt drives
+  // the pill's grace period before it escalates a dark health gate to UNKNOWN.
+  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeState | null>(null);
+  const [runtimeLoading, setRuntimeLoading] = useState(true);
+  const [runtimeError, setRuntimeError] = useState(false);
+  const [lastRuntimeSuccessAt, setLastRuntimeSuccessAt] = useState<number | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
 
   // ── Replay / time-machine state ─────────────────────────────────────
@@ -413,6 +432,38 @@ export function Liquidity() {
     };
     poll();
     const id = window.setInterval(poll, WS_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  // The single runtime-state poll for the LIQ page. Feeds both ObservationBanner
+  // and the header pill's collection-health gate, which distinguishes a stale
+  // ws_status write (soft "WS LAG") from a genuine worker outage ("WORKER DOWN")
+  // and from an unreachable health gate ("HEALTH UNKNOWN"). On success we stamp
+  // lastRuntimeSuccessAt; on failure we keep the last-known data (for in-grace
+  // gating) and flag the error so the banner can show its "unavailable" state.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await getRuntimeState();
+        if (!cancelled) {
+          setRuntimeHealth(r);
+          setRuntimeError(false);
+          setRuntimeLoading(false);
+          setLastRuntimeSuccessAt(Date.now());
+        }
+      } catch {
+        if (!cancelled) {
+          setRuntimeError(true);
+          setRuntimeLoading(false);
+        }
+      }
+    };
+    poll();
+    const id = window.setInterval(poll, RUNTIME_HEALTH_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -929,14 +980,19 @@ export function Liquidity() {
 
   return (
     <div className="space-y-4">
-      <ObservationBanner />
+      <ObservationBanner data={runtimeHealth} loading={runtimeLoading} error={runtimeError} />
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex items-baseline gap-3">
           <div className="text-accent text-xl font-bold tracking-[0.3em]">LIQ</div>
           <div className="text-[11px] uppercase tracking-[0.3em] text-muted">
             liquidity scanner
           </div>
-          <WsStatusPill status={wsStatus} pinnedCount={pins.length} />
+          <WsStatusPill
+            status={wsStatus}
+            runtime={runtimeHealth}
+            lastRuntimeSuccessAt={lastRuntimeSuccessAt}
+            pinnedCount={pins.length}
+          />
           {pinError && (
             <span className="text-[10px] uppercase tracking-[0.2em] text-[#d68b8b]">
               {pinError}
@@ -1345,9 +1401,13 @@ function LiveDot({
 
 function WsStatusPill({
   status,
+  runtime,
+  lastRuntimeSuccessAt,
   pinnedCount,
 }: {
   status: LiqWsStatus | null;
+  runtime: RuntimeState | null;
+  lastRuntimeSuccessAt: number | null;
   pinnedCount: number;
 }) {
   if (!status) {
@@ -1361,14 +1421,47 @@ function WsStatusPill({
   const ageSec = status.last_message_at ? now - status.last_message_at : null;
   const isStale = ageSec != null && ageSec > 10;
   const lastUpdatedAge = status.updated_at ? now - status.updated_at : null;
-  // If the worker hasn't written status in 30s, treat the worker as down.
-  const workerDead = lastUpdatedAge == null || lastUpdatedAge > 30;
+  // The worker hasn't written the ws_status row in 30s. On its own this only
+  // means the status-write/WS path lagged (scheduler starvation, WS reconnect
+  // churn, DB load) — it is NOT proof the worker is down. We confirm against the
+  // independent collection-health signal (runtime-state) before asserting an
+  // outage, because credible_depth / value-path keep flowing through such lags.
+  const statusStale = lastUpdatedAge == null || lastUpdatedAge > 30;
+
+  // The runtime-state health gate is trustworthy only if we have a snapshot AND
+  // a recent successful poll (within the grace window). A single missed poll
+  // keeps the last-known snapshot usable; sustained failure makes the gate blind.
+  const runtimeAgeMs =
+    lastRuntimeSuccessAt != null ? Date.now() - lastRuntimeSuccessAt : null;
+  const gateUsable =
+    runtime != null && runtimeAgeMs != null && runtimeAgeMs <= RUNTIME_GRACE_MS;
+
+  // Collection is confirmed unhealthy only when a usable gate positively says so:
+  // value-path broken, OR fewer subscriptions than baseline symbols.
+  const baselineCount = runtime?.baseline?.length ?? 0;
+  const subs = runtime?.subscribed_count ?? null;
+  const collectionUnhealthy =
+    gateUsable &&
+    (runtime!.value_path.ok === false ||
+      (subs != null && baselineCount > 0 && subs < baselineCount));
 
   let color = "#7d7d7d";
   let label = "OFFLINE";
-  if (workerDead) {
+  if (statusStale && collectionUnhealthy) {
+    // ws_status stale AND collection path confirmed broken → real worker outage.
     color = "#d68b8b";
     label = "WORKER DOWN";
+  } else if (statusStale && !gateUsable) {
+    // ws_status stale AND the health gate itself is unreachable beyond grace →
+    // we cannot confirm collection health. Distinct grey-red so the operator can
+    // tell "blind gate" apart from a confirmed WORKER DOWN.
+    color = "#a06b6b";
+    label = "HEALTH UNKNOWN";
+  } else if (statusStale) {
+    // ws_status write lagging but collection healthy (or last-known healthy
+    // within grace) → soft warning, not an outage claim.
+    color = "#c89a3a";
+    label = "WS LAG";
   } else if (!status.connected) {
     color = "#c89a3a";
     label = "RECONNECTING";
@@ -1385,12 +1478,18 @@ function WsStatusPill({
       className="inline-flex items-center gap-1.5 rounded-md border border-border/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em]"
       title={
         `conn #${status.conn_id} · ${status.subscribed.length} streamed · ${pinnedCount}/${PIN_CAP} pinned` +
-        (ageSec != null ? ` · last frame ${ageSec.toFixed(1)}s ago` : "")
+        (ageSec != null ? ` · last frame ${ageSec.toFixed(1)}s ago` : "") +
+        (lastUpdatedAge != null ? ` · status write ${lastUpdatedAge.toFixed(1)}s ago` : "") +
+        (gateUsable
+          ? ` · value-path ${runtime!.value_path.ok ? "ok" : "broken"}`
+          : ` · health gate unreachable${
+              runtimeAgeMs != null ? ` (${(runtimeAgeMs / 1000).toFixed(0)}s stale)` : ""
+            }`)
       }
     >
       <span
         className="inline-block h-1.5 w-1.5 rounded-full"
-        style={{ background: color, boxShadow: !isStale && status.connected ? `0 0 6px ${color}` : undefined }}
+        style={{ background: color, boxShadow: label === "LIVE" ? `0 0 6px ${color}` : undefined }}
       />
       <span style={{ color }}>{label}</span>
       <span className="text-muted">
