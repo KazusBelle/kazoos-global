@@ -1,0 +1,13 @@
+[Unit]
+Description=Run kazus host-monitor every 60s (survives reboot, independent of Docker)
+
+[Timer]
+# First check shortly after boot — catches "container did not come back" cases.
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=10s
+Unit=kazus-monitor.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

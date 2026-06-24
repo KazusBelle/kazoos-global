@@ -1,0 +1,15 @@
+[Unit]
+Description=kazus-global host resource & container watchdog (RAM/swap/load/disk/containers -> Telegram)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+Nice=10
+# Cap a single cycle so a hung docker/psql/HTTP call can never pile up across
+# the 60s timer or wedge the monitor.
+TimeoutStartSec=45
+# Independent of the app venv: stdlib-only script, reads creds from project .env.
+# Default action is one --once check cycle, then exit (the timer re-invokes).
+ExecStart=/usr/bin/python3 /home/deploy/workspace/kazus-global/ops/host-monitor/monitor.py --once
