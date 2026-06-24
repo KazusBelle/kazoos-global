@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # Emergency kill-switch for the heavy /research/* analytics endpoints.
+    # Default True (production stays enabled if the env var is absent). When
+    # False, those routes fast-fail 503 without touching the DB — used to shed
+    # the liquidity_samples aggregation load that can saturate the host.
+    research_enabled: bool = True
+
     refresh_interval_sec: int = 300
     server_metrics_interval_sec: int = 60
     server_metrics_retention_hours: int = 24 * 7
