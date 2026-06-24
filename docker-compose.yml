@@ -51,6 +51,11 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-kazus}:${POSTGRES_PASSWORD:-kazus}@db:5432/${POSTGRES_DB:-kazus}
       REFRESH_INTERVAL_SEC: ${REFRESH_INTERVAL_SEC:-300}
+      # Emergency kill-switch for the heavy worker analytics loops (anomaly,
+      # intel-snapshot, investigation autodraft/capture). Default true; set
+      # false to shed the liquidity_samples aggregation load. Core collection
+      # is unaffected.
+      WORKER_RESEARCH_ANALYTICS_ENABLED: ${WORKER_RESEARCH_ANALYTICS_ENABLED:-true}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       ALERT_TIMEFRAMES: ${ALERT_TIMEFRAMES:-D1,H1}

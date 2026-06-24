@@ -695,25 +695,36 @@ async def main() -> None:
     realtime_task = asyncio.create_task(
         realtime_engine.run(stop_event), name="liquidity-realtime"
     )
-    # Phase-12 auto-anomaly recorder — slow loop (5 min) that calls into
-    # research.auto_record_anomalies. Its own cooldowns keep the
-    # liquidity_anomaly_memory table sparse; nothing else needs to be
-    # tuned at this layer.
-    anomaly_task = asyncio.create_task(
-        _anomaly_loop(stop_event), name="liquidity-anomaly-recorder"
-    )
-    intel_snapshot_task = asyncio.create_task(
-        _intel_snapshot_loop(stop_event), name="liquidity-intel-snapshot"
-    )
-    # Phase-18 investigation auto-draft loop — opens draft cases on
-    # PRE_CASCADE genesis verdicts so post-mortem has a starting point.
-    investigation_task = asyncio.create_task(
-        _investigation_autodraft_loop(stop_event), name="investigation-autodraft"
-    )
-    # Integrity Repair Pass: fast-cadence PENDING-capture drain.
-    investigation_capture_task = asyncio.create_task(
-        _investigation_capture_loop(stop_event), name="investigation-capture"
-    )
+    # Heavy worker-side analytics loops (anomaly recorder, intel snapshot,
+    # investigation autodraft/capture). These call into kazus_logic.liquidity.
+    # research and run AVG(value)/percentile_disc aggregations over the 66M-row
+    # liquidity_samples — the worker-side source of the host-CPU saturation.
+    # Gated behind WORKER_RESEARCH_ANALYTICS_ENABLED so they can be shed in an
+    # emergency WITHOUT touching core collection above.
+    if settings.worker_research_analytics_enabled:
+        # Phase-12 auto-anomaly recorder — slow loop (5 min).
+        anomaly_task = asyncio.create_task(
+            _anomaly_loop(stop_event), name="liquidity-anomaly-recorder"
+        )
+        intel_snapshot_task = asyncio.create_task(
+            _intel_snapshot_loop(stop_event), name="liquidity-intel-snapshot"
+        )
+        # Phase-18 investigation auto-draft loop — opens draft cases on
+        # PRE_CASCADE genesis verdicts so post-mortem has a starting point.
+        investigation_task = asyncio.create_task(
+            _investigation_autodraft_loop(stop_event), name="investigation-autodraft"
+        )
+        # Integrity Repair Pass: fast-cadence PENDING-capture drain.
+        investigation_capture_task = asyncio.create_task(
+            _investigation_capture_loop(stop_event), name="investigation-capture"
+        )
+    else:
+        anomaly_task = intel_snapshot_task = investigation_task = investigation_capture_task = None
+        logger.warning(
+            "WORKER_RESEARCH_ANALYTICS_ENABLED=false — heavy research/intelligence "
+            "loops DISABLED (anomaly, intel-snapshot, investigation autodraft/capture). "
+            "Core collection (poller, realtime, watchdog, heartbeat) unaffected."
+        )
     # Day-1 value-based collection watchdog — protects continuity across the
     # long wait; isolated sibling task, exceptions caught, never blocks ingest.
     collection_watchdog_task = asyncio.create_task(
@@ -763,6 +774,8 @@ async def main() -> None:
             first_run = False
     finally:
         for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task, collection_watchdog_task, loop_hb_task):
+            if t is None:
+                continue
             t.cancel()
             try:
                 await t
