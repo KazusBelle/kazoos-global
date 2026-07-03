@@ -63,6 +63,11 @@ TH = {
     "mem_avail_warn_pct": 12.0, "mem_avail_crit_pct": 7.0,
     "swap_warn_pct": 20.0, "swap_crit_pct": 50.0,
     "disk_warn_pct": 88.0, "disk_crit_pct": 93.0,
+    # Absolute free-space floor (matches df "Avail", i.e. space usable by
+    # non-root processes incl. the DB). Gates independently of used% so a nearly
+    # full disk pages BEFORE the fs hits 0 — the % check alone under-reports
+    # because it counts the ~5% root-reserved blocks as "not used".
+    "disk_avail_warn_gb": 5.0, "disk_avail_crit_gb": 2.5,
     "inode_warn_pct": 80.0, "inode_crit_pct": 90.0,
     "load_warn": 6.0, "load_crit": 8.0,
     "iowait_warn_pct": 30.0, "iowait_warn_sustain_s": 180,
@@ -198,10 +203,13 @@ def check_host(state: dict, now: float) -> list[Finding]:
 
     du = shutil.disk_usage("/")
     disk_pct = du.used / du.total * 100
-    if disk_pct > TH["disk_crit_pct"]:
-        f.append(Finding("disk", CRITICAL, f"{disk_pct:.1f}%", f">{TH['disk_crit_pct']}%", "host", "disk /"))
-    elif disk_pct > TH["disk_warn_pct"]:
-        f.append(Finding("disk", WARNING, f"{disk_pct:.1f}%", f">{TH['disk_warn_pct']}%", "host", "disk /"))
+    avail_gb = du.free / 1e9  # matches df "Avail" (non-root usable space)
+    if disk_pct > TH["disk_crit_pct"] or avail_gb < TH["disk_avail_crit_gb"]:
+        f.append(Finding("disk", CRITICAL, f"{disk_pct:.1f}% ({avail_gb:.1f}G free)",
+                         f">{TH['disk_crit_pct']}% or <{TH['disk_avail_crit_gb']}G", "host", "disk /"))
+    elif disk_pct > TH["disk_warn_pct"] or avail_gb < TH["disk_avail_warn_gb"]:
+        f.append(Finding("disk", WARNING, f"{disk_pct:.1f}% ({avail_gb:.1f}G free)",
+                         f">{TH['disk_warn_pct']}% or <{TH['disk_avail_warn_gb']}G", "host", "disk /"))
 
     try:
         st = os.statvfs("/")
