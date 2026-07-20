@@ -1,0 +1,15 @@
+[Unit]
+Description=Run kazus partition maintainer daily (maintains >=14 days of future daily partitions)
+
+[Timer]
+# Well before the UTC-day rollover so the next day's partition always exists
+# before any row could target it. Runs daily at 12:00 UTC.
+OnCalendar=*-*-* 12:00:00 UTC
+# If the box was off at the scheduled time, run at next boot so runway never
+# silently lapses.
+Persistent=true
+AccuracySec=1m
+Unit=kazus-partition-maintainer.service
+
+[Install]
+WantedBy=timers.target
