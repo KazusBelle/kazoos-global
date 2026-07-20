@@ -35,7 +35,9 @@ logger = logging.getLogger("kazus.liquidity.poller")
 POLL_INTERVAL_S = 60
 TOP_N = 100
 CONCURRENCY = 8       # parallel symbol fetches; 8×(klines+depth) ≈ 16 req/s burst
-RETENTION_DAYS = 35   # keep ~1 month of samples
+RETENTION_DAYS = 14   # keep 2 weeks of raw samples (was 35; reduced 2026-07-20
+                      # to bound disk — one dated partition per UTC day is dropped
+                      # once fully expired; see ops/partition-maintainer)
 
 
 def _rest_metrics_real():
@@ -174,7 +176,15 @@ async def prune_old(db_factory, retention_days: int = RETENTION_DAYS) -> int:
     polling loop on a separate, slower cadence."""
     from kazus_db.models import LiquiditySample
 
-    cutoff_ms = int((time.time() - retention_days * 86400) * 1000)
+    # Floor the cutoff to the UTC day boundary so this row-level DELETE only
+    # ever targets WHOLE expired UTC days — which live entirely in fully-expired
+    # dated partitions that are DROPped by the partition-aware retention. This
+    # keeps prune_old from row-deleting (and bloating) the current straddling
+    # in-window partition. Unix epoch day boundaries are 86400-aligned to UTC
+    # midnight, so `now - now % DAY` is today's 00:00Z without any tz math.
+    _DAY = 86400
+    _today_utc_midnight = time.time() - (time.time() % _DAY)
+    cutoff_ms = int((_today_utc_midnight - retention_days * _DAY) * 1000)
     with db_factory() as db:  # type: Session
         deleted = (
             db.query(LiquiditySample)
