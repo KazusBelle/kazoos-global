@@ -548,6 +548,13 @@ def evaluate_collection_state(
     """Return (state, reasons, metrics). state in {'GREEN','RED'}."""
     from sqlalchemy import text as _t
 
+    # Bound every statement in this watchdog session. Post partition-pruning
+    # fix the credible_depth probe runs in single-digit ms; 15s is a generous
+    # backstop (not an expected duration) so a pathological plan can never run
+    # unbounded, spill temp files to a near-full disk, or block the worker
+    # event loop for minutes — the 2026-07-19 failure mode.
+    db.execute(_t("SET LOCAL statement_timeout = '15s'"))
+
     h = db.execute(_t(
         "SELECT subscribed_count, frames_total, conn_id "
         "FROM liquidity_runtime_health ORDER BY created_at DESC LIMIT 1")).first()
@@ -557,11 +564,11 @@ def evaluate_collection_state(
 
     rows = db.execute(_t(
         "SELECT symbol, "
-        " round((extract(epoch from now())*1000 - max(ts))/1000.0,1) AS age_s, "
+        " round(((extract(epoch from now())*1000)::bigint - max(ts))/1000.0,1) AS age_s, "
         " count(DISTINCT value) AS dv, count(value) AS nonnull "
         "FROM liquidity_samples "
         "WHERE metric='credible_depth' AND symbol = ANY(:syms) "
-        "  AND ts > (extract(epoch from now()) - :win)*1000 "
+        "  AND ts > (extract(epoch from now())*1000)::bigint - (:win * 1000) "
         "GROUP BY symbol"), {"syms": list(baseline), "win": stall_threshold_s}).all()
     by_sym = {r[0]: (float(r[1]), int(r[2]), int(r[3])) for r in rows}
 
