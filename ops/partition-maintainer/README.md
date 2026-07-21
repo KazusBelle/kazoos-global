@@ -15,13 +15,31 @@ disk. This maintainer prevents a recurrence.
 
 ## What it does (and never does)
 
-- Creates missing daily partitions for **today+1 .. today+`RUNWAY_DAYS`** (14).
-- Idempotent — existing partitions are skipped, never recreated.
+- **Creates** missing daily partitions for **today+1 .. today+`RUNWAY_DAYS`** (14).
+- **Enforces retention** (`--enforce-retention`): DROPs dated partitions whose
+  upper bound is `<= today_utc_midnight − RETENTION_DAYS` (14), oldest first, one
+  autocommit txn each, bounded locks, **never `CASCADE`**. The UTC-day-floored
+  cutoff matches `poller.prune_old`, so the two agree and the dropper only ever
+  removes WHOLE expired days.
+- Idempotent — existing partitions are skipped, expired ones dropped once.
 - Every DDL session sets `lock_timeout` + `statement_timeout` so it can never
   block the collection insert path for long, nor spill onto a full disk.
-- **Never** moves, deletes, copies, detaches, drops, vacuums, or alters any row
-  or existing partition — `default` included. Draining `default` is a separate,
-  human-approved operation.
+- **Never** touches `liquidity_samples_default`, future partitions, the current
+  straddling partition, or any non-`liquidity_samples_pYYYYMMDD` table — a name
+  regex is the hard guard. It never moves/copies/vacuums rows. Draining `default`
+  is a separate, human-approved operation.
+
+## Modes
+
+| Command | Action |
+|---|---|
+| _(no flag)_ | create missing future partitions |
+| `--enforce-retention` | DROP fully-expired dated partitions |
+| `--check` | report health; exit 2 if unhealthy |
+| `--daily` | create → enforce-retention → check (the timer entrypoint) |
+
+Modifiers: `--dry-run` (create/enforce/daily — prints actions, touches nothing),
+`--alert` (check/daily — Telegram on problems).
 
 ### The default-partition trap
 
@@ -34,15 +52,16 @@ overlap error it is logged `SKIPPED_OCCUPIED` and is **not** a hard failure.
 ## Usage
 
 ```bash
-# Preview — touches nothing:
-python3 ops/partition-maintainer/partition_maintainer.py --dry-run
+# Preview the whole daily pass — touches nothing:
+python3 ops/partition-maintainer/partition_maintainer.py --daily --dry-run
 
-# Real pass (what the timer runs):
-python3 ops/partition-maintainer/partition_maintainer.py
+# What the timer runs (create + enforce-retention + check + alert):
+python3 ops/partition-maintainer/partition_maintainer.py --daily --alert
 
-# Health check — exit 2 if runway < 7d or default is still growing:
-python3 ops/partition-maintainer/partition_maintainer.py --check          # print only
-python3 ops/partition-maintainer/partition_maintainer.py --check --alert   # + Telegram
+# Individual modes:
+python3 ops/partition-maintainer/partition_maintainer.py                      # create only
+python3 ops/partition-maintainer/partition_maintainer.py --enforce-retention --dry-run
+python3 ops/partition-maintainer/partition_maintainer.py --check              # health, exit 2 if bad
 ```
 
 ## Install (systemd timer, daily at 12:00 UTC)
@@ -62,16 +81,17 @@ journalctl -u kazus-partition-maintainer.service -n 20 --no-pager
 
 ## Monitoring
 
-The maintainer's `--check` mode is the durable guard (Phase 3 requirement #8):
-it alerts if the contiguous future runway drops below `MIN_RUNWAY_DAYS` (7) or
-if `liquidity_samples_default`'s estimated row count grows materially between
-checks (a sign routing regressed). It uses `pg_class.reltuples` — a catalog
-estimate, no table scan — and stores the previous count in
-`~/.kazus-partition-state.json`.
+`--check` alerts (catalog-only — never scans a table) on:
+- future runway `< MIN_RUNWAY_DAYS` (7);
+- **post-boundary** DEFAULT growth or a **missing current-day partition** — i.e.
+  new writes leaking into DEFAULT (routing regression);
+- fully-expired dated partitions still present (retention not being enforced);
+- disk free below `DISK_WARN_GB` / `DISK_CRIT_GB`.
 
-You can wire `--check --alert` onto the existing 60s host-monitor cadence, or
-add a second daily timer, or fold an equivalent `check_partitions()` into
-`ops/host-monitor/monitor.py` (which already owns Telegram cooldowns).
+It is **boundary-aware**: before `WRITES_ROUTED_BOUNDARY_MS` (2026-07-21 00:00Z),
+and for the legacy July 14–20 rows aging out of DEFAULT through ~2026-08-04, it
+logs an INFO note and **never pages** — only genuine post-boundary regressions
+alert. Previous DEFAULT row count is stored in `~/.kazus-partition-state.json`.
 
 ## Configuration (env overrides)
 

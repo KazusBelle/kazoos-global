@@ -7,9 +7,10 @@ Wants=docker.service
 Type=oneshot
 User=deploy
 Nice=10
-# One maintenance pass creates any missing future daily partitions and exits.
+# One daily pass: create missing future partitions -> enforce retention (DROP
+# fully-expired dated partitions) -> health check (+ Telegram alert on problems).
 # Cap the whole pass: creating a partition scans the DEFAULT partition under a
 # brief parent lock (~5-15s each here); the script also sets its own psql
 # lock_timeout/statement_timeout. This ceiling is a backstop.
 TimeoutStartSec=600
-ExecStart=/usr/bin/python3 /home/deploy/workspace/kazus-global/ops/partition-maintainer/partition_maintainer.py
+ExecStart=/usr/bin/python3 /home/deploy/workspace/kazus-global/ops/partition-maintainer/partition_maintainer.py --daily --alert
