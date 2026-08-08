@@ -381,152 +381,6 @@ def _due_timeframes(boundary: datetime) -> Set[str]:
     return due
 
 
-_ANOMALY_INTERVAL_S = 300
-_INTEL_SNAPSHOT_INTERVAL_S = 300
-_INVESTIGATION_AUTODRAFT_INTERVAL_S = 300
-# Integrity Repair Pass: PENDING-capture drain runs faster than auto-draft
-# so freshly-created cases get a frozen snapshot within ~30s rather than
-# waiting up to 5 minutes for the autodraft tick.
-_INVESTIGATION_CAPTURE_INTERVAL_S = 30
-
-
-async def _anomaly_loop(stop_event: asyncio.Event) -> None:
-    """Periodically scan recent intelligence layers and auto-record
-    anomalies + genealogy edges. Phase 13 added the auto-linker so
-    each new anomaly is wired into the memory graph the moment it
-    lands."""
-    from kazus_logic.liquidity.research import auto_record_anomalies_with_links
-
-    # Initial delay so the worker isn't fighting the first poll cycle.
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=30.0)
-        return
-    except asyncio.TimeoutError:
-        pass
-    while not stop_event.is_set():
-        try:
-            # Heavy synchronous DB scan (structural_breaks → _interaction_in_window
-            # issues a multi-minute query) — run it in a thread so it cannot block
-            # the event loop / starve realtime ingestion. Session is opened inside
-            # the thread (not shared across threads).
-            def _run():
-                with SessionLocal() as db:
-                    return auto_record_anomalies_with_links(db)
-            result = await asyncio.to_thread(_run)
-            inserted = len(result.get("inserted") or [])
-            edges = len(result.get("edges") or [])
-            if inserted or edges:
-                logger.info("auto-anomaly scan: recorded %d · linked %d edges", inserted, edges)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("auto-anomaly scan failed: %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_ANOMALY_INTERVAL_S)
-            break
-        except asyncio.TimeoutError:
-            continue
-
-
-async def _intel_snapshot_loop(stop_event: asyncio.Event) -> None:
-    """Persist a snapshot of the engine's aggregate state so the
-    evolution timeline + market cycle decomposition have history to
-    plot. Mirrors the anomaly cadence (5 min)."""
-    from kazus_logic.liquidity.research import snapshot_intelligence_history
-
-    # Offset start so the snapshot doesn't fire at the same instant as
-    # the anomaly scan (DB-load smoothing).
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=90.0)
-        return
-    except asyncio.TimeoutError:
-        pass
-    while not stop_event.is_set():
-        try:
-            def _run():
-                with SessionLocal() as db:
-                    return snapshot_intelligence_history(db)
-            row = await asyncio.to_thread(_run)
-            logger.debug("intel snapshot persisted id=%s state=%s", row["id"], row["coordinated_state"])
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("intel snapshot failed: %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_INTEL_SNAPSHOT_INTERVAL_S)
-            break
-        except asyncio.TimeoutError:
-            continue
-
-
-async def _investigation_capture_loop(stop_event: asyncio.Event) -> None:
-    """Integrity Repair Pass: drain the PENDING capture queue on a
-    fast cadence (30s). Decouples case creation from the 8-layer
-    intelligence-surface cascade — case creation is now a single
-    insert, and frozen snapshot lands a few seconds later in the
-    background. Failures are recorded on the case (FAILED status +
-    capture_error); operator can retry via the API."""
-    from kazus_logic.liquidity.research import investigation_capture_pending
-
-    # Brief delay so the first tick doesn't fight the initial cycle.
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=15.0)
-        return
-    except asyncio.TimeoutError:
-        pass
-    while not stop_event.is_set():
-        try:
-            def _run():
-                with SessionLocal() as db:
-                    return investigation_capture_pending(db, limit=20)
-            result = await asyncio.to_thread(_run)
-            if result.get("captured_ids") or result.get("failed_ids"):
-                logger.info(
-                    "investigation capture drained: %d captured · %d failed",
-                    len(result.get("captured_ids") or []),
-                    len(result.get("failed_ids") or []),
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("investigation capture drain failed: %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=_INVESTIGATION_CAPTURE_INTERVAL_S)
-            break
-        except asyncio.TimeoutError:
-            continue
-
-
-async def _investigation_autodraft_loop(stop_event: asyncio.Event) -> None:
-    """Phase-18 auto-draft loop. Polls crisis_genesis and opens a draft
-    investigation case whenever the verdict transitions to PRE_CASCADE
-    on a new probe-composition fingerprint. Idempotent — dedups against
-    any active case with the same fingerprint."""
-    from kazus_logic.liquidity.research import investigation_auto_draft_tick
-
-    # Stagger initial start so this doesn't fight the first poll cycle
-    # or the anomaly/intel snapshots.
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=120.0)
-        return
-    except asyncio.TimeoutError:
-        pass
-    while not stop_event.is_set():
-        try:
-            def _run():
-                with SessionLocal() as db:
-                    return investigation_auto_draft_tick(db)
-            drafted = await asyncio.to_thread(_run)
-            if drafted:
-                logger.info(
-                    "investigation auto-drafted: id=%s title=%s",
-                    drafted.get("id"), drafted.get("title"),
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("investigation autodraft failed: %s", exc)
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(), timeout=_INVESTIGATION_AUTODRAFT_INTERVAL_S,
-            )
-            break
-        except asyncio.TimeoutError:
-            continue
-
-
 # ── Collection watchdog (Day-1) ─────────────────────────────────────────────
 # Value-based continuity guard for realtime collection. It does NOT trust
 # row-recency or frames_total alone — a stall is depth VALUE going stale/frozen
@@ -702,36 +556,6 @@ async def main() -> None:
     realtime_task = asyncio.create_task(
         realtime_engine.run(stop_event), name="liquidity-realtime"
     )
-    # Heavy worker-side analytics loops (anomaly recorder, intel snapshot,
-    # investigation autodraft/capture). These call into kazus_logic.liquidity.
-    # research and run AVG(value)/percentile_disc aggregations over the 66M-row
-    # liquidity_samples — the worker-side source of the host-CPU saturation.
-    # Gated behind WORKER_RESEARCH_ANALYTICS_ENABLED so they can be shed in an
-    # emergency WITHOUT touching core collection above.
-    if settings.worker_research_analytics_enabled:
-        # Phase-12 auto-anomaly recorder — slow loop (5 min).
-        anomaly_task = asyncio.create_task(
-            _anomaly_loop(stop_event), name="liquidity-anomaly-recorder"
-        )
-        intel_snapshot_task = asyncio.create_task(
-            _intel_snapshot_loop(stop_event), name="liquidity-intel-snapshot"
-        )
-        # Phase-18 investigation auto-draft loop — opens draft cases on
-        # PRE_CASCADE genesis verdicts so post-mortem has a starting point.
-        investigation_task = asyncio.create_task(
-            _investigation_autodraft_loop(stop_event), name="investigation-autodraft"
-        )
-        # Integrity Repair Pass: fast-cadence PENDING-capture drain.
-        investigation_capture_task = asyncio.create_task(
-            _investigation_capture_loop(stop_event), name="investigation-capture"
-        )
-    else:
-        anomaly_task = intel_snapshot_task = investigation_task = investigation_capture_task = None
-        logger.warning(
-            "WORKER_RESEARCH_ANALYTICS_ENABLED=false — heavy research/intelligence "
-            "loops DISABLED (anomaly, intel-snapshot, investigation autodraft/capture). "
-            "Core collection (poller, realtime, watchdog, heartbeat) unaffected."
-        )
     # Day-1 value-based collection watchdog — protects continuity across the
     # long wait; isolated sibling task, exceptions caught, never blocks ingest.
     collection_watchdog_task = asyncio.create_task(
@@ -780,7 +604,7 @@ async def main() -> None:
             last_tick = tick
             first_run = False
     finally:
-        for t in (liquidity_task, realtime_task, anomaly_task, intel_snapshot_task, investigation_task, investigation_capture_task, collection_watchdog_task, loop_hb_task):
+        for t in (liquidity_task, realtime_task, collection_watchdog_task, loop_hb_task):
             if t is None:
                 continue
             t.cancel()

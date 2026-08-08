@@ -14,13 +14,6 @@ class WorkerSettings(BaseSettings):
     # candle before we fetch. Kept small — must stay well under a minute.
     close_check_delay_sec: int = 10
     refresh_interval_sec: int = 300  # retained for config compatibility
-    # Emergency kill-switch for the heavy worker-side analytics loops
-    # (anomaly recorder, intel snapshot, investigation autodraft/capture) that
-    # run AVG(value)/percentile_disc aggregations over liquidity_samples and can
-    # pin the host CPU. Default True (normal behavior). False => those loops are
-    # not started; CORE collection (poller, realtime engine, watchdog,
-    # heartbeat) is unaffected.
-    worker_research_analytics_enabled: bool = True
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     alert_timeframes: str = "D1,H1,H1-M5"  # comma-separated

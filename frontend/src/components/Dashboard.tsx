@@ -25,16 +25,8 @@ import {
   type ChartInterval,
   type ChartTheme,
 } from "./CandleChart";
-import { Coordination } from "./Coordination";
-import { Discovery } from "./Discovery";
-import { Investigations } from "./Investigations";
 import { Liquidity } from "./Liquidity";
-import { MemoryPage } from "./Memory";
-import { Meta } from "./Meta";
-import { Operations } from "./Operations";
-import { Research } from "./Research";
 import { ServerHealth } from "./ServerHealth";
-import { Strategy } from "./Strategy";
 import { ScreenerTable } from "./ScreenerTable";
 import { normalizeSymbol, SymbolSuggestInput } from "./SymbolSuggestInput";
 import { TDA } from "./TDA";
@@ -63,7 +55,13 @@ const CHART_HEIGHT_MAX = 560;
 const CHART_HEIGHT_DEFAULT = 380;
 
 type Density = "cozy" | "compact";
-type Page = "ote" | "tda" | "liq" | "research" | "ops" | "strat" | "meta" | "coord" | "mem" | "disc" | "inv" | "server";
+type Page = "ote" | "tda" | "liq" | "server";
+
+const PAGES: readonly Page[] = ["ote", "tda", "liq", "server"] as const;
+
+function isPage(v: string | null): v is Page {
+  return v !== null && (PAGES as readonly string[]).includes(v);
+}
 
 function displayName(symbol: string) {
   let s = symbol.replace(/USDT$/, "");
@@ -87,133 +85,6 @@ function FibIcon({ size = 20 }: { size?: number }) {
   );
 }
 
-function DiscoveryIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <circle cx="10" cy="10" r="6" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M10 4v2M10 14v2M4 10h2M14 10h2M5.8 5.8l1.4 1.4M12.8 12.8l1.4 1.4M5.8 14.2l1.4-1.4M12.8 7.2l1.4-1.4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-      <circle cx="10" cy="10" r="1.6" fill="currentColor" />
-    </svg>
-  );
-}
-
-function InvestigationIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <rect x="3" y="3" width="11" height="14" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M6 7h5M6 10h5M6 13h3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-      <circle cx="15" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M17 16.5l1.5 1.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function MemoryIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <circle cx="4" cy="4" r="1.5" fill="currentColor" />
-      <circle cx="10" cy="6" r="1.5" fill="currentColor" />
-      <circle cx="16" cy="4" r="1.5" fill="currentColor" />
-      <circle cx="6" cy="13" r="1.5" fill="currentColor" />
-      <circle cx="14" cy="14" r="1.5" fill="currentColor" />
-      <circle cx="10" cy="17" r="1.5" fill="currentColor" />
-      <path d="M4 4L10 6L16 4M10 6L6 13L14 14L10 17L6 13" stroke="currentColor" strokeWidth="0.8" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function CoordIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <circle cx="10" cy="10" r="2" fill="currentColor" />
-      <circle cx="4" cy="5" r="1.5" stroke="currentColor" strokeWidth="1.2" />
-      <circle cx="16" cy="5" r="1.5" stroke="currentColor" strokeWidth="1.2" />
-      <circle cx="4" cy="15" r="1.5" stroke="currentColor" strokeWidth="1.2" />
-      <circle cx="16" cy="15" r="1.5" stroke="currentColor" strokeWidth="1.2" />
-      <path d="M5 6L9 9M15 6L11 9M5 14L9 11M15 14L11 11" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function MetaIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <circle cx="10" cy="10" r="7" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="10" cy="10" r="3" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M10 1.5v4M10 14.5v4M1.5 10h4M14.5 10h4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function StratIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <path d="M3 17l4-8 3 5 4-10 3 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="14" cy="4" r="2.4" stroke="currentColor" strokeWidth="1.4" />
-    </svg>
-  );
-}
-
-function OpsIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <path d="M3 14l3-4 3 2 4-6 4 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="6" cy="10" r="1.2" fill="currentColor" />
-      <circle cx="13" cy="6" r="1.2" fill="currentColor" />
-      <circle cx="17" cy="11" r="1.2" fill="currentColor" />
-    </svg>
-  );
-}
-
 function ServerIcon({ size = 20 }: { size?: number }) {
   return (
     <svg
@@ -227,23 +98,6 @@ function ServerIcon({ size = 20 }: { size?: number }) {
       <rect x="3" y="4" width="14" height="5" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
       <rect x="3" y="11" width="14" height="5" rx="1.4" stroke="currentColor" strokeWidth="1.5" />
       <path d="M6 6.5h.01M6 13.5h.01M9 6.5h5M9 13.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function ResearchIcon({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <circle cx="8.5" cy="8.5" r="5" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M13 13l4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M6 8.5h5M8.5 6v5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1196,9 +1050,13 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     () => localStorage.getItem(SIDEBAR_KEY) === "1"
   );
   const [swapped, setSwapped] = useState(() => localStorage.getItem(SWAPPED_KEY) === "1");
-  const [page, setPageState] = useState<Page>(
-    () => (localStorage.getItem(PAGE_KEY) as Page) || "ote"
-  );
+  const [page, setPageState] = useState<Page>(() => {
+    // A stored value can name a page that no longer exists (an operator whose
+    // last session ended on a since-removed tab). Fall back to OTE rather than
+    // rendering an empty main area.
+    const stored = localStorage.getItem(PAGE_KEY);
+    return isPage(stored) ? stored : "ote";
+  });
   const [chartSymbol, setChartSymbolState] = useState<string | null>(
     () => localStorage.getItem(CHART_SYMBOL_KEY)
   );
@@ -1241,46 +1099,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     setPageState(page);
     localStorage.setItem(PAGE_KEY, page);
   }
-
-  // Cross-component navigation: the INV panel dispatches
-  // kazus:open-replay with {symbol, anchor_ms, window_*} when the user
-  // clicks the case-header "replay" button. Switch to the Liquidity
-  // page and stash the request in sessionStorage so the Liquidity page
-  // picks it up on mount.
-  useEffect(() => {
-    const handler = (ev: Event) => {
-      const detail = (ev as CustomEvent<any>).detail;
-      if (!detail) return;
-      try {
-        sessionStorage.setItem("kazus_replay_request", JSON.stringify(detail));
-      } catch { /* ignore */ }
-      setPage("liq");
-    };
-    window.addEventListener("kazus:open-replay", handler as EventListener);
-    return () => window.removeEventListener("kazus:open-replay", handler as EventListener);
-  }, []);
-
-  // Maintenance Pass §1 — queue ↔ investigation continuity.
-  // Discovery's operator-queue row dispatches `kazus:open-investigation`
-  // when the operator opens (or de-dups onto) a case. Switch to the INV
-  // page so the Investigations panel — which separately listens for the
-  // same event to select the case — actually becomes visible.
-  useEffect(() => {
-    const handler = () => setPage("inv");
-    window.addEventListener("kazus:open-investigation", handler);
-    return () => window.removeEventListener("kazus:open-investigation", handler);
-  }, []);
-
-  // Reverse direction: the Investigations EvidencePanel dispatches
-  // `kazus:open-priority` when the operator wants to jump from a linked
-  // operator_priority evidence row back to the queue. We just navigate
-  // to DISC — the priority key is included in the detail for future use
-  // (no auto-scroll today; the queue is short).
-  useEffect(() => {
-    const handler = () => setPage("disc");
-    window.addEventListener("kazus:open-priority", handler);
-    return () => window.removeEventListener("kazus:open-priority", handler);
-  }, []);
 
   function setChartSymbol(
     symbol: string | null,
@@ -1541,70 +1359,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onClick={() => setPage("liq")}
             title="Liquidity Screener"
           />
-          <NavBtn
-            active={page === "research"}
-            open={sidebarOpen}
-            icon={<ResearchIcon size={20} />}
-            label="RSRCH"
-            onClick={() => setPage("research")}
-            title="Research · Calibration · Validation"
-          />
-          <NavBtn
-            active={page === "ops"}
-            open={sidebarOpen}
-            icon={<OpsIcon size={20} />}
-            label="OPS"
-            onClick={() => setPage("ops")}
-            title="Operational Intelligence · Risk · Reliability"
-          />
-          <NavBtn
-            active={page === "strat"}
-            open={sidebarOpen}
-            icon={<StratIcon size={20} />}
-            label="STRAT"
-            onClick={() => setPage("strat")}
-            title="Strategic Intelligence · Structural Shifts · Adaptation"
-          />
-          <NavBtn
-            active={page === "meta"}
-            open={sidebarOpen}
-            icon={<MetaIcon size={20} />}
-            label="META"
-            onClick={() => setPage("meta")}
-            title="Self-Calibration · Anomaly Memory · Meta-Health"
-          />
-          <NavBtn
-            active={page === "coord"}
-            open={sidebarOpen}
-            icon={<CoordIcon size={20} />}
-            label="COORD"
-            onClick={() => setPage("coord")}
-            title="Coordination · Synthesis · Multi-Horizon"
-          />
-          <NavBtn
-            active={page === "mem"}
-            open={sidebarOpen}
-            icon={<MemoryIcon size={20} />}
-            label="MEM"
-            onClick={() => setPage("mem")}
-            title="Memory · Genealogy · Evolution · Cycles"
-          />
-          <NavBtn
-            active={page === "disc"}
-            open={sidebarOpen}
-            icon={<DiscoveryIcon size={20} />}
-            label="DISC"
-            onClick={() => setPage("disc")}
-            title="Discovery · Patterns · Archetypes · Hidden Regimes"
-          />
-          <NavBtn
-            active={page === "inv"}
-            open={sidebarOpen}
-            icon={<InvestigationIcon size={20} />}
-            label="INV"
-            onClick={() => setPage("inv")}
-            title="Investigations · Casework · Evidence · Notes"
-          />
         </div>
 
         {/* Nav bottom */}
@@ -1804,22 +1558,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
         {page === "liq" && <Liquidity />}
 
-        {page === "research" && <Research />}
-
-        {page === "ops" && <Operations />}
-
         {page === "server" && <ServerHealth />}
-
-        {page === "strat" && <Strategy />}
-
-        {page === "meta" && <Meta />}
-
-        {page === "coord" && <Coordination />}
-
-        {page === "mem" && <MemoryPage />}
-
-        {page === "disc" && <Discovery />}
-        {page === "inv" && <Investigations />}
       </main>
 
       {/* ── Chart Modal ── */}

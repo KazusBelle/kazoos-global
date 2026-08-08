@@ -31,7 +31,6 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-globalocal}
       DEFAULT_COINS: ${DEFAULT_COINS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT}
       CORS_ORIGINS: ${CORS_ORIGINS:-["*"]}
-      RESEARCH_ENABLED: ${RESEARCH_ENABLED:-true}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
 
@@ -51,11 +50,6 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-kazus}:${POSTGRES_PASSWORD:-kazus}@db:5432/${POSTGRES_DB:-kazus}
       REFRESH_INTERVAL_SEC: ${REFRESH_INTERVAL_SEC:-300}
-      # Emergency kill-switch for the heavy worker analytics loops (anomaly,
-      # intel-snapshot, investigation autodraft/capture). Default true; set
-      # false to shed the liquidity_samples aggregation load. Core collection
-      # is unaffected.
-      WORKER_RESEARCH_ANALYTICS_ENABLED: ${WORKER_RESEARCH_ANALYTICS_ENABLED:-true}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       ALERT_TIMEFRAMES: ${ALERT_TIMEFRAMES:-D1,H1}
@@ -75,6 +69,12 @@ services:
       WATCHDOG_STALL_THRESHOLD_SECONDS: ${WATCHDOG_STALL_THRESHOLD_SECONDS:-900}
       WATCHDOG_CONN_STORM: ${WATCHDOG_CONN_STORM:-12}
 
+  # User-facing traffic is served by the pm2-managed `kazus-frontend` vite
+  # process on the host (port 8080), not by this container. The container is
+  # kept because the worker's Playwright chart renderer navigates to
+  # http://frontend/chart-export over the compose network to produce the
+  # images attached to Telegram alerts. Host port 8080 is deliberately NOT
+  # mapped here — pm2 owns it, and mapping it made `docker compose up` fail.
   frontend:
     build:
       context: .
@@ -84,7 +84,6 @@ services:
       - backend
     ports:
       - "${FRONTEND_HTTP_PORT:-80}:80"
-      - "${FRONTEND_PORT:-8080}:80"
 
 volumes:
   pgdata:

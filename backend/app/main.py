@@ -4,7 +4,6 @@ import time
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from .api import auth, chart, coins, dashboard, frontend_logs, liquidity, system, tda
 from .core.config import get_settings
@@ -41,24 +40,6 @@ def create_app() -> FastAPI:
     # injection, no response mutation, no UI exposure. Used to gather
     # cold/warm timings before any optimization is attempted.
     liq_prefix = f"{settings.api_prefix}/liquidity"
-    research_prefix = f"{liq_prefix}/research/"
-
-    @app.middleware("http")
-    async def _research_killswitch(request: Request, call_next):
-        # Emergency load-shed: when RESEARCH_ENABLED=false, the heavy
-        # /api/liquidity/research/* aggregations over the 66M-row
-        # liquidity_samples are refused *here* — before any DB dependency or
-        # SQL runs — so they cannot pile up and pin the host CPU. Re-reads
-        # settings each request so a flag flip needs no restart of this guard
-        # itself. LIQ live paths (runtime-state, ws/status, top, snapshot) and
-        # everything else are untouched.
-        if not get_settings().research_enabled and research_prefix in request.url.path:
-            return JSONResponse(
-                status_code=503,
-                content={"detail": "Research analytics temporarily disabled for system protection."},
-                headers={"Retry-After": "3600"},
-            )
-        return await call_next(request)
 
     @app.middleware("http")
     async def _liquidity_timing(request: Request, call_next):
