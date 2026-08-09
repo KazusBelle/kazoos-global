@@ -13,13 +13,16 @@ never become a load source.
 
 ## What it checks (one cycle / 60s)
 
-**Host:** RAM (by `MemAvailable`, not cache-inflated "used%"), swap, disk `/`,
-inodes `/`, load (1-min), CPU busy % and iowait % (from `/proc/stat` deltas,
-sustained windows).
+**Host:** RAM (by `MemAvailable`, not cache-inflated "used%"), actionable
+memory pressure (PSI and sustained active swap I/O), kernel OOM evidence, disk
+`/`, inodes `/`, load (1-min), CPU busy % and iowait % (from `/proc/stat`
+deltas, sustained windows). Static swap occupancy remains diagnostic state and
+does not alert by itself.
 
 **Docker/containers:** daemon reachable; `frontend/backend/worker/db` status +
 health + restart-count; db container CPU (targeted `docker stats`, sustained).
-Any key container down/unhealthy, or a restart-count increase, is CRITICAL.
+Any key container down/unhealthy, a restart-count increase, or `OOMKilled=true`
+is CRITICAL.
 
 **HTTP/API:** `/healthz`, `/api/liquidity/runtime-state`, `/ws/status`,
 `/top?limit=100`. 3 consecutive failures on a probe = CRITICAL (single blips are
@@ -38,7 +41,8 @@ stale (sustained) = CRITICAL.
 | Signal | WARNING | CRITICAL |
 |---|---|---|
 | RAM available | <12% | <7% |
-| Swap used | >20% | >50% |
+| Memory PSI avg10 | `some` >=10% sust 3m | `full` >=10% sust 2m |
+| Active swap I/O | RAM available <20% sust 3m | — |
 | Disk `/` | >88% | >93% |
 | Inodes `/` | >80% | >90% |
 | Load (1m) | >6 | >8 |
@@ -55,8 +59,13 @@ stale (sustained) = CRITICAL.
 | container down/unhealthy / restart++ | — | critical |
 
 Tune in the `TH` dict at the top of `monitor.py` (or override paths via
-`KAZUS_*` env vars). Cooldowns: WARNING 30 min/key, CRITICAL 10 min/key;
-RECOVERY sent once after a key is OK for 5 min. State: `~/.kazus-monitor-state.json`.
+`KAZUS_*` env vars). Alerts are transition-based: once when a key first enters
+WARNING/CRITICAL, once on a material severity escalation, and no reminder while
+the same state persists. RECOVERY is sent once after a key is OK for 5 min.
+An alert or recovery whose Telegram delivery actually fails is retried at most
+once per 10 minutes until one delivery succeeds.
+State is atomically replaced at `~/.kazus-monitor-state.json`, so a full disk
+cannot truncate the last good deduplication state.
 
 ## Run it
 
@@ -64,7 +73,7 @@ RECOVERY sent once after a key is OK for 5 min. State: `~/.kazus-monitor-state.j
 # Evaluate everything, print structured results. No Telegram, no state write.
 python3 ops/host-monitor/monitor.py --dry-run
 
-# One production-like cycle (reads/writes state, sends if thresholds+cooldowns require).
+# One production-like cycle (reads/writes state, sends on state transitions).
 python3 ops/host-monitor/monitor.py --once          # (also the default with no flag)
 
 # Channel tests (ignore cooldowns, no heavy checks):
@@ -93,11 +102,10 @@ tail -f ~/.kazus-monitor.log                           # cron-bridge log
 
 ## Troubleshooting
 
-- **Alert storm:** raise the offending threshold in `TH` (or widen its sustained
-  window) and/or lengthen cooldowns (`WARN_COOLDOWN_S` / `CRIT_COOLDOWN_S`). To
-  silence chronic-but-known warnings (e.g. `SCHEDULER_STARVATION`, elevated swap
-  during recovery), bump that specific threshold. As a blunt stop, `sudo
-  systemctl stop kazus-monitor.timer`.
+- **Alert storm:** inspect `~/.kazus-monitor-state.json` and recent service logs;
+  repeated identical Telegram alerts indicate state is not being preserved.
+  Static swap occupancy and known `SCHEDULER_STARVATION` do not page by
+  themselves. As a blunt stop, `sudo systemctl stop kazus-monitor.timer`.
 - **Monitor silent (no alerts when expected):** run `--dry-run` to see evaluated
   state; check `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are set in `.env`
   (`--force-warn` tests the channel); check the timer is active
