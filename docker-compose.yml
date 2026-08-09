@@ -1,7 +1,19 @@
+# Docker's json-file driver keeps container logs forever unless told otherwise.
+# Left at the default, the worker alone writes ~56 MB/day with nothing to cap
+# it — a standing contributor to the disk exhaustion that stopped liquidity
+# collection for eight days (2026-07-31 → 08-08). 50m × 3 files bounds every
+# container at 150 MB and rotates in place.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-kazus}
       POSTGRES_USER: ${POSTGRES_USER:-kazus}
@@ -21,6 +33,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
@@ -39,6 +52,7 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
@@ -80,6 +94,7 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - backend
     ports:
