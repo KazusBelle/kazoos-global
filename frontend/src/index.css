@@ -768,13 +768,19 @@ body {
      высоты, то есть его низ на 10px выше нижней рамки — отсюда -10px. */
   bottom: -10px;
   transform: translateX(-50%);
-  width: 56px;
+  width: 73px;
   height: 2px;
   border-radius: 2px;
   background: #E3822D;
 }
 
+/* Пиксельный замер отрисованной плашки: чернила монеты лежат в 21…31 (центр
+   26.0), чернила стрелок в 25…31 (центры 28.0 и 28.5) — знак "‹" сидит на
+   базовой линии ниже, чем прописные буквы. Поднимаем на измеренные 2px.
+   Через top, а не transform: transform принадлежит kzArrowSwap и затёр бы. */
 .coinNav5 .arrow {
+  position: relative;
+  top: -2px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
