@@ -646,7 +646,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-9 w-[23px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Previous coin"
             >
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
@@ -667,19 +667,19 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[106px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[64px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
             >
               {nearPrevLabel}
             </button>
-            <span className="currentCoin kz-coin-active h-[30px] w-[132px] justify-self-center truncate">
+            <span className="currentCoin kz-coin-active h-[30px] w-[79px] justify-self-center truncate">
               {currentLabel}
             </span>
             <button
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[106px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[64px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearNextLabel ? `${nearNextLabel} →` : ""}
             >
               {nearNextLabel}
@@ -697,7 +697,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-9 w-[23px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Next coin"
             >
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">

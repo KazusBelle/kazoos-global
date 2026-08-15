@@ -430,7 +430,7 @@ body {
   grid-template-columns: 90px 32px 120px 32px 90px;
   align-items: center;
   justify-items: center;
-  column-gap: 10px;
+  column-gap: 6px;
   height: 60px;
   line-height: 1;
   perspective: 900px;
@@ -460,7 +460,8 @@ body {
      текст — так активная монета читается ярче соседних, а акцент не спорит с
      оранжевыми элементами тулбара. */
   color: #ffffff;
-  font-size: 15px;
+  /* Ровно +20% к кеглю соседних монет (13px). */
+  font-size: 15.6px;
   font-weight: 700;
   letter-spacing: 0.14em;
   line-height: 1;
@@ -678,19 +679,19 @@ body {
   top: 50%;
   transform: translate3d(-50%, -50%, 0);
   display: grid;
-  grid-template-columns: 38px 96px 106px 132px 106px 96px 38px;
+  grid-template-columns: 23px 58px 64px 79px 64px 58px 23px;
   align-items: center;
   justify-items: center;
   place-items: center;
-  column-gap: 10px;
+  column-gap: 6px;
   /* Ширина считается по содержимому, а не задаётся числом. Раньше здесь стояло
      фиксированное значение, которое приходилось пересчитывать вручную при каждой
      правке колонок — и после очередной оно разошлось на 34px, из-за чего правую
      стрелку выдавливало за скруглённую границу плашки. max-content исключает
      этот класс ошибок целиком. */
   width: max-content;
-  height: 52px;
-  padding: 0 14px;
+  height: 62px;
+  padding: 0 8px;
   border: 1px solid #262932;
   border-radius: 16px;
   background: #15171d;
@@ -747,7 +748,8 @@ body {
 .coinNav5 .currentCoin {
   position: relative;
   color: #ffffff;
-  font-size: 15px;
+  /* Ровно +20% к кеглю соседних монет (13px). */
+  font-size: 15.6px;
   font-weight: 700;
   letter-spacing: 0.14em;
   line-height: 1;
@@ -766,7 +768,7 @@ body {
   left: 50%;
   /* В самый низ плашки. Блок активной монеты 30px по центру 50px внутренней
      высоты, то есть его низ на 10px выше нижней рамки — отсюда -10px. */
-  bottom: -10px;
+  bottom: -15px;
   /* Сдвиг на пол-интервала влево. letter-spacing добавляет пробел ПОСЛЕ
      последней буквы, поэтому чернила надписи смещены влево относительно её
      бокса — замер дал 349.8 против 350.8. Полоска центрируется по боксу, и без
@@ -786,10 +788,9 @@ body {
    line-height, ни компенсирующий top больше не нужны. */
 .coinNav5 .arrow {
   position: relative;
-  /* Замер отрисованной плашки при трёхкратном рендере: габариты шеврона дают
-     центр 26.167, габариты прописных букв — 27.0. Разница 0.83px: у букв есть
-     небольшой выносной элемент вниз, у шеврона нет. Опускаем на измеренное. */
-  top: 0.83px;
+  /* Пересчитано после того, как кегль центральной монеты вырос до 15.6px:
+     замер показал стрелки на 1.5px НИЖЕ надписи, прежние +0.83px стали лишними. */
+  top: -0.67px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
