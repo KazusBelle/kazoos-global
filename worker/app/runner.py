@@ -409,9 +409,13 @@ def evaluate_collection_state(
     # event loop for minutes — the 2026-07-19 failure mode.
     db.execute(_t("SET LOCAL statement_timeout = '15s'"))
 
+    # ORDER BY id, not created_at. Rows are append-only so the newest id IS the
+    # newest row, but only id carries an index — ordering by created_at forced a
+    # parallel scan of the whole table, ~99ms and 93MB off disk every 60s poll.
+    # By id it is an index scan on the primary key: 0.2ms. Same row either way.
     h = db.execute(_t(
         "SELECT subscribed_count, frames_total, conn_id "
-        "FROM liquidity_runtime_health ORDER BY created_at DESC LIMIT 1")).first()
+        "FROM liquidity_runtime_health ORDER BY id DESC LIMIT 1")).first()
     subscribed = int(h[0]) if h and h[0] is not None else 0
     frames = int(h[1]) if h and h[1] is not None else 0
     conn = int(h[2]) if h and h[2] is not None else 0

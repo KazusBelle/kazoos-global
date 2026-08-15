@@ -7,22 +7,26 @@ from ..core.config import get_settings
 
 
 _settings = get_settings()
-# Explicit pool config — defaults (5 + 10 overflow, no timeout) were sized
-# for snappy CRUD and starve under heavy research endpoints. Sized for the
-# audit's worst case: ~10 simultaneous Coordination/Discovery tabs each
-# holding one session for the duration of an uncached heavy call.
-#   pool_size=20      base connections held open
-#   max_overflow=20   burst capacity above pool_size
-#   pool_timeout=10   fail fast (10s) instead of stacking client waits
+# Pool sized for what actually runs. The previous 20+20 was chosen for "~10
+# simultaneous Coordination/Discovery tabs each holding a session through an
+# uncached heavy call" — those pages and their endpoints are gone. Measured
+# steady state is 3 checked-out connections, so 5+10 keeps a fivefold margin.
+#   pool_timeout=10   fail fast instead of stacking client waits
 #   pool_recycle=1800 reset connections every 30 min to dodge stale TCP
 #   pool_pre_ping     verify the connection is alive before checkout
+#
+# statement_timeout is set per CONNECTION, not per request. It used to be a
+# `SET LOCAL` inside get_db(), which binds to the open transaction only — so
+# in the seven handlers that commit mid-request every query afterwards ran
+# with no ceiling at all, exactly where a runaway is most likely.
 engine = create_engine(
     _settings.database_url,
     pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=20,
+    pool_size=5,
+    max_overflow=10,
     pool_timeout=10,
     pool_recycle=1800,
+    connect_args={"options": "-c statement_timeout=45s"},
     future=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
@@ -42,16 +46,10 @@ def pool_status() -> dict:
 
 
 def get_db():
+    # statement_timeout now comes from connect_args above, so it holds for the
+    # whole connection and survives commits inside a request.
     db = SessionLocal()
     try:
-        # Hard ceiling per request so a pathological query (e.g. a future
-        # propagation reading 1M+ alerts after a cascade) can't hold the
-        # pool connection forever. 45s leaves headroom above the slowest
-        # uncached call observed (synthesis ≈ 30s) but kills runaways.
-        # SET LOCAL scopes to this session only; closing returns it to
-        # the pool with global defaults restored.
-        from sqlalchemy import text as _text
-        db.execute(_text("SET LOCAL statement_timeout = '45s'"))
         yield db
     finally:
         db.close()

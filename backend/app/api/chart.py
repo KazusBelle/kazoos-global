@@ -18,6 +18,7 @@ from kazus_logic.engine import (
     KazusLocalEngine,
 )
 
+from ..core.cache import TTLCache
 from .deps import get_current_user
 
 router = APIRouter(tags=["chart"])
@@ -198,6 +199,13 @@ def _analyze(
 # chart engine state matches what the screener table shows.
 _INTERVAL_DEFAULT_LIMIT = {"1d": 500, "1h": 900, "15m": 600, "5m": 600}
 
+# 10s: long enough that panning between symbols and re-opening a chart stops
+# generating outbound traffic, short enough that the forming bar still looks
+# live. Every timeframe served here is 1m or slower, so a hit can never be
+# more than a fraction of a bar behind.
+_KLINES_TTL_S = 10.0
+_klines_cache: TTLCache[list] = TTLCache(ttl=_KLINES_TTL_S)
+
 
 @router.get("/chart/{symbol}", response_model=ChartResponse)
 async def get_chart(
@@ -209,8 +217,15 @@ async def get_chart(
     if interval not in ALLOWED_INTERVALS:
         raise HTTPException(status_code=400, detail=f"interval must be one of {sorted(ALLOWED_INTERVALS)}")
     effective_limit = limit if limit is not None else _INTERVAL_DEFAULT_LIMIT.get(interval, 500)
+    sym = symbol.upper()
     try:
-        bars = await _fetch_klines(symbol.upper(), interval, effective_limit)
+        # Cached for _KLINES_TTL_S. The newest bar is still forming, so a hit
+        # can be up to that many seconds behind — invisible on 1h/4h/1d, and
+        # the alternative was an outbound Binance request on every chart open.
+        bars = await _klines_cache.get(
+            f"{sym}:{interval}:{effective_limit}",
+            lambda: _fetch_klines(sym, interval, effective_limit),
+        )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"Binance error: {exc.response.status_code}")
     except Exception as exc:

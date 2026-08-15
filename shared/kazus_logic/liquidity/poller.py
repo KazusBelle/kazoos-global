@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 import httpx
@@ -214,6 +215,16 @@ OPERATOR_HISTORY_RETENTION_DAYS = 90
 OPERATOR_EVENTS_RETENTION_DAYS = 90
 OPERATOR_ACK_RETENTION_DAYS = 180
 
+# Realtime engine tables. Unlike everything above these are NOT slow-growth:
+# the engine appends ~27K rows/hour to each, ~570 MB/day combined, and they
+# were never covered by any retention — a standing path back to the disk
+# exhaustion that stopped collection for eight days (2026-07-31 → 08-08).
+# Their only live reader is the runtime-state status banner, which takes the
+# newest row per table (_latest_age_created_at), so the horizon is a
+# disk-safety choice, not a data-need one. Matched to RETENTION_DAYS so the
+# whole live pipeline expires on a single clock: ~5.8 GB steady state.
+REALTIME_RETENTION_DAYS = RETENTION_DAYS
+
 
 async def prune_research_tables(db_factory) -> Dict[str, int]:
     """Prune the slow-growth research tables. Returns per-table deletion
@@ -227,6 +238,9 @@ async def prune_research_tables(db_factory) -> Dict[str, int]:
         OperatorPriorityHistory,
         OperatorPriorityEvent,
         OperatorAcknowledgement,
+        LiquidityBurst,
+        LiquidityResiliency,
+        LiquidityExecValidation,
     )
 
     now_ms = int(time.time() * 1000)
@@ -242,6 +256,15 @@ async def prune_research_tables(db_factory) -> Dict[str, int]:
         "operator_priority_events":    (OperatorPriorityEvent, "ts_ms",       now_ms - OPERATOR_EVENTS_RETENTION_DAYS * H),
         "operator_acknowledgements":   (OperatorAcknowledgement, "created_at_ms", now_ms - OPERATOR_ACK_RETENTION_DAYS * H),
     }
+    # Realtime tables timestamp with a DateTime `created_at`, not the epoch-ms
+    # columns used above, so their cutoff must be a datetime — handing Postgres
+    # `timestamp < 1786...` would just error out per table and prune nothing.
+    dt_cutoff = datetime.now(timezone.utc) - timedelta(days=REALTIME_RETENTION_DAYS)
+    cutoffs.update({
+        "bursts":          (LiquidityBurst,          "created_at", dt_cutoff),
+        "resiliency":      (LiquidityResiliency,     "created_at", dt_cutoff),
+        "exec_validation": (LiquidityExecValidation, "created_at", dt_cutoff),
+    })
     deleted: Dict[str, int] = {}
     with db_factory() as db:  # type: Session
         for label, (model, ts_col, cutoff) in cutoffs.items():
