@@ -132,22 +132,22 @@ body {
 
 /* Center coin "comes from depth": starts slightly blurred/smaller and snaps
    into crisp focus. */
+/* Появление активной монеты. Прежние значения (scale 0.58 -> 1.14, blur 7px,
+   разъезжающийся межбуквенный интервал, 1800мс) рассчитывались на заголовок в
+   32px. После того как ряд свели к единому кеглю 17px, тот же размах читается
+   как рывок при каждом открытии окна.
+   ВАЖНО: конечный кадр обязан совпадать со статическим состоянием .currentCoin —
+   при fill-mode: both он остаётся на элементе навсегда и перебивает CSS. Именно
+   так молча отменялась оптическая поправка. */
 @keyframes kzCoinSwap {
   0% {
     opacity: 0;
-    transform: translateY(18px) scale(0.58) translateZ(-54px);
-    letter-spacing: 0.28em;
-    filter: blur(7px);
-  }
-  72% {
-    opacity: 1;
-    transform: translateY(0) scale(1.14) translateZ(0);
-    filter: blur(0.35px);
+    transform: translateY(4px) scale(0.96);
+    filter: blur(2px);
   }
   100% {
     opacity: 1;
-    transform: translateY(0) scale(1) translateZ(0);
-    letter-spacing: 0.14em;
+    transform: translateY(0) scale(1);
     filter: blur(0);
   }
 }
@@ -161,22 +161,23 @@ body {
     filter: blur(1.2px);
   }
   100% {
-    opacity: 0.62;
-    transform: translateY(0) scale(0.94) translateZ(-10px);
-    filter: blur(0.16px);
+    /* Совпадает с .sideCoin — иначе анимация навсегда перебивает статику. */
+    opacity: 0.75;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
   }
 }
 
 @keyframes kzArrowSwap {
   0% {
     opacity: 0;
-    transform: translateY(8px) scale(0.76) translateZ(-10px);
-    filter: blur(2px);
+    transform: translateY(3px) scale(0.9);
   }
   100% {
-    opacity: 1;
-    transform: translateY(0) scale(1) translateZ(0);
-    filter: blur(0);
+    /* Совпадает с .arrow — иначе стрелки после анимации оставались бы
+       полностью непрозрачными вместо приглушённых. */
+    opacity: 0.55;
+    transform: translateY(0) scale(1);
   }
 }
 
@@ -288,15 +289,15 @@ body {
 :root[data-motion="on"] .coinNav:not([data-dir]) .kz-coin-active,
 :root[data-motion="on"] .coinNav5[data-dir=""] .kz-coin-active,
 :root[data-motion="on"] .coinNav5:not([data-dir]) .kz-coin-active {
-  animation: kzCoinSwap 1800ms var(--kz-ease-spring) both;
+  animation: kzCoinSwap 380ms var(--kz-ease-spring) both;
 }
 :root[data-motion="on"] .coinNav[data-dir="next"] .kz-coin-active,
 :root[data-motion="on"] .coinNav5[data-dir="next"] .kz-coin-active {
-  animation: kzCoinFromRight 1640ms var(--kz-ease-spring) both;
+  animation: kzCoinFromRight 420ms var(--kz-ease-spring) both;
 }
 :root[data-motion="on"] .coinNav[data-dir="prev"] .kz-coin-active,
 :root[data-motion="on"] .coinNav5[data-dir="prev"] .kz-coin-active {
-  animation: kzCoinFromLeft 1640ms var(--kz-ease-spring) both;
+  animation: kzCoinFromLeft 420ms var(--kz-ease-spring) both;
 }
 
 /* Side coins: slide from the far side when new, fade from center when promoted. */
@@ -320,11 +321,11 @@ body {
 :root[data-motion="on"] .coinNav:not([data-dir]) .kz-coin-side,
 :root[data-motion="on"] .coinNav5[data-dir=""] .kz-coin-side,
 :root[data-motion="on"] .coinNav5:not([data-dir]) .kz-coin-side {
-  animation: kzCoinSideSwap 1640ms var(--kz-ease-out) both;
+  animation: kzCoinSideSwap 420ms var(--kz-ease-out) both;
 }
 
 :root[data-motion="on"] .kz-coin-arrow {
-  animation: kzArrowSwap 1520ms var(--kz-ease-out) both;
+  animation: kzArrowSwap 380ms var(--kz-ease-out) both;
 }
 
 :root[data-motion="on"] .navRow-out-next {
@@ -461,9 +462,9 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  /* Оптическая поправка была рассчитана на кегль 32px; при 17px сдвиг вдвое
-     меньше, иначе строка заметно уезжает вверх относительно соседних монет. */
-  transform: translateY(-1px);
+  /* Поправка через top, а не transform: transform принадлежит анимации
+     появления, и статическое значение затиралось её последним кадром. */
+  top: -1px;
 }
 
 /* Подчёркивание активной монеты — как в референсе. Псевдоэлемент, чтобы не
@@ -615,14 +616,14 @@ body {
    kzSideFrom*: entrance for side coins after navigation.              */
 
 @keyframes kzCoinFromRight {
-  0%   { opacity: 0; transform: translateX(44px) scale(0.82); filter: blur(6px); }
-  60%  { filter: blur(0); transform: translateX(-3px) scale(1.06); }
+  0%   { opacity: 0; transform: translateX(16px) scale(0.96); filter: blur(2px); }
+  60%  { filter: blur(0); transform: translateX(-1px) scale(1.01); }
   100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
 }
 
 @keyframes kzCoinFromLeft {
-  0%   { opacity: 0; transform: translateX(-44px) scale(0.82); filter: blur(6px); }
-  60%  { filter: blur(0); transform: translateX(3px) scale(1.06); }
+  0%   { opacity: 0; transform: translateX(-16px) scale(0.96); filter: blur(2px); }
+  60%  { filter: blur(0); transform: translateX(1px) scale(1.01); }
   100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
 }
 
