@@ -553,7 +553,7 @@ export function CandleChart({
         setStatus("loading");
         setErr(null);
 
-        const { createChart, ColorType, CandlestickSeries, CrosshairMode } = await import("lightweight-charts");
+        const { createChart, ColorType, CandlestickSeries, CrosshairMode, LineStyle } = await import("lightweight-charts");
         const data = await getChartCached(symbol, interval);
         if (destroyed || !containerRef.current) return;
 
@@ -614,15 +614,22 @@ export function CandleChart({
             horzTouchDrag: true,
             vertTouchDrag: true,
           },
+          // Перекрестие: сплошные волосяные линии вместо пунктира по умолчанию —
+          // "ровный прицел". Сам указатель мыши тоже становится крестом, через
+          // cursor: crosshair на контейнере ниже.
           crosshair: {
             mode: CrosshairMode.Normal,
             vertLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
-              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
+              color: theme === "dark" ? "rgba(255,255,255,0.28)" : "rgba(32,32,32,0.28)",
+              width: 1,
+              style: LineStyle.Solid,
+              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.9)" : "rgba(110,110,110,0.9)",
             },
             horzLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
-              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
+              color: theme === "dark" ? "rgba(255,255,255,0.28)" : "rgba(32,32,32,0.28)",
+              width: 1,
+              style: LineStyle.Solid,
+              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.9)" : "rgba(110,110,110,0.9)",
             },
           },
           grid: {
@@ -1563,7 +1570,10 @@ export function CandleChart({
       style={{ height: chartHeight, background: t.bg }}
       data-chart-status={status}
     >
-      <div ref={containerRef} style={{ width: "100%", height: chartHeight }} />
+      <div
+        ref={containerRef}
+        style={{ width: "100%", height: chartHeight, cursor: "crosshair" }}
+      />
       <svg
         ref={overlayRef}
         className="pointer-events-none absolute inset-0"

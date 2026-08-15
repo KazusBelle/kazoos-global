@@ -454,10 +454,13 @@ body {
 .currentCoin {
   position: relative;
   text-align: center;
-  color: #E3822D;
-  font-size: 17px;
+  /* Белая, как в референсе: цвет-акцент несёт полоска под надписью, а не сам
+     текст — так активная монета читается ярче соседних, а акцент не спорит с
+     оранжевыми элементами тулбара. */
+  color: #ffffff;
+  font-size: 15px;
   font-weight: 700;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.14em;
   line-height: 1;
   display: inline-flex;
   align-items: center;
@@ -473,9 +476,9 @@ body {
   content: "";
   position: absolute;
   left: 50%;
-  bottom: -9px;
+  bottom: -8px;
   transform: translateX(-50%);
-  width: 26px;
+  width: 34px;
   height: 2px;
   border-radius: 2px;
   background: #E3822D;
@@ -487,7 +490,7 @@ body {
   opacity: 0.75;
   font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.12em;
   text-align: center;
   color: rgba(255, 255, 255, 0.55);
   transition: color 160ms var(--kz-ease), opacity 160ms var(--kz-ease);
@@ -499,9 +502,11 @@ body {
 }
 
 /* Дальние монеты — ещё тише, чтобы ряд имел глубину и взгляд шёл к центру. */
+/* В референсе весь ряд одного размера; дальние оставлены чуть тише только
+   потому, что они не кликабельны — иначе выглядели бы как рабочие кнопки. */
 .sideCoin-far {
-  opacity: 0.4;
-  font-size: 12px;
+  opacity: 0.45;
+  font-size: 13px;
 }
 
 .arrow {
@@ -670,12 +675,12 @@ body {
   top: 50%;
   transform: translate3d(-50%, -50%, 0);
   display: grid;
-  grid-template-columns: 74px 84px 26px 108px 26px 84px 74px;
+  grid-template-columns: 26px 78px 88px 112px 88px 78px 26px;
   align-items: center;
   justify-items: center;
   place-items: center;
   column-gap: 8px;
-  width: 560px;
+  width: 540px;
   height: 44px;
   padding: 0 10px;
   border: 1px solid #262932;

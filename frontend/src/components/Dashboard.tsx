@@ -638,16 +638,6 @@ function ChartModal({
             key={row.symbol}
             data-dir={navDirRef.current}
           >
-            <span className="sideCoin sideCoin-far truncate" title={farPrevLabel}>{farPrevLabel}</span>
-            <button
-              type="button"
-              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
-              disabled={!prevSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[84px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
-              title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
-            >
-              {nearPrevLabel}
-            </button>
             <button
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
@@ -657,9 +647,29 @@ function ChartModal({
             >
               ‹
             </button>
-            <span className="currentCoin kz-coin-active h-[26px] w-[108px] justify-self-center truncate">
+            <span className="sideCoin sideCoin-far truncate" title={farPrevLabel}>{farPrevLabel}</span>
+            <button
+              type="button"
+              onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
+              disabled={!prevSymbol}
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[88px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
+            >
+              {nearPrevLabel}
+            </button>
+            <span className="currentCoin kz-coin-active h-[26px] w-[112px] justify-self-center truncate">
               {currentLabel}
             </span>
+            <button
+              type="button"
+              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
+              disabled={!nextSymbol}
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[88px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              title={nearNextLabel ? `${nearNextLabel} →` : ""}
+            >
+              {nearNextLabel}
+            </button>
+            <span className="sideCoin sideCoin-far truncate" title={farNextLabel}>{farNextLabel}</span>
             <button
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
@@ -669,16 +679,6 @@ function ChartModal({
             >
               ›
             </button>
-            <button
-              type="button"
-              onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
-              disabled={!nextSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[84px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
-              title={nearNextLabel ? `${nearNextLabel} →` : ""}
-            >
-              {nearNextLabel}
-            </button>
-            <span className="sideCoin sideCoin-far truncate" title={farNextLabel}>{farNextLabel}</span>
           </div>
         </div>
 
