@@ -514,7 +514,11 @@ export function ScreenerTable({
               return (
                 <tr
                   key={row.symbol + title}
-                  className={`border-t border-border/60 hover:bg-white/[0.02] ${
+                  // cursor-pointer на всей строке. Tailwind preflight выдаёт
+                  // палец только элементам button, поэтому курсор превращался в
+                  // стрелку в промежутках между названием монеты, пином и
+                  // кнопками call — палец «моргал» при движении вдоль строки.
+                  className={`border-t border-border/60 cursor-pointer hover:bg-white/[0.02] ${
                     isPinned ? "bg-white/[0.015]" : ""
                   } ${flashBySymbol[row.symbol] ? "kz-row-flash" : ""}`}
                 >

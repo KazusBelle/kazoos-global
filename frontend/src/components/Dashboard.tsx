@@ -1072,7 +1072,14 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
       localStorage.getItem(GLOBAL_EXPANDED_KEY) !== "0" &&
       localStorage.getItem(LOCAL_EXPANDED_KEY) !== "0"
   );
-  const [motionEnabled, setMotionEnabled] = useState<boolean>(true);
+  // Читаем сохранённое значение, как и остальные настройки рядом. Раньше здесь
+  // стояло безусловное true: выбор "motion off" записывался в localStorage, но
+  // при следующей загрузке игнорировался, а эффект ниже тут же перезаписывал
+  // его обратно на "1". Переключатель сбрасывался каждый раз, а вместе с ним
+  // пропадала и подсветка строк по цене — она анимируется только при motion=on.
+  const [motionEnabled, setMotionEnabled] = useState<boolean>(
+    () => localStorage.getItem(MOTION_KEY) !== "0"
+  );
   const lastChartRowRef = useRef<DashboardRow | null>(null);
 
   function changeFontSize(delta: number) {
