@@ -447,34 +447,66 @@ body {
   text-align: center;
 }
 
+/* Активная монета: раньше 32px — крупный заголовок, из-за которого соседние
+   монеты выглядели подписями, а не равноправным рядом. В референсе весь ряд
+   одного кегля, а текущая выделена цветом и подчёркиванием. */
 .currentCoin {
+  position: relative;
   text-align: center;
-  color: #fff;
-  font-size: 32px;
+  color: #E3822D;
+  font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.16em;
   line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  /* Optical correction: cap-height ≈ 0.72em, so glyphs sit ~3px below
-     the geometric center of the em square. Shift up to hit optical center. */
-  transform: translateY(-2px);
+  /* Оптическая поправка была рассчитана на кегль 32px; при 17px сдвиг вдвое
+     меньше, иначе строка заметно уезжает вверх относительно соседних монет. */
+  transform: translateY(-1px);
 }
 
+/* Подчёркивание активной монеты — как в референсе. Псевдоэлемент, чтобы не
+   трогать разметку и не влиять на анимацию перелистывания. */
+.currentCoin::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -9px;
+  transform: translateX(-50%);
+  width: 26px;
+  height: 2px;
+  border-radius: 2px;
+  background: #E3822D;
+}
+
+/* Соседние монеты подтянуты по кеглю к активной — ряд читается как один
+   уровень, а не как заголовок с подписями по бокам. */
 .sideCoin {
-  opacity: 0.6;
-  font-size: 12px;
+  opacity: 0.75;
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.14em;
   text-align: center;
   color: rgba(255, 255, 255, 0.55);
+  transition: color 160ms var(--kz-ease), opacity 160ms var(--kz-ease);
+}
+
+.kz-coin-side:not(:disabled):hover {
+  opacity: 1;
+  color: #ffffff;
+}
+
+/* Дальние монеты — ещё тише, чтобы ряд имел глубину и взгляд шёл к центру. */
+.sideCoin-far {
+  opacity: 0.4;
+  font-size: 12px;
 }
 
 .arrow {
   opacity: 0.55;
   color: rgba(255, 255, 255, 0.55);
-  font-size: 28px;
+  font-size: 20px;
   line-height: 1;
   transition:
     opacity 160ms var(--kz-ease),
@@ -621,25 +653,33 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 48px;
-  height: 48px;
-  border-bottom: 1px solid #2a2a2e;
-  margin-bottom: 8px;
+  min-height: 60px;
+  height: 60px;
+  /* Разделительная линия убрана: плашка монет теперь сама обведена рамкой и
+     служит визуальной границей, две линии подряд смотрелись бы шумно. */
+  margin-bottom: 10px;
 }
 
+/* Плашка монет — скруглённый контейнер с рамкой, как в референсе: одна оправа
+   на всю группу, стрелки и монеты внутри неё. Раньше элементы висели на пустом
+   фоне, и шапка выпадала из общего оформления панелей. */
 .coinNav5 {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate3d(-50%, -50%, 0);
   display: grid;
-  grid-template-columns: 70px 90px 28px 130px 28px 90px 70px;
+  grid-template-columns: 74px 84px 26px 108px 26px 84px 74px;
   align-items: center;
   justify-items: center;
   place-items: center;
-  column-gap: 10px;
-  width: 626px;
-  height: 100%;
+  column-gap: 8px;
+  width: 560px;
+  height: 44px;
+  padding: 0 10px;
+  border: 1px solid #262932;
+  border-radius: 14px;
+  background: #15171d;
   pointer-events: none;
 }
 

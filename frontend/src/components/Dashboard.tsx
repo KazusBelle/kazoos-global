@@ -643,7 +643,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[90px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[84px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
             >
               {nearPrevLabel}
@@ -652,19 +652,19 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav arrow kz-coin-arrow h-7 w-[28px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-7 w-[26px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Previous coin"
             >
               ‹
             </button>
-            <span className="currentCoin kz-coin-active h-[36px] w-[130px] justify-self-center truncate">
+            <span className="currentCoin kz-coin-active h-[26px] w-[108px] justify-self-center truncate">
               {currentLabel}
             </span>
             <button
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav arrow kz-coin-arrow h-7 w-[28px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-7 w-[26px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Next coin"
             >
               ›
@@ -673,7 +673,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[90px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[84px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearNextLabel ? `${nearNextLabel} →` : ""}
             >
               {nearNextLabel}
