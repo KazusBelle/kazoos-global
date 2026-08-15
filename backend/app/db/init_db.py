@@ -349,6 +349,15 @@ _ADDITIVE_MIGRATIONS = [
     "ALTER TABLE investigation_replay_snapshots DROP CONSTRAINT IF EXISTS uq_inv_replay_snapshot_revision",
     "ALTER TABLE investigation_replay_snapshots ADD CONSTRAINT uq_inv_replay_snapshot_revision UNIQUE (investigation_id, revision)",
     "CREATE INDEX IF NOT EXISTS ix_inv_replay_snapshot_case_active ON investigation_replay_snapshots (investigation_id, is_active)",
+    # Оба индекса — под запросы collection watchdog в worker/app/runner.py,
+    # который раз в 60с спрашивает «сколько всплесков за окно» и «какой разброс
+    # conn_id за окно». Существующие индексы на этих таблицах построены по
+    # другим колонкам (symbol+burst_end_ts, ts), поэтому фильтр по created_at
+    # шёл полным перебором: 425мс по 1.4М строк и 61мс соответственно. С
+    # индексами — 3.2мс и 0.3мс, и время перестаёт расти вместе с таблицей.
+    # На живой базе созданы CONCURRENTLY; здесь — для чистой установки.
+    "CREATE INDEX IF NOT EXISTS ix_liq_bursts_created_at ON liquidity_bursts (created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_liq_runtime_health_created_at ON liquidity_runtime_health (created_at)",
 ]
 
 
