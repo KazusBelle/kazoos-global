@@ -16,7 +16,12 @@ class Settings(BaseSettings):
 
     app_name: str = "Kazus Screener"
     api_prefix: str = "/api"
-    cors_origins: List[str] = ["*"]
+    # Empty = no cross-origin access, which is the correct default here: the
+    # frontend calls the API on a RELATIVE path ("/api/..."), and both delivery
+    # paths keep that same-origin — the pm2 vite server proxies /api, and the
+    # nginx container proxy_passes it to backend:8000. No browser request to
+    # this API is ever cross-origin, so there is nothing legitimate to allow.
+    cors_origins: List[str] = []
 
     database_url: str = "postgresql+psycopg://kazus:kazus@db:5432/kazus"
 
@@ -44,7 +49,9 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             s = v.strip()
             if not s:
-                return ["*"]
+                # An unset or blank CORS_ORIGINS must NOT mean "allow every
+                # origin" — a forgotten env var should fail closed, not open.
+                return []
             if s.startswith("["):
                 try:
                     return json.loads(s)

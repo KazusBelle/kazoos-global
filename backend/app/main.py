@@ -1,12 +1,15 @@
 import logging
 import asyncio
 import time
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from .api import auth, chart, coins, dashboard, frontend_logs, liquidity, system, tda
 from .core.config import get_settings
+from .db.base import engine
 from .db.init_db import create_schema, seed_initial_data
 from .services.server_metrics import run_server_metrics_collector
 
@@ -14,14 +17,50 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("kazus.backend")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown. Replaces @app.on_event, deprecated since FastAPI 0.93.
+
+    Startup failures are fatal on purpose. The previous version caught every
+    exception, logged it and carried on, so a backend that never got its schema
+    still served traffic — and still reported healthy — while answering every
+    request with an error. With `restart: unless-stopped` crashing is the
+    useful behaviour: the container retries instead of pretending.
+    """
+    create_schema()
+    seed_initial_data()
+    stop_event = asyncio.Event()
+    app.state.server_metrics_stop = stop_event
+    app.state.server_metrics_task = asyncio.create_task(
+        run_server_metrics_collector(stop_event)
+    )
+    app.state.ready = True
+    logger.info("startup complete — schema ready, serving")
+    try:
+        yield
+    finally:
+        app.state.ready = False
+        stop_event.set()
+        task = getattr(app.state, "server_metrics_task", None)
+        if task is not None:
+            await task
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title=settings.app_name)
+    app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.state.ready = False
 
+    # allow_credentials is deliberately off. Combined with a "*" origin it is
+    # forbidden by the CORS spec, and Starlette works around that by echoing
+    # back whatever Origin the request carried — which grants every site the
+    # access the wildcard appeared to grant anonymously. Auth here travels in
+    # the Authorization header, not cookies, so nothing needs credentialed
+    # CORS. Turning it back on would also require naming explicit origins.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -62,30 +101,31 @@ def create_app() -> FastAPI:
         return response
 
     @app.get("/healthz")
-    def healthz():
-        return {"ok": True}
+    def healthz(response: Response):
+        """Prove the process can actually serve, don't just confirm it is alive.
 
-    @app.on_event("startup")
-    async def on_startup():
+        Three systems act on this answer: the Docker healthcheck, the host
+        monitor, and the worker's `depends_on: condition: service_healthy`
+        gate. It used to return a constant, so all three read "healthy" right
+        through outages — which is how an eight-day collection gap and a
+        backend answering errors both went unnoticed. A liveness probe that
+        cannot fail is not a probe.
+
+        Kept cheap: one SELECT 1 on a pooled connection, called every 30s.
+        If the database is gone this blocks on pool_timeout and Docker's own
+        5s healthcheck timeout marks the container unhealthy — also correct.
+        """
+        if not getattr(app.state, "ready", False):
+            response.status_code = 503
+            return {"ok": False, "reason": "starting"}
         try:
-            create_schema()
-            seed_initial_data()
-            stop_event = asyncio.Event()
-            app.state.server_metrics_stop = stop_event
-            app.state.server_metrics_task = asyncio.create_task(
-                run_server_metrics_collector(stop_event)
-            )
-        except Exception as exc:
-            logger.exception("startup initialization failed: %s", exc)
-
-    @app.on_event("shutdown")
-    async def on_shutdown():
-        stop_event = getattr(app.state, "server_metrics_stop", None)
-        task = getattr(app.state, "server_metrics_task", None)
-        if stop_event is not None:
-            stop_event.set()
-        if task is not None:
-            await task
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("healthz: database unreachable: %s", exc)
+            response.status_code = 503
+            return {"ok": False, "reason": "db"}
+        return {"ok": True}
 
     return app
 

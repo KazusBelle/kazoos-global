@@ -45,7 +45,15 @@ services:
       DEFAULT_COINS: ${DEFAULT_COINS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT}
       CORS_ORIGINS: ${CORS_ORIGINS:-["*"]}
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      # Bound to loopback ON PURPOSE. A bare "8000:8000" publishes to
+      # 0.0.0.0, and ufw cannot take that back: Docker's DNAT rules live in
+      # nat/PREROUTING, which runs before ufw's filter/INPUT chain, so a
+      # "deny 8000" rule looks applied and changes nothing. Restricting the
+      # publish is what actually closes the port.
+      # Everything that needs this port reaches it over loopback — the host
+      # monitor (KAZUS_BACKEND_BASE) and the pm2 vite proxy. The nginx
+      # container talks to backend:8000 over the compose network instead.
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
 
   worker:
     build:
