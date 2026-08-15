@@ -834,7 +834,7 @@ function ChartModal({
         >
           {outgoingSymbol && (
             <div
-              key={`${outgoingSymbol}-${tab}-${theme}-${chartHeight}-out`}
+              key={`${outgoingSymbol}-${tab}-${theme}-out`}
               className={`kz-chart-pane kz-chart-pane-out navRow-out-${chartNavDir}`}
             >
               <CandleChart
@@ -848,7 +848,7 @@ function ChartModal({
             </div>
           )}
           <div
-            key={`${activeSymbol}-${tab}-${theme}-${chartHeight}-in`}
+            key={`${activeSymbol}-${tab}-${theme}-in`}
             className={`kz-chart-pane ${outgoingSymbol ? `navRow-in-${chartNavDir}` : "kz-chart-frame"}`}
           >
             <CandleChart

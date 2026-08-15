@@ -70,7 +70,15 @@ const CURRENT_PRICE_COLOR = "#056656";
 // Backend defaults the chart limit per interval (d1=500, h1=900, 15m=600) —
 // matches worker/compute.py so engine state is identical to the screener.
 
-const chartDataCache = new Map<string, ChartData>();
+// Срок жизни записи в кеше. Без него Map держал данные до перезагрузки вкладки:
+// открыв BTC·D1 утром, вечером вы видели утренние свечи, и линия "текущей цены"
+// показывала закрытие последней загруженной свечи, а не рынок. Сбрасывался кеш
+// только из saveStructure/deleteStructure, а те сейчас заглушки и бросают
+// исключение — то есть не сбрасывался никогда.
+// 60с: переключения таймфрейма и высоты по-прежнему идут из памяти, а данные
+// перестают быть замороженными. На бэкенде у /api/chart свой TTL в 10с.
+const CHART_CACHE_TTL_MS = 60_000;
+const chartDataCache = new Map<string, { at: number; data: ChartData }>();
 const chartDataInFlight = new Map<string, Promise<ChartData>>();
 
 function chartCacheKey(symbol: string, interval: string) {
@@ -80,14 +88,14 @@ function chartCacheKey(symbol: string, interval: string) {
 export async function getChartCached(symbol: string, interval: string) {
   const key = chartCacheKey(symbol, interval);
   const cached = chartDataCache.get(key);
-  if (cached) return cached;
+  if (cached && Date.now() - cached.at < CHART_CACHE_TTL_MS) return cached.data;
 
   const inFlight = chartDataInFlight.get(key);
   if (inFlight) return inFlight;
 
   const req = getChart(symbol, interval)
     .then((data) => {
-      chartDataCache.set(key, data);
+      chartDataCache.set(key, { at: Date.now(), data });
       chartDataInFlight.delete(key);
       return data;
     })
@@ -437,6 +445,21 @@ export function CandleChart({
   const [err, setErr] = useState<string | null>(null);
   const t = CHART_THEMES[theme];
 
+  // Высота меняется кнопками "Smaller/Larger chart" и раньше входила и в key
+  // компонента, и в зависимости главного эффекта — то есть каждое нажатие
+  // уничтожало график и строило заново, теряя приближение, которое пользователь
+  // выставил колесом. Теперь применяется на месте: экземпляр графика доступен
+  // по ссылке, а rAF-цикл читает актуальную высоту через ref, а не через
+  // замыкание эффекта.
+  const chartApiRef = useRef<any>(null);
+  const chartHeightRef = useRef(chartHeight);
+  useEffect(() => {
+    chartHeightRef.current = chartHeight;
+    try {
+      chartApiRef.current?.applyOptions({ height: chartHeight });
+    } catch { /* график ещё не создан или уже уничтожен */ }
+  }, [chartHeight]);
+
   // Live refs — read by the rAF loop each frame so toggling FVG
   // visibility never forces a chart remount.
   const fvgEnabledRef = useRef(fvgEnabled);
@@ -620,6 +643,9 @@ export function CandleChart({
             rightOffset: 0,
           },
         });
+        // Ссылка наружу — по ней эффект высоты применяет размер на месте,
+        // не трогая ни данные, ни выставленный пользователем масштаб.
+        chartApiRef.current = chart;
 
         candles = chart.addSeries(CandlestickSeries, {
           ...(theme === "light"
@@ -756,6 +782,12 @@ export function CandleChart({
         const fibElements: FibEl[] = [];
         const fibLayer = document.createElementNS(SVG_NS, "g");
         fibLayer.setAttribute("data-layer", "fib");
+        // Обрезка по области свечей — как у zigzag/swing/setup слоёв ниже. Без
+        // неё фибо оставался единственным неограниченным слоем: линии рисуются
+        // на FIB_RIGHT_OFFSET_BARS правее последней свечи, подпись ставится ещё
+        // на FIB_LABEL_GAP дальше, и у правого края она уезжала поверх шкалы
+        // цен — "0.705" накладывалась на "63200.00", обе нечитаемы.
+        fibLayer.setAttribute("clip-path", plotClipUrl);
         svg.appendChild(fibLayer);
 
         if (isBullish) {
@@ -1214,7 +1246,10 @@ export function CandleChart({
           try {
             if (destroyed || !chart || !candles || !overlayRef.current || !containerRef.current) return;
             const w = containerRef.current.clientWidth;
-            const h = chartHeight;
+            // Через ref, а не из замыкания: эффект больше не перезапускается при
+            // смене высоты, поэтому захваченное значение устарело бы и слой
+            // разметки считал бы обрезку по прежнему размеру.
+            const h = chartHeightRef.current;
             if (w <= 0) return;
 
             let psWidth = 60;
@@ -1495,11 +1530,18 @@ export function CandleChart({
       dragRef.current = null;
       try { cleanupListeners?.(); } catch { /* noop */ }
       cleanupListeners = null;
+      chartApiRef.current = null;
       try { chart?.remove(); } catch { /* double-remove */ }
       chart = null;
       candles = null;
     };
-  }, [symbol, interval, theme, chartHeight, reloadKey]);
+    // chartHeight здесь больше нет — высота применяется на месте эффектом выше,
+    // поэтому пересоздавать график не нужно и масштаб пользователя сохраняется.
+    // theme убран как мёртвый код: он входит в key компонента в Dashboard, а
+    // смена key заставляет React выбросить старый экземпляр и создать новый —
+    // до зависимостей старого эффекта дело не доходит никогда. Держать его в
+    // списке значило вводить в заблуждение: правки здесь ни на что не влияли.
+  }, [symbol, interval, reloadKey]);
 
   // Rebuild swing layer when edit mode toggles or draft changes. Edit mode
   // sources swings from the draft (instant feedback for clicks); outside
