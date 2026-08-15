@@ -410,10 +410,12 @@ body {
   text-shadow: none;
 }
 
+/* Размытие и уменьшение убраны: ряд должен читаться одним уровнем, а blur
+   давал ощущение расфокуса на соседних монетах. */
 .kz-coin-side {
-  opacity: 0.62;
-  filter: blur(0.08px);
-  transform: scale(0.94) translateZ(-10px);
+  opacity: 1;
+  filter: none;
+  transform: none;
 }
 
 /* coinNav is taken OUT of flow. position:absolute + left:50% + translateX(-50%)
@@ -713,23 +715,22 @@ body {
   transform: none;
 }
 
-.coinNav5 .sideCoin-near {
-  color: rgba(255, 255, 255, 0.58);
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-}
-
+/* Ряд одного вида: раньше ближние были 13px/0.58, дальние 11px/0.32, и лента
+   выглядела ступенькой. Теперь все четыре соседние монеты одинаковы. */
+.coinNav5 .sideCoin-near,
 .coinNav5 .sideCoin-far {
-  color: rgba(255, 255, 255, 0.32);
-  font-size: 11px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.12em;
 }
 
+/* Именно этот блок применяется к активной монете: он специфичнее общего
+   .currentCoin, и правки там не давали никакого эффекта. */
 .coinNav5 .currentCoin {
-  color: #fff;
-  font-size: 22px;
+  position: relative;
+  color: #ffffff;
+  font-size: 15px;
   font-weight: 700;
   letter-spacing: 0.14em;
   line-height: 1;
@@ -737,12 +738,26 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  overflow: visible;
   transform: none;
+}
+
+/* Полоска под активной монетой — акцент несёт она, а не цвет текста. */
+.coinNav5 .currentCoin::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -9px;
+  transform: translateX(-50%);
+  width: 34px;
+  height: 2px;
+  border-radius: 2px;
+  background: #E3822D;
 }
 
 .coinNav5 .arrow {
   color: rgba(255, 255, 255, 0.72);
-  font-size: 26px;
+  font-size: 20px;
   line-height: 1;
   display: inline-flex;
   align-items: center;

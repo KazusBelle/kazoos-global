@@ -620,16 +620,16 @@ export function CandleChart({
           crosshair: {
             mode: CrosshairMode.Normal,
             vertLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.28)" : "rgba(32,32,32,0.28)",
+              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
               width: 1,
               style: LineStyle.Solid,
-              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.9)" : "rgba(110,110,110,0.9)",
+              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
             },
             horzLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.28)" : "rgba(32,32,32,0.28)",
+              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
               width: 1,
               style: LineStyle.Solid,
-              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.9)" : "rgba(110,110,110,0.9)",
+              labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
             },
           },
           grid: {
