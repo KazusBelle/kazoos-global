@@ -682,7 +682,12 @@ body {
   justify-items: center;
   place-items: center;
   column-gap: 10px;
-  width: 668px;
+  /* Ширина считается по содержимому, а не задаётся числом. Раньше здесь стояло
+     фиксированное значение, которое приходилось пересчитывать вручную при каждой
+     правке колонок — и после очередной оно разошлось на 34px, из-за чего правую
+     стрелку выдавливало за скруглённую границу плашки. max-content исключает
+     этот класс ошибок целиком. */
+  width: max-content;
   height: 52px;
   padding: 0 14px;
   border: 1px solid #262932;
@@ -749,7 +754,7 @@ body {
   content: "";
   position: absolute;
   left: 50%;
-  bottom: -9px;
+  bottom: -7px;
   transform: translateX(-50%);
   width: 56px;
   height: 2px;
