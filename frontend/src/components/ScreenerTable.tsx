@@ -337,6 +337,8 @@ export function ScreenerTable({
 }: Props) {
   const prevPricesRef = useRef<Record<string, number | null>>({});
   const [flashBySymbol, setFlashBySymbol] = useState<Record<string, true>>({});
+  // id таймера снятия подсветки, по одному на символ — см. эффект ниже.
+  const flashTimersRef = useRef<Record<string, number>>({});
   const sortStorageKey = `kazus_sort_${storageKey}`;
   const [sortKey, setSortKey] = useState<SortKey>(() => {
     try {
@@ -438,16 +440,37 @@ export function ScreenerTable({
       return next;
     });
 
-    const timer = window.setTimeout(() => {
-      setFlashBySymbol((state) => {
-        const next = { ...state };
-        for (const sym of changed) delete next[sym];
-        return next;
-      });
-    }, 850);
-
-    return () => window.clearTimeout(timer);
+    // Таймер на КАЖДЫЙ символ, а не один на пачку. Раньше пачка делила общий
+    // таймер, а cleanup эффекта его отменял — и если следующий прогон приходил
+    // раньше 850мс и ничего не менял (например, оптимистичное обновление после
+    // простановки call-метки), новый таймер не заводился: ранняя проверка
+    // changed.length === 0 выходит до его создания. Флаг оставался навсегда.
+    // Видно этого не было — анимация заканчивается прозрачным фоном, — но
+    // состояние копилось, и строка больше никогда не мигала повторно.
+    for (const sym of changed) {
+      window.clearTimeout(flashTimersRef.current[sym]);
+      flashTimersRef.current[sym] = window.setTimeout(() => {
+        delete flashTimersRef.current[sym];
+        setFlashBySymbol((state) => {
+          if (!(sym in state)) return state;
+          const next = { ...state };
+          delete next[sym];
+          return next;
+        });
+      }, 850);
+    }
   }, [rows]);
+
+  // Снять оставшиеся таймеры при размонтировании таблицы.
+  useEffect(
+    () => () => {
+      for (const id of Object.values(flashTimersRef.current)) {
+        window.clearTimeout(id);
+      }
+      flashTimersRef.current = {};
+    },
+    [],
+  );
 
   // Row height control ("cozy" by default, compact halves the vertical padding).
   const rowPad = density === "compact" ? "py-1.5" : "py-3";
