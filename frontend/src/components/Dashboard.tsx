@@ -482,9 +482,17 @@ function ChartModal({
     onClose(reason);
   }
   const isDark = theme === "dark";
+  // Модаль теперь открывается почти во весь экран, поэтому полотно тянется под
+  // неё — иначе под графиком оставалась бы пустая треть окна. Формула та же,
+  // что была для полноэкранного режима; ручные "-"/"+" при подгонке по высоте
+  // отключаются, как они и раньше отключались в полноэкранном.
+  const fittedChartHeight = Math.max(CHART_HEIGHT_MIN, viewportHeight - 260);
+  const autoFitHeight = true;
   const effectiveChartHeight = isFullscreen
     ? Math.max(360, viewportHeight - 250)
-    : chartHeight;
+    : autoFitHeight
+      ? fittedChartHeight
+      : chartHeight;
 
   // Find prev/next coin in the ordered list passed in from the table the
   // user clicked. If the modal was opened outside that flow (e.g. fall-back
@@ -557,21 +565,41 @@ function ChartModal({
     await el.requestFullscreen();
   }
 
-  const modalBg = "#18181b";
-  const modalBorder = "#3f3f46";
+  // Тёмная база под сам холст графика: он остаётся как есть, меняется только
+  // обрамление вокруг него.
+  const modalBg = "#0b0c0f";
+  const modalBorder = "#23252d";
   const modalText = "#f4f4f5";
-  const subText = "#71717a";
+  const subText = "#8b90a0";
+  // Поверхность под элементами управления — на тон светлее фона, чтобы кнопки
+  // читались как отдельный слой, а не как надписи на пустоте.
+  const ctrlSurface = "#15171d";
+  const ctrlBorder = "#262932";
 
-  // Unified button base — every header control uses the same chrome so the
-  // toolbar reads as one rhythm.
+  // Каждый элемент управления — скруглённая плитка на приподнятой поверхности с
+  // тонкой рамкой. Единый базовый класс держит ритм панели.
   const btnBase =
-    "kz-btn h-8 inline-flex items-center justify-center rounded-md border text-[11px] tracking-widest uppercase select-none";
-  const btnIcon = `${btnBase} w-8`;
-  const btnText = `${btnBase} px-3`;
+    "kz-btn h-9 inline-flex items-center justify-center gap-1.5 rounded-lg border " +
+    "text-[11px] tracking-wider uppercase select-none transition-colors";
+  const btnIcon = `${btnBase} w-9`;
+  const btnText = `${btnBase} px-3.5`;
   const btnStyle: React.CSSProperties = {
-    borderColor: modalBorder,
+    borderColor: ctrlBorder,
     color: subText,
-    background: "transparent",
+    background: ctrlSurface,
+  };
+  // Активное состояние — заливка акцентом проекта (оранжевый), а не фиолетовым
+  // из референса: иначе модаль выпала бы из палитры всего остального интерфейса.
+  const btnActiveStyle: React.CSSProperties = {
+    borderColor: "rgba(227,130,45,0.45)",
+    color: "#E3822D",
+    background: "rgba(227,130,45,0.10)",
+  };
+  // Группа-сегмент: несколько кнопок в общем контейнере, как в референсе.
+  const groupWrap = "inline-flex items-center gap-1 rounded-xl border p-1";
+  const groupStyle: React.CSSProperties = {
+    borderColor: ctrlBorder,
+    background: "rgba(255,255,255,0.02)",
   };
 
   useEffect(() => {
@@ -593,7 +621,10 @@ function ChartModal({
         className={`border kz-modal-pop ${
           isFullscreen
             ? "w-screen h-screen max-h-none rounded-none p-3 overflow-hidden"
-            : "rounded-2xl p-4 w-[min(1080px,94vw)] max-h-[94vh] overflow-y-auto"
+            // Было min(1080px, 94vw): на широком мониторе модаль занимала чуть
+            // больше половины ширины, остальное — пустое затемнение. Теперь
+            // открывается почти во весь экран, оставляя лишь узкую рамку.
+            : "rounded-2xl p-4 w-[98vw] h-[96vh] max-h-[96vh] overflow-hidden"
         }`}
         style={{ background: modalBg, borderColor: modalBorder }}
         onClick={(e) => e.stopPropagation()}
@@ -653,17 +684,19 @@ function ChartModal({
 
         {/* Unified controls block — tabs on the left, ALL actions on the right */}
         <div className="kz-unified-toolbar">
-          <div className="flex gap-1">
+          {/* Вкладки — общий контейнер-сегмент, как в референсе: рамка одна на
+              всю группу, активная вкладка залита акцентом. */}
+          <div className={groupWrap} style={groupStyle}>
             {tabsForSymbol(activeSymbol).map((t) => (
               <button
                 key={t}
                 onClick={() => guardedSetTab(t)}
-                className={`kz-tab h-8 px-3 inline-flex items-center rounded-md text-[11px] uppercase tracking-[0.22em] ${
+                className={`kz-tab h-7 px-3 inline-flex items-center rounded-lg text-[11px] uppercase tracking-[0.18em] transition-colors ${
                   tab === t ? "kz-tab-active" : ""
                 }`}
                 style={{
-                  color: tab === t ? modalText : subText,
-                  background: tab === t ? "rgba(63,63,70,0.55)" : "transparent",
+                  color: tab === t ? "#E3822D" : subText,
+                  background: tab === t ? "rgba(227,130,45,0.12)" : "transparent",
                 }}
               >
                 {TAB_LABELS[t]}
@@ -674,19 +707,19 @@ function ChartModal({
           <div className="kz-toolbar-actions">
             <button
               onClick={() => resizeChart(-60)}
-              disabled={isFullscreen}
+              disabled={isFullscreen || autoFitHeight}
               className={`${btnIcon} disabled:opacity-30 disabled:pointer-events-none`}
               style={btnStyle}
-              title={isFullscreen ? "Disabled in full screen" : "Smaller chart"}
+              title={isFullscreen || autoFitHeight ? "Высота подгоняется под окно" : "Smaller chart"}
             >
               −
             </button>
             <button
               onClick={() => resizeChart(60)}
-              disabled={isFullscreen}
+              disabled={isFullscreen || autoFitHeight}
               className={`${btnIcon} disabled:opacity-30 disabled:pointer-events-none`}
               style={btnStyle}
-              title={isFullscreen ? "Disabled in full screen" : "Larger chart"}
+              title={isFullscreen || autoFitHeight ? "Высота подгоняется под окно" : "Larger chart"}
             >
               +
             </button>

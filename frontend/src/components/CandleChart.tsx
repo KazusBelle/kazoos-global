@@ -599,6 +599,8 @@ export function CandleChart({
           layout: {
             background: { type: ColorType.Solid, color: t.bg },
             textColor: t.textColor,
+            // Логотип TradingView в углу полотна — убран по просьбе оператора.
+            attributionLogo: false,
           },
           handleScale: {
             mouseWheel: true,
