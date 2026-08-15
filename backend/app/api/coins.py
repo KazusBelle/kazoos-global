@@ -18,6 +18,11 @@ VALID_CALL_TAGS = {"vanga", "voldemar", "makiavelli", "me"}
 FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 SYMBOL_CACHE_TTL_SEC = 60 * 60
 _symbol_cache: tuple[float, list[str]] = (0, [])
+# Отдал ли Binance список контрактов в последний раз. Нужно, чтобы проверка
+# символа при добавлении НЕ отвергала валидную монету, когда биржа недоступна:
+# в этом случае список состоит только из локальных источников и полным не
+# является. Лучше пропустить сомнительный символ, чем не дать добавить нужный.
+_symbols_from_binance: bool = False
 
 
 @router.get("", response_model=list[CoinOut])
@@ -26,13 +31,28 @@ def list_coins(db: Session = Depends(get_db), _=Depends(get_current_user)):
 
 
 @router.post("", response_model=CoinOut)
-def add_coin(body: CoinIn, db: Session = Depends(get_db), _=Depends(get_current_user)):
+async def add_coin(body: CoinIn, db: Session = Depends(get_db), _=Depends(get_current_user)):
     symbol = body.symbol.strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="empty symbol")
+
     exists = db.query(Coin).filter(Coin.symbol == symbol).first()
     if exists:
-        return exists
+        # Раньше здесь молча возвращался существующий объект с кодом 200, и
+        # интерфейс показывал успех, хотя не произошло ничего. Теперь отказ
+        # явный — фронтенд поднимает detail в баннер ошибки как есть.
+        raise HTTPException(status_code=409, detail=f"{symbol} уже отслеживается")
+
+    # Проверка, что символ вообще торгуется. Без неё опечатка вроде BTCUSTD
+    # создавала запись навсегда: снимка для неё не появится никогда, и строка
+    # висела бы в таблице с пустыми колонками.
+    known = await _available_symbols(db)
+    if _symbols_from_binance and symbol not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{symbol} не найден среди бессрочных USDT-контрактов Binance",
+        )
+
     coin = Coin(symbol=symbol, is_active=True)
     db.add(coin)
     db.commit()
@@ -193,7 +213,7 @@ def _compact_pins(db: Session) -> None:
 
 
 async def _available_symbols(db: Session) -> list[str]:
-    global _symbol_cache
+    global _symbol_cache, _symbols_from_binance
 
     now = time.time()
     if _symbol_cache[1] and now - _symbol_cache[0] < SYMBOL_CACHE_TTL_SEC:
@@ -223,8 +243,9 @@ async def _available_symbols(db: Session) -> list[str]:
             and item.get("contractType") == "PERPETUAL"
             and item.get("status") == "TRADING"
         )
+        _symbols_from_binance = True
     except Exception:
-        pass
+        _symbols_from_binance = False
 
     _symbol_cache = (now, sorted(symbols))
     return _symbol_cache[1]

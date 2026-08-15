@@ -78,16 +78,22 @@ def dashboard(db: Session = Depends(get_db), _=Depends(get_current_user)):
             )
         )
 
-        for s in (g, l):
-            if s is None:
-                continue
-            total += 1
-            if s.in_ote:
-                ote_count += 1
-            if s.zone == "discount":
-                dic_count += 1
-            elif s.zone == "premium":
-                pre_count += 1
+        # Счёт по МОНЕТАМ, а не по снимкам. Раньше каждая монета давала +2 (D1 и
+        # H1), и "144 TOTAL" при 72 отслеживаемых монетах читалось как число
+        # монет. Теперь total — ровно длина списка в таблице.
+        #
+        # Монета попадает в категорию, если подходит ЛЮБОЙ из её таймфреймов:
+        # она может быть в discount по D1 и в premium по H1, и оба утверждения
+        # верны. Поэтому категории пересекаются и их сумма не обязана давать
+        # total — это свойство данных, а не ошибка счёта.
+        states = [s for s in (g, l) if s is not None]
+        total += 1
+        if any(s.in_ote for s in states):
+            ote_count += 1
+        if any(s.zone == "discount" for s in states):
+            dic_count += 1
+        if any(s.zone == "premium" for s in states):
+            pre_count += 1
 
     sys_status = db.query(SystemStatus).filter(SystemStatus.id == 1).first()
     return DashboardResponse(
