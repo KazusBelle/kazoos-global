@@ -502,6 +502,11 @@ function ChartModal({
   const nextSymbol = idx >= 0 && idx < orderedSymbols.length - 1
     ? orderedSymbols[idx + 1]
     : null;
+  // Крайние монеты тоже кликабельны — раньше это был просто текст, и палец на
+  // них обещал переход, которого не было.
+  const farPrevSymbol = idx > 1 ? orderedSymbols[idx - 2] : null;
+  const farNextSymbol =
+    idx >= 0 && idx < orderedSymbols.length - 2 ? orderedSymbols[idx + 2] : null;
   const currentLabel = displayName(row.symbol);
   const nearPrevLabel = idx > 0 ? displayName(orderedSymbols[idx - 1]) : "";
   const farPrevLabel = idx > 1 ? displayName(orderedSymbols[idx - 2]) : "";
@@ -644,9 +649,20 @@ function ChartModal({
               className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Previous coin"
             >
-              ‹
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path d="M9 2.5 4.5 7 9 11.5" stroke="currentColor" strokeWidth="1.8"
+                      strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </button>
-            <span className="sideCoin sideCoin-far truncate" title={farPrevLabel}>{farPrevLabel}</span>
+            <button
+              type="button"
+              onClick={() => { if (farPrevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(farPrevSymbol); } }}
+              disabled={!farPrevSymbol}
+              className="kz-nav sideCoin sideCoin-far truncate disabled:pointer-events-none disabled:opacity-0"
+              title={farPrevLabel}
+            >
+              {farPrevLabel}
+            </button>
             <button
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
@@ -668,7 +684,15 @@ function ChartModal({
             >
               {nearNextLabel}
             </button>
-            <span className="sideCoin sideCoin-far truncate" title={farNextLabel}>{farNextLabel}</span>
+            <button
+              type="button"
+              onClick={() => { if (farNextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(farNextSymbol); } }}
+              disabled={!farNextSymbol}
+              className="kz-nav sideCoin sideCoin-far truncate disabled:pointer-events-none disabled:opacity-0"
+              title={farNextLabel}
+            >
+              {farNextLabel}
+            </button>
             <button
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
@@ -676,7 +700,10 @@ function ChartModal({
               className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Next coin"
             >
-              ›
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path d="M5 2.5 9.5 7 5 11.5" stroke="currentColor" strokeWidth="1.8"
+                      strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </button>
           </div>
         </div>
