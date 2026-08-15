@@ -631,7 +631,6 @@ function ChartModal({
       >
         {/* Top block: OTE info on the left, 5-coin symmetric rail centered */}
         <div className="kz-modal-header">
-          <ChartHeaderOteInfo row={row} tab={tab} />
           {/* Center rail — 5 coins + arrows, fully symmetric slots */}
           <div
             className="coinNav5"
@@ -642,7 +641,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav arrow kz-coin-arrow h-7 w-[26px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Previous coin"
             >
               ‹
@@ -652,19 +651,19 @@ function ChartModal({
               type="button"
               onClick={() => { if (prevSymbol) { navDirRef.current = "prev"; guardedSwitchSymbol(prevSymbol); } }}
               disabled={!prevSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[88px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[106px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearPrevLabel ? `← ${nearPrevLabel}` : ""}
             >
               {nearPrevLabel}
             </button>
-            <span className="currentCoin kz-coin-active h-[26px] w-[112px] justify-self-center truncate">
+            <span className="currentCoin kz-coin-active h-[30px] w-[132px] justify-self-center truncate">
               {currentLabel}
             </span>
             <button
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav sideCoin sideCoin-near kz-coin-side h-6 w-[88px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav sideCoin sideCoin-near kz-coin-side h-7 w-[106px] justify-self-center truncate disabled:pointer-events-none disabled:opacity-0"
               title={nearNextLabel ? `${nearNextLabel} →` : ""}
             >
               {nearNextLabel}
@@ -674,7 +673,7 @@ function ChartModal({
               type="button"
               onClick={() => { if (nextSymbol) { navDirRef.current = "next"; guardedSwitchSymbol(nextSymbol); } }}
               disabled={!nextSymbol}
-              className="kz-nav arrow kz-coin-arrow h-7 w-[26px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
+              className="kz-nav arrow kz-coin-arrow h-9 w-[38px] justify-self-center disabled:pointer-events-none disabled:opacity-0"
               aria-label="Next coin"
             >
               ›

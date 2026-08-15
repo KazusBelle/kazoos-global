@@ -661,8 +661,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 60px;
-  height: 60px;
+  min-height: 68px;
+  height: 68px;
   /* Разделительная линия убрана: плашка монет теперь сама обведена рамкой и
      служит визуальной границей, две линии подряд смотрелись бы шумно. */
   margin-bottom: 10px;
@@ -677,16 +677,16 @@ body {
   top: 50%;
   transform: translate3d(-50%, -50%, 0);
   display: grid;
-  grid-template-columns: 26px 78px 88px 112px 88px 78px 26px;
+  grid-template-columns: 38px 96px 106px 132px 106px 96px 38px;
   align-items: center;
   justify-items: center;
   place-items: center;
-  column-gap: 8px;
-  width: 540px;
-  height: 44px;
-  padding: 0 10px;
+  column-gap: 10px;
+  width: 668px;
+  height: 52px;
+  padding: 0 14px;
   border: 1px solid #262932;
-  border-radius: 14px;
+  border-radius: 16px;
   background: #15171d;
   pointer-events: none;
 }
@@ -699,7 +699,9 @@ body {
   pointer-events: auto;
 }
 
-.coinNav5 button,
+/* Обрезка нужна названиям монет (длинные тикеры), но НЕ стрелкам: глиф шире
+   своего 26-пиксельного слота, и общее правило срезало ему бока. */
+.coinNav5 button:not(.arrow),
 .coinNav5 span {
   display: inline-flex;
   align-items: center;
@@ -749,15 +751,19 @@ body {
   left: 50%;
   bottom: -9px;
   transform: translateX(-50%);
-  width: 34px;
+  width: 56px;
   height: 2px;
   border-radius: 2px;
   background: #E3822D;
 }
 
 .coinNav5 .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
   color: rgba(255, 255, 255, 0.72);
-  font-size: 20px;
+  font-size: 28px;
   line-height: 1;
   display: inline-flex;
   align-items: center;
