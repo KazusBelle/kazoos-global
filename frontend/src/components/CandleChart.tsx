@@ -614,21 +614,25 @@ export function CandleChart({
             horzTouchDrag: true,
             vertTouchDrag: true,
           },
-          // Перекрестие: сплошные волосяные линии вместо пунктира по умолчанию —
-          // "ровный прицел". Сам указатель мыши тоже становится крестом, через
+          // Перекрестие: длинный штрих (LargeDashed = 6px через 6px против
+          // 2/2 у Dashed — втрое длиннее; это потолок библиотеки при width 1),
+          // заметно прозрачнее свечей —
+          // прицел не спорит с данными. Сам указатель мыши тоже крест, через
           // cursor: crosshair на контейнере ниже.
+          // mode: Normal — перекрестие ходит свободно. Magnet приклеил бы
+          // горизонталь к close свечи; это НЕ включено.
           crosshair: {
             mode: CrosshairMode.Normal,
             vertLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
+              color: theme === "dark" ? "rgba(255,255,255,0.13)" : "rgba(32,32,32,0.13)",
               width: 1,
-              style: LineStyle.Solid,
+              style: LineStyle.LargeDashed,
               labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
             },
             horzLine: {
-              color: theme === "dark" ? "rgba(255,255,255,0.2)" : "rgba(32,32,32,0.2)",
+              color: theme === "dark" ? "rgba(255,255,255,0.13)" : "rgba(32,32,32,0.13)",
               width: 1,
-              style: LineStyle.Solid,
+              style: LineStyle.LargeDashed,
               labelBackgroundColor: theme === "dark" ? "rgba(46,46,46,0.2)" : "rgba(110,110,110,0.2)",
             },
           },
